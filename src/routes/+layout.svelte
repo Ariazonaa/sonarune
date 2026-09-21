@@ -18,6 +18,8 @@
   import { player } from "$lib/state/player.svelte";
   import { library } from "$lib/state/library.svelte";
   import { net } from "$lib/state/net.svelte";
+  import { toast } from "$lib/state/toast.svelte";
+  import { updates } from "$lib/state/updates.svelte";
   import { palette } from "$lib/state/palette.svelte";
   import { help } from "$lib/state/help.svelte";
   import { layoutPreferences } from "$lib/state/layout.svelte";
@@ -75,6 +77,16 @@
     player.init();
     library.init();
     net.init();
+    updates.init();
+  });
+
+  // A found update is announced once, as a pill — it is never urgent enough to
+  // interrupt, and Settings holds the button that acts on it.
+  $effect(() => {
+    const version = updates.info?.version;
+    if (!version || updates.announced === version) return;
+    updates.announced = version;
+    toast.show(m.toast_update_available({ version }), { kind: "info", ms: 6000 });
   });
 
   // Global shortcuts only for the signed-in main-window shell.

@@ -33,6 +33,7 @@ src/lib/paraglide/
 # Files that belong to the private origin only.
 /TODO.md
 /done.md
+/docs/features.de.md
 /CLAUDE.md
 /.gitea/
 /.gitleaks.toml

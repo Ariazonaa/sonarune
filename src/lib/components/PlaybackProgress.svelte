@@ -24,7 +24,7 @@
   const shownPosition = $derived(scrubbing ?? pending ?? s.positionMs);
   // The queue entry, not just the item: the same track queued twice in a row
   // is still a track change for a drag in progress.
-  const trackKey = $derived(s.current ? `${s.current.itemId}:${s.current.playSessionId}` : null);
+  const trackKey = $derived(s.current ? `${s.current.itemId}:${s.current.entryId}` : null);
 
   $effect(() => {
     if (pending !== null && Math.abs(s.positionMs - pending) < 2000) pending = null;

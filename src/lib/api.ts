@@ -28,6 +28,7 @@ import type {
   TrackInfoDto,
   TrayLabels,
   TrustedCert,
+  UpdateInfo,
 } from "./types";
 
 export const api = {
@@ -143,6 +144,16 @@ export const api = {
     invoke<void>("set_extras_settings", { settings }),
   exportSettings: () => invoke<string>("export_settings"),
   importSettings: (json: string) => invoke<string[]>("import_settings", { json }),
+
+  /** Ask the release endpoint what the current version is (updater.rs). */
+  checkForUpdate: () => invoke<UpdateInfo>("check_for_update"),
+  /**
+   * Download the update, verify its signature and start the installer. On
+   * Windows this never resolves: the app is closed by the installer. Rejects
+   * with `update:playing` (a track is running), `update:portable` (not an
+   * installed copy) or `update:none`.
+   */
+  installUpdate: () => invoke<void>("install_update"),
 
   getGenres: () => invoke<GenreDto[]>("get_genres"),
   /** Index of the first item whose name sorts at/after `letter`. */

@@ -3,10 +3,36 @@ name: Release
 # Cuts a release from a tag, so the installer people download is one CI built
 # from a commit anyone can check out -- not one somebody produced on their own
 # machine. Push a `v*` tag and a DRAFT release appears with the installer, a
-# portable zip and their checksums; review it, then publish by hand.
+# portable zip, their checksums and the updater manifest; review it, then
+# publish by hand.
 #
 # A manual run builds the same way but creates nothing. That is the way to find
 # out whether the release path still works without cutting a release.
+#
+# ## Updates
+#
+# The app updates itself from this release (src-tauri/src/updater.rs). Two
+# things have to be true for that, and both happen here:
+#
+#   * the installer is signed with the updater's minisign key, which lives in
+#     the `TAURI_SIGNING_PRIVATE_KEY` secret and nowhere else. The matching
+#     public key is in `src-tauri/tauri.conf.json`, so a build that is not
+#     signed with this key cannot be installed by anyone's app. Signing is
+#     switched on by `src-tauri/tauri.updater.conf.json`, which is merged into
+#     the config for this build only -- an ordinary local `tauri build` keeps
+#     working without the key.
+#   * the release carries `latest.json`, the manifest the app asks for. The
+#     endpoint is `releases/latest/download/latest.json`, so it is always the
+#     newest published release that answers.
+#
+# **Rolling back** therefore means un-publishing (or deleting) the bad release:
+# `latest` then falls back to the release before it, whose own `latest.json`
+# is still correct, and new downloads and new checks get the older version
+# again. It does not reach the people who already installed the bad one --
+# nothing downgrades an installed app, by design (`allowDowngrades` stays off,
+# or anyone able to spoof the endpoint could push an old, still validly signed
+# build onto every client). Those users need a fixed release with a higher
+# version.
 
 on:
   push:
@@ -82,8 +108,26 @@ jobs:
 
       # Deliberately uncached: a release is worth the extra minutes of building
       # every dependency from source rather than trusting a restored cache.
+      #
+      # The updater config is merged in only when the signing key is there.
+      # Without it the bundler refuses to produce updater artefacts and the
+      # whole build fails, which would be a pointless way to lose a release --
+      # and a dry run in a fork has no secrets at all.
       - name: Build the app and the installer
-        run: npm run tauri build
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ($env:TAURI_SIGNING_PRIVATE_KEY) {
+            "SIGNED=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+            npm run tauri build -- --config src-tauri/tauri.updater.conf.json
+          } else {
+            "::warning::no TAURI_SIGNING_PRIVATE_KEY -- building without updater artefacts, this release cannot be installed as an update"
+            "SIGNED=0" | Out-File -FilePath $env:GITHUB_ENV -Append
+            npm run tauri build
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Collect the artefacts
         shell: pwsh
@@ -99,6 +143,37 @@ jobs:
           $exe = "src-tauri/target/release/jellysic.exe"
           if (-not (Test-Path $exe)) { "::error::jellysic.exe not found at $exe"; exit 1 }
           Compress-Archive -Path $exe -DestinationPath "$out/jellysic_${env:VERSION}_x64-portable.zip"
+
+          # The signed installer and the manifest the app polls. The signature
+          # travels inside latest.json; the .sig file rides along so a release
+          # can be verified with `minisign -Vm` by hand, without picking the
+          # string out of the JSON.
+          if ($env:SIGNED -eq "1") {
+            $sig = "$setup.sig"
+            if (-not (Test-Path $sig)) { "::error::signature not found at $sig"; exit 1 }
+            Copy-Item $sig $out
+
+            # On a manual run there is no tag; the URL still has to name one,
+            # and the tag a release of this version would carry is known.
+            $tag = if ($env:GITHUB_REF -like "refs/tags/*") { $env:GITHUB_REF_NAME } else { "v$($env:VERSION)" }
+            $name = Split-Path $setup -Leaf
+            $manifest = [ordered]@{
+              version   = $env:VERSION
+              notes     = "See the release notes and CHANGELOG.md for what changed in $($env:VERSION)."
+              pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+              platforms = [ordered]@{
+                "windows-x86_64" = [ordered]@{
+                  signature = (Get-Content $sig -Raw).Trim()
+                  url       = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$tag/$name"
+                }
+              }
+            }
+            [System.IO.File]::WriteAllText(
+              (Join-Path (Get-Location) "$out/latest.json"),
+              ($manifest | ConvertTo-Json -Depth 5),
+              (New-Object System.Text.UTF8Encoding $false))
+            Get-Content "$out/latest.json"
+          }
 
           # The list is materialized with @() before anything is written: a
           # PowerShell pipeline streams, so writing the sums file straight out of

@@ -143,7 +143,11 @@ export interface QueueTrack {
   imageTag: string | null;
   imageBlurHash: string | null;
   streamUrl: string;
-  playSessionId: string;
+  /** Identity of this queue line (not the server's play session, which the
+   *  player mints per playback attempt). Stable across moves, which is what
+   *  row keys and "which entry did I click" resolve against. Empty for
+   *  entries persisted by builds before it existed. */
+  entryId: string;
   normalizationGain: number | null;
   artists: ArtistRef[];
   genres: GenreRef[];
@@ -238,6 +242,19 @@ export interface DesktopSettings {
   closeBehavior: CloseBehavior;
   startMinimized: boolean;
   coverCacheLimitMb: number;
+  autoCheckUpdates: boolean;
+}
+
+/** What `check_for_update` answers (src-tauri/src/updater.rs). `version` is
+ *  null when the release endpoint has nothing newer; `installable` is false
+ *  for a portable copy, which can see an update but must not run the
+ *  installer. */
+export interface UpdateInfo {
+  currentVersion: string;
+  version: string | null;
+  notes: string | null;
+  date: string | null;
+  installable: boolean;
 }
 
 export interface CacheInfo {

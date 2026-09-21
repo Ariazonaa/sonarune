@@ -1,6 +1,6 @@
 [package]
 name = "jellysic"
-version = "0.1.0"
+version = "0.2.0"
 description = "A fast Jellyfin desktop music client"
 authors = ["Ariazonaa"]
 license = "GPL-3.0-or-later"
@@ -42,6 +42,9 @@ sha2 = "0.10"
 flate2 = "1"
 tauri-plugin-window-state = "2.4.1"
 tauri-plugin-single-instance = "2"
+# In-app updates (updater.rs). Desktop only, which is every target this crate
+# has -- the iOS port is its own project.
+tauri-plugin-updater = "2.12.0"
 souvlaki = "0.8.3"
 opus = "0.3.1"
 ogg = "0.9.2"

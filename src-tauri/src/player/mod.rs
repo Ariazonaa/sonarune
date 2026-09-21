@@ -139,11 +139,16 @@ pub struct QueueTrack {
     pub image_tag: Option<String>,
     #[serde(default)]
     pub image_blur_hash: Option<String>,
+    /// The track's stream, without the parameters of a single attempt at
+    /// playing it: the play session and a start position are added when a
+    /// source is opened (`spawn_open`, `source::open_track_source`).
     pub stream_url: String,
-    /// Correlates our playback reports with the server's (transcode) session;
-    /// also embedded in `stream_url`. Empty in queues persisted by old builds.
-    #[serde(default)]
-    pub play_session_id: String,
+    /// Identity of this queue line, minted when it was queued and kept across
+    /// moves. The UI keys its rows by it, which is how two copies of the same
+    /// track stay apart; it never reaches the server. Empty in queues
+    /// persisted before it existed — the UI falls back to the item id there.
+    #[serde(default, alias = "playSessionId")]
+    pub entry_id: String,
     /// Jellyfin `NormalizationGain` (dB), input to volume normalization.
     #[serde(default)]
     pub normalization_gain: Option<f32>,
@@ -548,6 +553,11 @@ impl Default for PlayerState {
 }
 
 /// Map a downloaded byte fraction onto the track's timeline.
+/// A fresh play session id. See `spawn_open` for what the server does with it.
+fn new_play_session() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 fn buffered_range_ms(fraction: Option<(f64, f64)>, duration_ms: u64) -> Option<(u64, u64)> {
     let (start, end) = fraction?;
     if duration_ms == 0 {
@@ -665,6 +675,9 @@ pub enum PlayerCommand {
         prefetch_generation: u64,
         purpose: OpenPurpose,
         track: Box<QueueTrack>,
+        /// The play session this source was opened under; it is in the stream
+        /// URL the server answered, so the reports have to use the same one.
+        play_session: String,
         result: AppResult<Box<OpenedSource>>,
     },
 }
@@ -742,6 +755,9 @@ fn restored_index(snapshot: &PersistedQueue, saved_index: Option<&str>) -> usize
 
 struct Prefetched {
     item_id: String,
+    /// Session the prefetch was opened under, handed on to the report when
+    /// this source actually starts playing.
+    play_session: String,
     source: TrackSource,
     fade: FadeHandle,
     tap_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -1003,6 +1019,10 @@ struct Worker {
     /// is promoted with it — same life cycle as the fade and tap handles.
     current_download: Option<Arc<DownloadProgress>>,
     pending_download: Option<Arc<DownloadProgress>>,
+    /// Play session of the gapless-appended source, promoted with it when the
+    /// boundary is crossed — same life cycle as the fade, tap and download
+    /// handles above.
+    pending_play_session: Option<String>,
     /// Old sink still audible during a crossfade (kept steerable via its
     /// fade handle), dropped after its ramp.
     fading_out: Option<(rodio::Player, FadeHandle, Instant)>,
@@ -1051,7 +1071,10 @@ struct Worker {
     /// reopen at a position (`restart_at`; rodio's get_pos is
     /// source-relative).
     position_offset_ms: u64,
-    /// Jellyfin play session id of the currently reported track.
+    /// Jellyfin play session of the playback currently being reported — the
+    /// one in the stream URL of the source in `sink`, minted when that source
+    /// was opened (`spawn_open`). Taken when the track stops, so the same id
+    /// is never reported started twice.
     play_session_id: Option<String>,
     ticks_since_report: u32,
     /// Time actually listened to the current track (the ListenBrainz rule).
@@ -1157,6 +1180,7 @@ impl Worker {
             pending_tap: None,
             current_download: None,
             pending_download: None,
+            pending_play_session: None,
             fading_out: None,
             last_output_rebuild: Instant::now(),
             output_failed_pending: false,
@@ -1418,8 +1442,16 @@ impl Worker {
                 prefetch_generation,
                 purpose,
                 track,
+                play_session,
                 result,
-            } => self.source_ready(generation, prefetch_generation, purpose, *track, result),
+            } => self.source_ready(
+                generation,
+                prefetch_generation,
+                purpose,
+                *track,
+                play_session,
+                result,
+            ),
         }
     }
 
@@ -1429,6 +1461,7 @@ impl Worker {
         prefetch_generation: u64,
         purpose: OpenPurpose,
         track: QueueTrack,
+        play_session: String,
         result: AppResult<Box<OpenedSource>>,
     ) {
         if generation != self.generation {
@@ -1467,7 +1500,7 @@ impl Worker {
                         self.current_download = Some(download);
                         self.position_offset_ms = 0;
                         self.ticks_since_report = 0;
-                        self.report_start(&track);
+                        self.report_start(&track, play_session);
                         if self.status == PlaybackStatus::Paused {
                             self.report_progress(true);
                         }
@@ -1541,6 +1574,7 @@ impl Worker {
                         } = *opened;
                         self.prefetched = Some(Prefetched {
                             item_id: track.item_id,
+                            play_session,
                             source,
                             fade,
                             tap_enabled,
@@ -1844,6 +1878,7 @@ impl Worker {
                         self.pending_fade = Some(p.fade);
                         self.pending_tap = Some(p.tap_enabled);
                         self.pending_download = Some(p.download);
+                        self.pending_play_session = Some(p.play_session);
                         self.appended = Some(p.item_id);
                     }
                 } else {
@@ -1856,6 +1891,7 @@ impl Worker {
     /// Fade the current track out while the next fades in on a fresh player;
     /// the queue pointer moves immediately (the new track is what's "current").
     fn begin_crossfade(&mut self, p: Prefetched, fade_ms: u64) {
+        let play_session = p.play_session;
         if let Some(prev) = self.queue.get(self.index).cloned() {
             let position_ms = self.position_ms();
             self.report_stopped(&prev, position_ms);
@@ -1883,6 +1919,7 @@ impl Worker {
             tap.store(false, std::sync::atomic::Ordering::Relaxed);
         }
         self.pending_download = None;
+        self.pending_play_session = None;
 
         let sink = rodio::Player::connect_new(self.output.mixer());
         sink.set_volume(self.volume);
@@ -1902,7 +1939,7 @@ impl Worker {
         self.sync_queue();
         if let Some(track) = self.queue.get(self.index).cloned() {
             self.ticks_since_report = 0;
-            self.report_start(&track);
+            self.report_start(&track, play_session);
             self.update_media_metadata(&track);
         }
         self.update_media_playback();
@@ -1935,7 +1972,11 @@ impl Worker {
             self.sync_queue();
             if let Some(track) = self.queue.get(self.index).cloned() {
                 self.ticks_since_report = 0;
-                self.report_start(&track);
+                let play_session = self
+                    .pending_play_session
+                    .take()
+                    .unwrap_or_else(new_play_session);
+                self.report_start(&track, play_session);
                 self.update_media_metadata(&track);
             }
             self.update_media_playback();
@@ -2024,6 +2065,7 @@ impl Worker {
         self.pending_fade = None;
         self.pending_tap = None;
         self.pending_download = None;
+        self.pending_play_session = None;
         self.fading_out = None;
         let sink = rodio::Player::connect_new(self.output.mixer());
         sink.set_volume(self.volume);
@@ -2036,7 +2078,7 @@ impl Worker {
         self.listen.restart(Instant::now(), 0);
         self.status = PlaybackStatus::Playing;
         self.ticks_since_report = 0;
-        self.report_start(&track);
+        self.report_start(&track, p.play_session);
         self.update_media_metadata(&track);
         self.update_media_playback();
         self.emit();
@@ -2457,6 +2499,21 @@ impl Worker {
             }
             return;
         };
+        // One play session per *attempt* at a track, not per queue line. The
+        // server takes the id as the identity of a playback: it ties the
+        // /Sessions/Playing* reports to the transcode job it started for this
+        // stream URL, and once we report a session stopped, that playback is
+        // over as far as the server is concerned. Playing the same entry again
+        // -- repeat, jumping back, a queue restored from the store -- has to
+        // be a new one. A reopen (seek inside a transcode, an output-device
+        // switch) is the same attempt and keeps its session.
+        let play_session = match purpose {
+            OpenPurpose::SeekRestart { .. } => self
+                .play_session_id
+                .clone()
+                .unwrap_or_else(new_play_session),
+            OpenPurpose::Play | OpenPurpose::Prefetch => new_play_session(),
+        };
         if matches!(purpose, OpenPurpose::Prefetch) {
             self.prefetch_inflight = Some(track.item_id.clone());
         }
@@ -2471,6 +2528,7 @@ impl Worker {
         let generation = self.generation;
         let prefetch_generation = self.prefetch_generation;
         let tx = self.tx.clone();
+        let session = play_session.clone();
         let spawned = std::thread::Builder::new()
             .name("jellysic-open".into())
             .spawn(move || {
@@ -2478,7 +2536,15 @@ impl Worker {
                 // header with sample rate 0) must still answer, or the player
                 // waits in Loading for good.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    source::open_track_source(&auth, &track, dsp, tap, start_ms, Some(waveform))
+                    source::open_track_source(
+                        &auth,
+                        &track,
+                        &session,
+                        dsp,
+                        tap,
+                        start_ms,
+                        Some(waveform),
+                    )
                 }))
                 .unwrap_or_else(|_| Err(AppError::Audio("the decoder crashed".into())))
                 .map(Box::new);
@@ -2487,6 +2553,7 @@ impl Worker {
                     prefetch_generation,
                     purpose,
                     track: Box::new(track),
+                    play_session,
                     result,
                 });
             });
@@ -2592,12 +2659,10 @@ impl Worker {
 
     // --- Playback reporting (fire-and-forget; never blocks audio) ---
 
-    fn report_start(&mut self, track: &QueueTrack) {
-        let session_id = if track.play_session_id.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            track.play_session_id.clone()
-        };
+    /// `session_id` is the play session the source was opened under: it is in
+    /// the stream URL the server is serving, so the reports have to name the
+    /// same one or the server cannot tie them to its transcode job.
+    fn report_start(&mut self, track: &QueueTrack, session_id: String) {
         self.play_session_id = Some(session_id.clone());
         if let Some(client) = self.session_client() {
             let item_id = track.item_id.clone();
@@ -3466,7 +3531,7 @@ mod tests {
             image_tag: None,
             image_blur_hash: None,
             stream_url: String::new(),
-            play_session_id: String::new(),
+            entry_id: String::new(),
             normalization_gain: None,
             artists: Vec::new(),
             genres: Vec::new(),

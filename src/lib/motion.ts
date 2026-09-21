@@ -31,7 +31,7 @@ export function listFlip(
 
 /**
  * Keys for a list whose natural key may be missing or repeat — queue entries
- * persisted by older builds carry an empty `playSessionId`. Duplicate keys
+ * persisted by older builds carry an empty `entryId`. Duplicate keys
  * make a keyed `{#each}` throw, so a missing or already used id falls back
  * to the row's position.
  */

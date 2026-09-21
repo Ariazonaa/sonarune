@@ -8,6 +8,10 @@ That channel is private until an advisory is published, so nothing is disclosed
 while a fix is being written. Please do not open a public issue for a
 vulnerability.
 
+Without a GitHub account, gh@ariazonaa.net reaches the same person. Plain mail
+is not encrypted, so keep that first message to what the problem touches and
+leave the details for a private advisory once one is open.
+
 This is a one-person project. Expect a first reply within a week rather than
 within a day. If a report is valid and the fix is small, it usually ships in the
 next release; if it is not, you will get a reason rather than silence.

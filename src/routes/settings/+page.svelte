@@ -22,6 +22,7 @@
   import ShortcutSettings from "$lib/components/ShortcutSettings.svelte";
   import LayoutSettings from "$lib/components/LayoutSettings.svelte";
   import TrustedCertSettings from "$lib/components/TrustedCertSettings.svelte";
+  import UpdateSettings from "$lib/components/UpdateSettings.svelte";
   import {
     ACCENTS,
     applyTheme,
@@ -572,6 +573,8 @@
       </label>
     </section>
   {/if}
+
+  <UpdateSettings bind:desktop onsave={() => void saveDesktop()} />
 
   {#if settings}
     <section class="mb-8 rounded-lg bg-card p-5">

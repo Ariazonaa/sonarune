@@ -96,15 +96,15 @@
     const position = entries.findIndex((entry) => entry.index === index);
     const playNextSlot = position > currentPos ? currentPos + 1 : currentPos;
     // The row the user right-clicked, by entry identity, at click time. The
-    // per-entry playSessionId tells two copies of the same track apart (an
-    // item id would hit the other copy); an entry restored from an older
-    // build has none and only still matches where it was.
+    // per-entry id tells two copies of the same track apart (an item id would
+    // hit the other copy); an entry restored from an older build has none and
+    // only still matches where it was.
     const liveIndex = () => {
       const tracks = player.queue.tracks;
-      if (!track.playSessionId) return tracks[index]?.itemId === track.itemId ? index : -1;
-      return tracks[index]?.playSessionId === track.playSessionId
+      if (!track.entryId) return tracks[index]?.itemId === track.itemId ? index : -1;
+      return tracks[index]?.entryId === track.entryId
         ? index
-        : tracks.findIndex((t) => t.playSessionId === track.playSessionId);
+        : tracks.findIndex((t) => t.entryId === track.entryId);
     };
     menu = {
       x: event.clientX,
@@ -207,9 +207,9 @@
     dropAt = event.clientY < rect.top + rect.height / 2 ? index : index + 1;
   }
 
-  // Queue entries carry a per-entry playSessionId, which survives moves —
-  // the stable key FLIP needs. Entries from older builds may lack it.
-  const rowKeys = $derived(uniqueRowKeys(entries.map((entry) => entry.track.playSessionId)));
+  // Queue entries carry a per-entry id, which survives moves — the stable
+  // key FLIP needs. Entries from older builds may lack it.
+  const rowKeys = $derived(uniqueRowKeys(entries.map((entry) => entry.track.entryId)));
 </script>
 
 <aside class="surface flex w-80 shrink-0 flex-col rounded-panel bg-panel">

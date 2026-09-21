@@ -16,6 +16,7 @@ mod proto;
 mod store;
 mod tls;
 mod tray;
+mod updater;
 mod webview_power;
 
 use library_watch::LibraryWatchHandle;
@@ -40,11 +41,11 @@ pub struct AppState {
     pub relogin_blocked: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Shut the app down in order: let the player flush its final "stopped"
-/// report and ListenBrainz listen, and cancel in-flight downloads, before the
-/// process (and with it the async runtime) goes away.
-pub fn quit(app: &tauri::AppHandle) {
-    use tauri::Manager;
+/// Let the player flush its final "stopped" report and ListenBrainz listen,
+/// and cancel in-flight downloads. Every path out of the process goes through
+/// this: quitting, and the updater handing over to the installer, which kills
+/// us just as abruptly.
+pub fn flush_before_exit(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         state
             .player
@@ -53,6 +54,12 @@ pub fn quit(app: &tauri::AppHandle) {
     if let Some(downloads) = app.try_state::<download::DownloadManager>() {
         downloads.cancel_all();
     }
+}
+
+/// Shut the app down in order: flush, then let the process (and with it the
+/// async runtime) go away.
+pub fn quit(app: &tauri::AppHandle) {
+    flush_before_exit(app);
     app.exit(0);
 }
 
@@ -75,6 +82,10 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main_window(app);
         }))
+        // In-app updates (updater.rs). Registering the plugin only provides
+        // the configured endpoint and public key; the check and the install
+        // are our own commands, so no window can reach the plugin's own.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             // Persist size/position/maximized only. Crucially NOT decorations:
             // the window is frameless by config (decorations:false), and a saved
@@ -173,6 +184,10 @@ pub fn run() {
 
             if desktop_settings.start_minimized {
                 tray::hide_main_window(app.handle());
+            }
+
+            if desktop_settings.auto_check_updates {
+                updater::check_in_background(app.handle());
             }
 
             // Bring last session's queue back (paused) so the app never starts
@@ -293,6 +308,8 @@ pub fn run() {
             commands_library::get_favorite_artists,
             commands::check_library_now,
             commands::check_server,
+            updater::check_for_update,
+            updater::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -52,12 +52,23 @@ is on the list. Every release carries a `SHA256SUMS.txt`, and the builds are
 produced by [the release workflow](.github/workflows/release.yml) from the
 tagged commit rather than on someone's machine.
 
+From 0.2.0 on, the installed app keeps itself current: it asks once per start
+whether a newer version exists (you can switch that off) and installs it from
+Settings when you say so — never while a track is playing, and only after the
+download's signature checks out against the project's key. The portable zip
+cannot do that; it gets its new version by hand.
+
 What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md). Building
 it yourself is under [Getting started](#getting-started).
 
 ## Highlights
 
-**Playback (all in Rust)**
+Folded up by area; the full list, with the reasoning, is in
+[`docs/features.md`](docs/features.md).
+
+<details open>
+<summary><b>Playback (all in Rust)</b></summary>
+
 - Symphonia + rodio engine — FLAC / MP3 / Vorbis / WAV, plus a libopus-backed
   decoder for Ogg-Opus.
 - **True gapless** (next track opened ahead and appended sample-accurately) and
@@ -67,7 +78,11 @@ it yourself is under [Getting started](#getting-started).
 - Output-device selection with automatic fallback on device hotplug; sleep timer
   with fade-out.
 
-**Library & queue**
+</details>
+
+<details>
+<summary><b>Library & queue</b></summary>
+
 - Albums / artists / genres with an A–Z scrubber, virtualized grids, favorites,
   home rows, recently-added, multi-disc, play counts.
 - Search 2.0 with history; instant mix and similar-artists.
@@ -77,20 +92,32 @@ it yourself is under [Getting started](#getting-started).
 - Playlists: full CRUD, drag-and-drop reorder, dedup, duplicate, cross-playlist
   transfer, and "save the queue as a playlist".
 
-**Discovery**
+</details>
+
+<details>
+<summary><b>Discovery</b></summary>
+
 - A Discover hub, **dynamic smart views** (server-side filters you can save and
   materialize to a static playlist), decade rows, read-only Collections/BoxSets.
 - **Auto-DJ** that keeps the music going from a track / artist / genre / album /
   playlist seed.
 
-**Now playing & visuals**
+</details>
+
+<details>
+<summary><b>Now playing & visuals</b></summary>
+
 - Synced **lyrics** (line- and word-level), panel + fullscreen, per-track offset.
 - Ambient now-playing backdrop derived from cover art.
 - A **Butterchurn (MilkDrop) visualizer**: 393 presets across seven bundled packs, plus the
   opt-in online Butterchurn Weekly pack, preset browser, beat-sync, sensitivity/quality controls, screenshots,
   and a **projector window** you can throw onto a second monitor with overlays.
 
-**Desktop integration**
+</details>
+
+<details>
+<summary><b>Desktop integration</b></summary>
+
 - Windows **SMTC** (media keys + the OS now-playing overlay), system tray with a
   background mode, a frameless **mini-player** window.
 - **Drops to ~115 MB in the background.** Hidden or minimised, the WebView is
@@ -99,17 +126,27 @@ it yourself is under [Getting started](#getting-started).
 - Command palette (`Ctrl+K`), fully **configurable keyboard shortcuts**, context
   menus with multi-select everywhere.
 
-**Look & feel**
+</details>
+
+<details>
+<summary><b>Look & feel</b></summary>
+
 - **AMOLED dark**: a true-black ground, a short ladder of near blacks, hairlines
   instead of light edges. The accent follows the playing cover by default
   (kept readable against the black), or pick one of 8 presets or your own.
 - View-density and layout presets; skeletons, empty states, an offline banner,
   and a stale-while-revalidate cache for instant navigation.
 
-**Security & trust**
+</details>
+
+<details>
+<summary><b>Security & trust</b></summary>
+
 - Self-signed home servers are handled by **per-server SHA-256 certificate
   pinning** (a custom rustls verifier) — no blanket "accept invalid certs".
 - Auth tokens live in the **OS credential store**, never in the DOM or in SQLite.
+
+</details>
 
 ## Screenshots
 

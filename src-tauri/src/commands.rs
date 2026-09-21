@@ -1103,10 +1103,11 @@ pub(crate) fn to_queue_tracks(
     tracks
         .into_iter()
         .map(|t| {
-            let play_session_id = uuid::Uuid::new_v4().to_string();
             Ok(QueueTrack {
-                stream_url: client.stream_url(&t.id, &play_session_id)?,
-                play_session_id,
+                stream_url: client.stream_url(&t.id)?,
+                // Identity of the queue line for the UI; the play session the
+                // server sees is minted per playback attempt (player/mod.rs).
+                entry_id: uuid::Uuid::new_v4().to_string(),
                 item_id: t.id,
                 name: t.name,
                 artist: t.artist,

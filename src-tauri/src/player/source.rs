@@ -222,9 +222,38 @@ pub struct OpenedSource {
 /// `start_ms` reopens a transcode at that media position (`startTimeTicks`).
 /// With `waveform`, the finished download is also analysed for the seek bar.
 /// Blocking; call from a dedicated thread.
+/// Drop a `playSessionId` the URL already carries. A queue persisted before
+/// the session moved from the queue line to the playback attempt has one baked
+/// into every entry's URL; appending a second would leave the server to pick
+/// between them, and the one it picked might be the stale one.
+fn strip_play_session(url: &str) -> String {
+    let Some(start) = url
+        .find("?playSessionId=")
+        .or_else(|| url.find("&playSessionId="))
+        .map(|i| i + 1)
+    else {
+        return url.to_string();
+    };
+    // Up to and including the separator that ends the parameter, so the one in
+    // front of it stays the separator of what follows.
+    let end = url[start..].find('&').map_or(url.len(), |i| start + i + 1);
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..start]);
+    out.push_str(&url[end..]);
+    // It was the last parameter: the separator in front of it is now dangling.
+    while out.ends_with('&') || out.ends_with('?') {
+        out.pop();
+    }
+    out
+}
+
+/// Open `track` for one attempt at playing it: `play_session` goes into the
+/// stream URL so the server can tie its transcode job to the reports the
+/// player sends, `start_ms` starts it somewhere other than the beginning.
 pub fn open_track_source(
     auth: &StreamAuth,
     track: &QueueTrack,
+    play_session: &str,
     dsp_state: Arc<AudioDsp>,
     tap_state: Arc<VisualizerTap>,
     start_ms: Option<u64>,
@@ -265,7 +294,12 @@ pub fn open_track_source(
     )?;
     let http = builder.build()?;
 
-    let mut stream_url = track.stream_url.clone();
+    // The queue entry's URL is the track; what belongs to this one attempt at
+    // playing it is added here. The play session is what the server correlates
+    // its transcode job and our progress reports by.
+    let mut stream_url = strip_play_session(&track.stream_url);
+    stream_url.push(if stream_url.contains('?') { '&' } else { '?' });
+    stream_url.push_str(&format!("playSessionId={play_session}"));
     if let Some(start_ms) = start_ms {
         // .NET ticks: 100 ns.
         stream_url.push_str(&format!("&startTimeTicks={}", start_ms * 10_000));
@@ -391,7 +425,38 @@ pub fn open_track_source(
 
 #[cfg(test)]
 mod tests {
-    use super::{same_origin, DownloadProgress};
+    use super::{same_origin, strip_play_session, DownloadProgress};
+
+    #[test]
+    fn an_old_entrys_play_session_is_replaced_not_doubled() {
+        // Middle of the query: the parameter goes, its neighbours stay joined.
+        assert_eq!(
+            strip_play_session(
+                "https://h/Audio/1/universal?userId=u&playSessionId=old&container=x"
+            ),
+            "https://h/Audio/1/universal?userId=u&container=x"
+        );
+        // Last parameter: no dangling separator is left behind.
+        assert_eq!(
+            strip_play_session("https://h/Audio/1/universal?userId=u&playSessionId=old"),
+            "https://h/Audio/1/universal?userId=u"
+        );
+        // Only parameter: the query goes with it.
+        assert_eq!(
+            strip_play_session("https://h/Audio/1/universal?playSessionId=old"),
+            "https://h/Audio/1/universal"
+        );
+        // A URL built by the current code has none.
+        assert_eq!(
+            strip_play_session("https://h/Audio/1/universal?userId=u"),
+            "https://h/Audio/1/universal?userId=u"
+        );
+        // A parameter that merely ends in the same name is not one.
+        assert_eq!(
+            strip_play_session("https://h/Audio/1/universal?notAPlaySessionId=keep"),
+            "https://h/Audio/1/universal?notAPlaySessionId=keep"
+        );
+    }
 
     #[test]
     fn download_progress_is_a_fraction_of_a_known_length() {

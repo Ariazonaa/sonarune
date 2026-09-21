@@ -1694,13 +1694,17 @@ impl JellyfinClient {
     /// Universal audio endpoint: the server picks direct play when the client
     /// supports the container (Symphonia: flac/mp3/vorbis/wav, our libopus
     /// path: ogg-opus), otherwise transcodes to Ogg-Opus (progressive; HLS is
-    /// a later refinement). `play_session_id` correlates our playback reports
-    /// with the server's transcode session so skipping a track kills its
+    /// a later refinement).
+    ///
+    /// Without a `playSessionId`: that one belongs to an attempt at playing
+    /// the track, not to the track, and is appended when a source is opened
+    /// (`player/source.rs`). It is what the server correlates our playback
+    /// reports with its transcode session by, so skipping a track kills its
     /// ffmpeg job.
-    pub fn stream_url(&self, item_id: &str, play_session_id: &str) -> AppResult<String> {
+    pub fn stream_url(&self, item_id: &str) -> AppResult<String> {
         let user_id = self.user_id()?;
         Ok(format!(
-            "{}/Audio/{item_id}/universal?userId={user_id}&deviceId={}&playSessionId={play_session_id}&container=opus,ogg%7Copus,flac,mp3,ogg%7Cvorbis,wav&transcodingContainer=opus&transcodingProtocol=http&audioCodec=opus&maxStreamingBitrate=320000000",
+            "{}/Audio/{item_id}/universal?userId={user_id}&deviceId={}&container=opus,ogg%7Copus,flac,mp3,ogg%7Cvorbis,wav&transcodingContainer=opus&transcodingProtocol=http&audioCodec=opus&maxStreamingBitrate=320000000",
             self.base_url, self.device_id
         ))
     }

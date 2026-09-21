@@ -17,6 +17,10 @@ pub struct DesktopSettings {
     pub close_behavior: CloseBehavior,
     pub start_minimized: bool,
     pub cover_cache_limit_mb: u64,
+    /// Ask the release endpoint once per start whether a newer version exists
+    /// (see updater.rs). Off means the app never talks to GitHub on its own;
+    /// the button in Settings still checks on demand.
+    pub auto_check_updates: bool,
 }
 
 impl Default for DesktopSettings {
@@ -25,6 +29,7 @@ impl Default for DesktopSettings {
             close_behavior: CloseBehavior::Quit,
             start_minimized: false,
             cover_cache_limit_mb: DEFAULT_LIMIT_MB,
+            auto_check_updates: true,
         }
     }
 }
