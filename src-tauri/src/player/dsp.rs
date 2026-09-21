@@ -32,6 +32,12 @@ pub struct DspParams {
     /// Per-band gain in dB, clamped to -12..=12 on application.
     pub eq_gains_db: [f32; BAND_COUNT],
     pub normalization_enabled: bool,
+    /// Album mode: every track of an album is played at one gain, so the quiet
+    /// piece stays quieter than the loud one — what an album was mixed for.
+    /// Off means per-track. A flag rather than a third state of
+    /// `normalization_enabled`, so settings saved by older builds keep working.
+    #[serde(default)]
+    pub album_normalization: bool,
     /// Extra gain in dB on top of the track's normalization gain, clamped to
     /// -15..=15. Only applied when a track gain is present.
     pub preamp_db: f32,
@@ -43,6 +49,7 @@ impl Default for DspParams {
             eq_enabled: false,
             eq_gains_db: [0.0; BAND_COUNT],
             normalization_enabled: true,
+            album_normalization: false,
             preamp_db: 0.0,
         }
     }
@@ -477,7 +484,7 @@ mod tests {
             eq_enabled: true,
             eq_gains_db: [6.0; BAND_COUNT],
             normalization_enabled: false,
-            preamp_db: 0.0,
+            ..DspParams::default()
         };
         let mut samples = vec![0.5f32; 8];
         samples[2] = f32::NAN;

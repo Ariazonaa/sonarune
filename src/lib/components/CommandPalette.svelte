@@ -37,6 +37,8 @@
     save: "M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z",
     moon: "M12.1 22c-5.5 0-10-4.5-10-10 0-5 3.7-9.2 8.6-9.9.5-.1.9.4.7.9-.3.8-.4 1.6-.4 2.5 0 4.1 3.3 7.4 7.4 7.4.9 0 1.7-.1 2.5-.4.5-.2 1 .3.9.7-.8 4.9-5 8.8-9.7 8.8z",
     mix: "M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.03 3.03L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z",
+    target:
+      "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.94 3A9 9 0 0 0 13 3.06V1h-2v2.06A9 9 0 0 0 3.06 11H1v2h2.06A9 9 0 0 0 11 20.94V23h2v-2.06A9 9 0 0 0 20.94 13H23v-2h-2.06zM12 19a7 7 0 1 1 0-14 7 7 0 0 1 0 14z",
   };
 
   let query = $state("");
@@ -118,6 +120,15 @@
       { label: sleepLabel(m.sleep_minutes({ minutes: 30 })), icon: I.moon, run: () => sleep(30, false) },
       { label: sleepLabel(m.sleep_minutes({ minutes: 60 })), icon: I.moon, run: () => sleep(60, false) },
       { label: sleepLabel(m.sleep_off()), icon: I.moon, run: () => sleep(null, false) },
+      {
+        label: m.queue_jump_to_current(),
+        icon: I.target,
+        disabled: !current,
+        run: () => {
+          close();
+          player.jumpToCurrent();
+        },
+      },
       {
         label: m.cmd_instant_mix_current(),
         icon: I.mix,

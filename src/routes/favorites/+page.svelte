@@ -5,12 +5,18 @@
   import { m } from "$lib/paraglide/messages";
   import Cover from "$lib/components/Cover.svelte";
   import AlbumContextMenu from "$lib/components/AlbumContextMenu.svelte";
+  import ContextMenu, { type ContextMenuItem } from "$lib/components/ContextMenu.svelte";
+  import AddToPlaylistMenu from "$lib/components/AddToPlaylistMenu.svelte";
+  import SongInfo from "$lib/components/SongInfo.svelte";
+  import MetadataEditor from "$lib/components/MetadataEditor.svelte";
   import EmptyState from "$lib/components/EmptyState.svelte";
   import { player } from "$lib/state/player.svelte";
   import { library } from "$lib/state/library.svelte";
   import { createAlbumMenu } from "$lib/state/albumMenu.svelte";
   import { swrGet, swrSet } from "$lib/swr";
-  import { contextMenuKey } from "$lib/menu";
+  import { contextMenuKey, menuPoint } from "$lib/menu";
+  import { TRACK_ICON, trackMenuItems } from "$lib/trackMenu";
+  import { startDrag } from "$lib/dragToPlaylist";
   import type { FavoritesData, Page, TrackDto } from "$lib/types";
 
   type Section = keyof FavoritesData;
@@ -28,6 +34,10 @@
   let loadSeq = 0;
   /** Bumped whenever the lists are replaced wholesale; section pages still in flight belong to the old lists. */
   let generation = 0;
+  let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
+  let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
+  let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
+  let edit = $state<{ itemId: string; name: string } | null>(null);
 
   function load() {
     const seq = ++loadSeq;
@@ -53,6 +63,49 @@
   $effect(() => {
     if (library.revision > 0) untrack(load);
   });
+
+  /** Drop tracks from the list without refetching: they were deleted on the
+   *  server, or they are not favorites any more. Either way this page is the
+   *  list of favorite tracks, and they no longer belong on it. */
+  function dropTracks(ids: string[]) {
+    if (!favorites) return;
+    const removed = new Set(ids);
+    const items = favorites.tracks.items.filter((track) => !removed.has(track.id));
+    favorites.tracks = { items, total: Math.max(items.length, favorites.tracks.total - ids.length) };
+  }
+
+  function onTrackContextMenu(event: MouseEvent, track: TrackDto) {
+    event.preventDefault();
+    const { x, y } = menuPoint(event);
+    menu = {
+      x,
+      y,
+      items: trackMenuItems([track], {
+        // Same as clicking the row: play it inside its album where it has one.
+        play: { run: () => void playTrack(track) },
+        addToPlaylist: (tracks) => (addTo = { x, y, trackIds: tracks.map((t) => t.id) }),
+        info: (t) => (info = { itemId: t.id, name: t.name, playCount: t.playCount }),
+        edit: (t) => (edit = { itemId: t.id, name: t.name }),
+        onRemoved: dropTracks,
+        extra: (tracks) => [
+          {
+            label: m.favorite_remove(),
+            icon: TRACK_ICON.heart,
+            action: () => {
+              const ids = tracks.map((t) => t.id);
+              dropTracks(ids);
+              // Re-sync from the server if it disagrees; the row is gone from
+              // the page either way until then.
+              apiLibrary.setFavorite(ids[0], false).catch((e) => {
+                player.error = String(e);
+                load();
+              });
+            },
+          },
+        ],
+      }),
+    };
+  }
 
   /** Append `next` to `current`. Favorites can change between pages; a repeated id would crash the keyed list. */
   function mergePage<T extends { id: string }>(current: Page<T>, next: Page<T>): Page<T> {
@@ -192,6 +245,8 @@
           {#each favorites.albums.items as album (album.id)}
             <a
               href="/album/{album.id}"
+              draggable="true"
+              ondragstart={(e) => startDrag(e, { albumId: album.id, label: album.name })}
               oncontextmenu={(e) => am.open(e, album)}
               {@attach contextMenuKey}
               class="group rounded-lg bg-card p-3 transition-colors duration-200 hover:bg-panel-2"
@@ -237,6 +292,11 @@
             {#each favorites.tracks.items as track (track.id)}
               <tr
                 class="group cursor-pointer transition-colors hover:bg-ink/10"
+                draggable="true"
+                ondragstart={(event) =>
+                  startDrag(event, { trackIds: [track.id], label: track.name })}
+                oncontextmenu={(event) => onTrackContextMenu(event, track)}
+                {@attach contextMenuKey}
                 onclick={() => playTrack(track)}
               >
                 <td class="w-11 rounded-l-md py-1">
@@ -262,3 +322,28 @@
 </div>
 
 <AlbumContextMenu menu={am} />
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
+{/if}
+{#if addTo}
+  <AddToPlaylistMenu x={addTo.x} y={addTo.y} trackIds={addTo.trackIds} onclose={() => (addTo = null)} />
+{/if}
+{#if info}
+  <SongInfo
+    itemId={info.itemId}
+    name={info.name}
+    playCount={info.playCount}
+    onclose={() => (info = null)}
+  />
+{/if}
+{#if edit}
+  <MetadataEditor
+    itemId={edit.itemId}
+    displayName={edit.name}
+    onclose={() => (edit = null)}
+    onsaved={() => {
+      edit = null;
+      load();
+    }}
+  />
+{/if}

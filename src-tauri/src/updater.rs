@@ -37,6 +37,79 @@ use crate::error::{AppError, AppResult};
 use crate::player::PlaybackStatus;
 use crate::AppState;
 
+/// What can stop an update, as far as the UI needs to tell the cases apart.
+///
+/// The frontend sees `update:<code>` (see [`UpdateError::code`] and
+/// `src/lib/updateErrors.ts`) and turns that into a sentence; the detail of a
+/// failure stays in the log, where it belongs -- "the release page could not
+/// be reached" is something a listener can act on, `error sending request` is
+/// not.
+#[derive(Debug)]
+enum UpdateError {
+    /// A track is playing or loading. The installer closes the app.
+    Playing,
+    /// Not an installed copy, so running the installer would leave two.
+    Portable,
+    /// Asked to install, but the endpoint offers nothing newer.
+    NothingNewer,
+    /// The endpoint answered, but with no release for this platform -- or with
+    /// nothing that could be read as one.
+    NoRelease,
+    /// The endpoint could not be reached at all.
+    Offline,
+    /// The download broke off.
+    Download,
+    /// The download did not match the project's signature. Not a hiccup: the
+    /// file was tampered with, came from somewhere else, or was signed with a
+    /// key this build does not trust.
+    Signature,
+    /// The installer could not be started.
+    Install,
+    /// This build has no updater configured.
+    Unavailable,
+}
+
+impl UpdateError {
+    /// The wire form `updateErrors.ts` parses. Keep both sides in sync.
+    fn code(&self) -> &'static str {
+        match self {
+            UpdateError::Playing => "update:playing",
+            UpdateError::Portable => "update:portable",
+            UpdateError::NothingNewer => "update:none",
+            UpdateError::NoRelease => "update:no-release",
+            UpdateError::Offline => "update:offline",
+            UpdateError::Download => "update:download",
+            UpdateError::Signature => "update:signature",
+            UpdateError::Install => "update:install",
+            UpdateError::Unavailable => "update:unavailable",
+        }
+    }
+}
+
+impl From<UpdateError> for AppError {
+    fn from(error: UpdateError) -> Self {
+        AppError::Other(error.code().into())
+    }
+}
+
+/// Sort a plugin failure into what the user can do about it, and log what
+/// actually happened -- the diagnostic export carries the log, the UI does not.
+fn classify(context: &str, error: tauri_plugin_updater::Error) -> UpdateError {
+    use tauri_plugin_updater::Error as E;
+    tracing::warn!("{context}: {error}");
+    match error {
+        E::ReleaseNotFound
+        | E::TargetNotFound(_)
+        | E::TargetsNotFound(_)
+        | E::UnsupportedArch
+        | E::UnsupportedOs => UpdateError::NoRelease,
+        E::Reqwest(_) | E::Network(_) => UpdateError::Offline,
+        E::Minisign(_) | E::SignatureUtf8(_) | E::Base64(_) => UpdateError::Signature,
+        E::EmptyEndpoints => UpdateError::Unavailable,
+        _ => UpdateError::Download,
+    }
+}
+
 /// How long the automatic check waits after startup. The first seconds belong
 /// to restoring the session and the queue; an update request would compete
 /// with them for the network and delays nothing by waiting.
@@ -72,7 +145,7 @@ struct ProgressEvent {
 /// An updater whose exit hook leaves the app in a clean state: the installer
 /// kills this process, so the last playback report and any running download
 /// have to be dealt with first — the same order as the quit path.
-fn updater(app: &AppHandle) -> AppResult<Updater> {
+fn updater(app: &AppHandle) -> Result<Updater, UpdateError> {
     let handle = app.clone();
     app.updater_builder()
         .on_before_exit(move || {
@@ -80,14 +153,14 @@ fn updater(app: &AppHandle) -> AppResult<Updater> {
             handle.cleanup_before_exit();
         })
         .build()
-        .map_err(|e| AppError::Other(format!("updater unavailable: {e}")))
+        .map_err(|e| classify("updater unavailable", e))
 }
 
-async fn check(app: &AppHandle) -> AppResult<Option<Update>> {
+async fn check(app: &AppHandle) -> Result<Option<Update>, UpdateError> {
     updater(app)?
         .check()
         .await
-        .map_err(|e| AppError::Other(format!("update check failed: {e}")))
+        .map_err(|e| classify("update check failed", e))
 }
 
 /// Whether this copy was installed rather than unpacked from the portable zip.
@@ -135,7 +208,7 @@ fn info(app: &AppHandle, update: Option<&Update>) -> UpdateInfo {
 
 /// The frontend disables the install button while a track runs, but the rule
 /// lives here — a command is reachable whatever the UI shows.
-fn refuse_while_playing(app: &AppHandle) -> AppResult<()> {
+fn refuse_while_playing(app: &AppHandle) -> Result<(), UpdateError> {
     let Some(state) = app.try_state::<AppState>() else {
         return Ok(());
     };
@@ -143,7 +216,7 @@ fn refuse_while_playing(app: &AppHandle) -> AppResult<()> {
         state.player.state().status,
         PlaybackStatus::Playing | PlaybackStatus::Loading
     ) {
-        return Err(AppError::Other("update:playing".into()));
+        return Err(UpdateError::Playing);
     }
     Ok(())
 }
@@ -164,13 +237,11 @@ pub async fn check_for_update(app: AppHandle) -> AppResult<UpdateInfo> {
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> AppResult<()> {
     if !installed_copy() {
-        return Err(AppError::Other("update:portable".into()));
+        return Err(UpdateError::Portable.into());
     }
     refuse_while_playing(&app)?;
 
-    let update = check(&app)
-        .await?
-        .ok_or_else(|| AppError::Other("update:none".into()))?;
+    let update = check(&app).await?.ok_or(UpdateError::NothingNewer)?;
 
     let mut downloaded: u64 = 0;
     let progress_to = app.clone();
@@ -183,15 +254,16 @@ pub async fn install_update(app: AppHandle) -> AppResult<()> {
             || {},
         )
         .await
-        .map_err(|e| AppError::Other(format!("update download failed: {e}")))?;
+        .map_err(|e| classify("update download failed", e))?;
 
     // The download runs for a while; playback may have started in it.
     refuse_while_playing(&app)?;
 
     tracing::info!(version = %update.version, "installing update");
-    update
-        .install(bytes)
-        .map_err(|e| AppError::Other(format!("update install failed: {e}")))
+    update.install(bytes).map_err(|e| {
+        classify("update install failed", e);
+        AppError::from(UpdateError::Install)
+    })
 }
 
 /// Check once, quietly, a while after startup, and tell the UI only when there
@@ -207,7 +279,9 @@ pub fn check_in_background(app: &AppHandle) {
                 let _ = app.emit("updater:available", info(&app, Some(&update)));
             }
             Ok(None) => tracing::debug!("no update available"),
-            Err(e) => tracing::info!("{e}"),
+            // `classify` already logged it; a failed background check is
+            // not worth anything louder.
+            Err(_) => {}
         }
     });
 }
@@ -250,6 +324,22 @@ mod tests {
             pubkey.starts_with("dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6"),
             "pubkey does not look like a minisign public key"
         );
+    }
+
+    #[test]
+    fn error_codes_are_stable() {
+        // `src/lib/updateErrors.ts` parses exactly these strings.
+        use super::UpdateError;
+        let wire = |e: UpdateError| crate::error::AppError::from(e).to_string();
+        assert_eq!(wire(UpdateError::Playing), "update:playing");
+        assert_eq!(wire(UpdateError::Portable), "update:portable");
+        assert_eq!(wire(UpdateError::NothingNewer), "update:none");
+        assert_eq!(wire(UpdateError::NoRelease), "update:no-release");
+        assert_eq!(wire(UpdateError::Offline), "update:offline");
+        assert_eq!(wire(UpdateError::Download), "update:download");
+        assert_eq!(wire(UpdateError::Signature), "update:signature");
+        assert_eq!(wire(UpdateError::Install), "update:install");
+        assert_eq!(wire(UpdateError::Unavailable), "update:unavailable");
     }
 
     /// The release build must not accept an older release. Downgrades are the

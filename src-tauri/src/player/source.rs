@@ -247,18 +247,34 @@ fn strip_play_session(url: &str) -> String {
     out
 }
 
-/// Open `track` for one attempt at playing it: `play_session` goes into the
-/// stream URL so the server can tie its transcode job to the reports the
-/// player sends, `start_ms` starts it somewhere other than the beginning.
+/// What one attempt at playing a track brings along, as opposed to the queue
+/// entry, which is the same every time it is played.
+pub struct Attempt<'a> {
+    /// Goes into the stream URL, so the server can tie its transcode job to
+    /// the reports the player sends.
+    pub play_session: &'a str,
+    /// The normalization gain the player picked (track or album mode) -- it is
+    /// deliberately not read off the entry here.
+    pub gain_db: Option<f32>,
+    /// Start somewhere other than the beginning: a seek in a live transcode,
+    /// or a reopen after the output device changed.
+    pub start_ms: Option<u64>,
+}
+
+/// Open `track` for one attempt at playing it.
 pub fn open_track_source(
     auth: &StreamAuth,
     track: &QueueTrack,
-    play_session: &str,
+    attempt: Attempt<'_>,
     dsp_state: Arc<AudioDsp>,
     tap_state: Arc<VisualizerTap>,
-    start_ms: Option<u64>,
     waveform: Option<WaveformRequest>,
 ) -> AppResult<OpenedSource> {
+    let Attempt {
+        play_session,
+        gain_db,
+        start_ms,
+    } = attempt;
     use stream_download::http::HttpStream;
     use stream_download::source::SourceStream;
     use stream_download::storage::adaptive::AdaptiveStorageProvider;
@@ -412,7 +428,7 @@ pub fn open_track_source(
         None => 0,
     };
 
-    let (faded, fade) = fade::wrap(dsp::wrap(source, dsp_state, track.normalization_gain));
+    let (faded, fade) = fade::wrap(dsp::wrap(source, dsp_state, gain_db));
     let (tapped, tap_enabled) = tap::wrap(faded, tap_state);
     Ok(OpenedSource {
         source: tapped,

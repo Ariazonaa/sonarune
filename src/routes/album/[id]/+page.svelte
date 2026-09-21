@@ -8,7 +8,11 @@
   import CoverBackdrop from "$lib/components/CoverBackdrop.svelte";
   import ArtistLinks from "$lib/components/ArtistLinks.svelte";
   import AddToPlaylistMenu from "$lib/components/AddToPlaylistMenu.svelte";
-  import { menuPoint } from "$lib/menu";
+  import ContextMenu, { type ContextMenuItem } from "$lib/components/ContextMenu.svelte";
+  import SongInfo from "$lib/components/SongInfo.svelte";
+  import { contextMenuKey, menuPoint } from "$lib/menu";
+  import { deleteTracks, trackMenuItems } from "$lib/trackMenu";
+  import { startDrag } from "$lib/dragToPlaylist";
   import MetadataEditor from "$lib/components/MetadataEditor.svelte";
   import { player } from "$lib/state/player.svelte";
   import { session } from "$lib/state/session.svelte";
@@ -22,6 +26,8 @@
   let error = $state<string | null>(null);
   let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
   let edit = $state<{ itemId: string; name: string } | null>(null);
+  let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
+  let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
 
   const albumId = $derived(page.params.id!);
   const currentTrackId = $derived(player.state.current?.itemId);
@@ -140,21 +146,28 @@
   }
 
   // Delete a single track's file from the server; drop it from the view.
-  async function deleteTrack(track: TrackDto) {
-    const ok = await confirm.ask({
-      title: m.delete_confirm_title(),
-      body: m.delete_track_confirm({ name: track.name }),
-      confirmLabel: m.delete_action(),
-      danger: true,
-    });
-    if (!ok) return;
-    try {
-      await apiLibrary.deleteItems([track.id]);
-      if (detail) detail.tracks = detail.tracks.filter((t) => t.id !== track.id);
-      toast.show(m.delete_done());
-    } catch (e) {
-      player.error = String(e);
-    }
+  /** Drop rows the server no longer has, without fetching the album again. */
+  function dropTracks(ids: string[]) {
+    const removed = new Set(ids);
+    if (detail) detail.tracks = detail.tracks.filter((track) => !removed.has(track.id));
+  }
+
+  function onRowContextMenu(event: MouseEvent, track: TrackDto, index: number) {
+    event.preventDefault();
+    const { x, y } = menuPoint(event);
+    menu = {
+      x,
+      y,
+      items: trackMenuItems([track], {
+        // Playing a row here means playing the album from it, which is what
+        // clicking the row does too.
+        play: { run: () => player.run(api.playAlbum(albumId, index)) },
+        addToPlaylist: (tracks) => (addTo = { x, y, trackIds: tracks.map((t) => t.id) }),
+        info: (t) => (info = { itemId: t.id, name: t.name, playCount: t.playCount }),
+        edit: (t) => (edit = { itemId: t.id, name: t.name }),
+        onRemoved: dropTracks,
+      }),
+    };
   }
 </script>
 
@@ -282,6 +295,10 @@
               tabindex="0"
               role="button"
               aria-label={track.name}
+              draggable="true"
+              ondragstart={(e) => startDrag(e, { trackIds: [track.id], label: track.name })}
+              oncontextmenu={(e) => onRowContextMenu(e, track, i)}
+              {@attach contextMenuKey}
               onclick={() => player.run(api.playAlbum(albumId, i))}
               onkeydown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
@@ -377,7 +394,7 @@
                       class="invisible rounded p-1 text-ink-muted group-hover:visible hover:text-red-400"
                       onclick={(e) => {
                         e.stopPropagation();
-                        deleteTrack(track);
+                        void deleteTracks([track], dropTracks);
                       }}
                       aria-label={m.delete_from_server()}
                       title={m.delete_from_server()}
@@ -417,6 +434,12 @@
   {/if}
 </div>
 
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
+{/if}
+{#if info}
+  <SongInfo itemId={info.itemId} name={info.name} onclose={() => (info = null)} />
+{/if}
 {#if addTo}
   <AddToPlaylistMenu x={addTo.x} y={addTo.y} trackIds={addTo.trackIds} onclose={() => (addTo = null)} />
 {/if}

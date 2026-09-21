@@ -9,6 +9,8 @@
   import EmptyState from "$lib/components/EmptyState.svelte";
   import { library } from "$lib/state/library.svelte";
   import { player } from "$lib/state/player.svelte";
+  // Aliased: this file has its own `playlists` — the list it renders.
+  import { playlists as playlistStore } from "$lib/state/playlists.svelte";
   import { toast } from "$lib/state/toast.svelte";
   import { confirm } from "$lib/state/confirm.svelte";
   import type { PlaylistDto } from "$lib/types";
@@ -43,6 +45,7 @@
             if (!ok) return;
             apiLibrary
               .deletePlaylist(playlist.id)
+              .then(() => playlistStore.refresh())
               .then(() => {
                 toast.show(m.playlist_deleted());
                 load();
@@ -76,6 +79,7 @@
     newName = "";
     try {
       const id = await apiLibrary.createPlaylist(name, []);
+      playlistStore.refresh();
       toast.show(m.playlist_created());
       goto(`/playlist/${id}`);
     } catch (e) {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { api, formatDuration } from "$lib/api";
   import { apiLibrary } from "$lib/api/library";
@@ -6,6 +7,7 @@
   import { player } from "$lib/state/player.svelte";
   import { toast } from "$lib/state/toast.svelte";
   import { downloads } from "$lib/state/downloads.svelte";
+  import { playlists } from "$lib/state/playlists.svelte";
   import { listFlip, uniqueRowKeys } from "$lib/motion";
   import { currentPosition, playOrder } from "$lib/queueOrder";
   import { contextMenuKey } from "$lib/menu";
@@ -23,6 +25,67 @@
   // in this list is what queue_move takes (play next, drag & drop).
   const entries = $derived(playOrder(queue));
   const currentPos = $derived(currentPosition(queue, entries));
+
+  // Scrolling to what is playing. The row is found in the DOM rather than
+  // bound: only one row at a time is the current one, and which row that is
+  // changes with every track.
+  let listEl = $state<HTMLUListElement | null>(null);
+  let currentOffscreen = $state(false);
+  const currentRow = () => listEl?.querySelector<HTMLElement>('[data-current="true"]') ?? null;
+
+  /** Put the playing entry in the middle of the panel. Instant when the panel
+   *  just opened — an animation out of nowhere reads as the list moving by
+   *  itself — and smooth when someone asked for it and can follow the motion. */
+  function revealCurrent(behavior: ScrollBehavior) {
+    currentRow()?.scrollIntoView({ block: "center", behavior });
+  }
+
+  onMount(() => revealCurrent("instant"));
+
+  // Is the playing entry in view? Decides whether the pill shows, and whether
+  // the list follows the music: while it is on screen the next track scrolls
+  // into place, and while the user is reading somewhere else it does not.
+  $effect(() => {
+    queue.index;
+    entries.length;
+    const root = listEl;
+    const row = currentRow();
+    if (!root || !row) {
+      currentOffscreen = false;
+      return;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => (currentOffscreen = !entry.isIntersecting),
+      { root, threshold: 0.6 },
+    );
+    observer.observe(row);
+    return () => observer.disconnect();
+  });
+
+  let followedIndex = player.queue.index;
+  $effect(() => {
+    const index = queue.index;
+    if (index === followedIndex) return;
+    const follow = !currentOffscreen;
+    followedIndex = index;
+    // The row for the new index exists only after this update is applied.
+    if (follow) void tick().then(() => revealCurrent("smooth"));
+  });
+
+  // "Jump to the playing track" from the palette or the shortcut. The panel
+  // may have been opened by that same request, and then `onMount` has already
+  // put the row in place — hence the counter: only a change means jump.
+  let lastReveal = player.revealCurrent;
+  $effect(() => {
+    const token = player.revealCurrent;
+    if (token === lastReveal) return;
+    lastReveal = token;
+    revealCurrent("smooth");
+  });
+
+  // A square in a circle: the sign for "and then it is quiet".
+  const ICON_STOP =
+    "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16zM9 9h6v6H9V9z";
 
   let menu = $state<{ x: number; y: number; items: ContextMenuItem[]; label?: string } | null>(null);
   let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
@@ -54,6 +117,7 @@
     if (!name || trackIds.length === 0) return;
     try {
       await apiLibrary.createPlaylist(name, trackIds);
+      playlists.refresh();
       toast.show(m.playlist_created());
     } catch (e) {
       player.error = String(e);
@@ -110,6 +174,41 @@
       x: event.clientX,
       y: event.clientY,
       items: [
+        {
+          // Armed on this row already? Then the entry takes it back off —
+          // otherwise there would be no way to undo it from here.
+          label:
+            player.state.stopAfter === "track" && player.state.stopAfterItem === track.itemId
+              ? m.queue_stop_after_track_off()
+              : m.queue_stop_after_track(),
+          icon: ICON_STOP,
+          action: () =>
+            player.run(
+              api.playerSetStopAfter(
+                player.state.stopAfter === "track" && player.state.stopAfterItem === track.itemId
+                  ? "off"
+                  : "track",
+                track.itemId,
+              ),
+            ),
+        },
+        {
+          label:
+            player.state.stopAfter === "album" && player.state.stopAfterItem === track.itemId
+              ? m.queue_stop_after_album_off()
+              : m.queue_stop_after_album(),
+          icon: ICON_STOP,
+          disabled: !track.albumId,
+          action: () =>
+            player.run(
+              api.playerSetStopAfter(
+                player.state.stopAfter === "album" && player.state.stopAfterItem === track.itemId
+                  ? "off"
+                  : "album",
+                track.itemId,
+              ),
+            ),
+        },
         {
           label: m.queue_play_now(),
           icon: "M8 5v14l11-7L8 5z",
@@ -212,7 +311,7 @@
   const rowKeys = $derived(uniqueRowKeys(entries.map((entry) => entry.track.entryId)));
 </script>
 
-<aside class="surface flex w-80 shrink-0 flex-col rounded-panel bg-panel">
+<aside class="surface relative flex w-80 shrink-0 flex-col rounded-panel bg-panel">
   <div class="flex items-center justify-between gap-2 px-4 py-3">
     {#if naming}
       <!-- svelte-ignore a11y_autofocus -->
@@ -292,7 +391,11 @@
       compact
     />
   {:else}
-    <ul class="min-h-0 flex-1 overflow-y-auto p-2" ondragleave={() => (dropAt = null)}>
+    <ul
+      bind:this={listEl}
+      class="min-h-0 flex-1 overflow-y-auto p-2"
+      ondragleave={() => (dropAt = null)}
+    >
       {#each entries as { track, index }, i (rowKeys[i])}
         <li
           animate:listFlip={{ rows: entries.length }}
@@ -318,6 +421,7 @@
             </p>
           {/if}
           <div
+            data-current={index === queue.index}
             class="group relative flex items-center gap-2 rounded-md px-2 py-1.5
               {index === queue.index ? 'bg-panel-2' : 'hover:bg-panel-2/60'}
               {dragFrom === i ? 'opacity-40' : ''}"
@@ -345,6 +449,21 @@
               {/if}
             </div>
           </button>
+          {#if player.state.stopAfter !== "off" && player.state.stopAfterItem === track.itemId}
+            <!-- The armed stop belongs on the row it was armed on: nothing
+                 else in the list says where the music will end. -->
+            <span
+              class="shrink-0 text-accent"
+              title={player.state.stopAfter === "album"
+                ? m.queue_stop_after_album()
+                : m.queue_stop_after_track()}
+              aria-label={m.queue_stop_after_armed()}
+            >
+              <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
+                <path d={ICON_STOP} />
+              </svg>
+            </span>
+          {/if}
           <span class="text-[11px] text-ink-muted tabular-nums">
             {formatDuration(track.durationMs)}
           </span>
@@ -362,6 +481,22 @@
         </li>
       {/each}
     </ul>
+  {/if}
+
+  <!-- Only while the playing entry is scrolled out of sight: it is an offer to
+       go back to it, not a permanent control. -->
+  {#if currentOffscreen}
+    <button
+      class="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 whitespace-nowrap rounded-full bg-accent px-3 py-1.5 text-xs font-bold text-(--color-on-accent) shadow-xl transition-transform hover:scale-105"
+      onclick={() => revealCurrent("smooth")}
+    >
+      <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
+        <path
+          d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.94 3A9 9 0 0 0 13 3.06V1h-2v2.06A9 9 0 0 0 3.06 11H1v2h2.06A9 9 0 0 0 11 20.94V23h2v-2.06A9 9 0 0 0 20.94 13H23v-2h-2.06zM12 19a7 7 0 1 1 0-14 7 7 0 0 1 0 14z"
+        />
+      </svg>
+      {m.queue_jump_to_current()}
+    </button>
   {/if}
 </aside>
 

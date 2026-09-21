@@ -1120,6 +1120,7 @@ pub(crate) fn to_queue_tracks(
                 image_tag: t.image_tag,
                 image_blur_hash: t.image_blur_hash,
                 normalization_gain: t.normalization_gain,
+                album_normalization_gain: t.album_normalization_gain,
                 artists: t.artists,
                 genres: t.genres,
                 source_playlist_id: None,
@@ -1428,6 +1429,20 @@ pub fn set_sleep_timer(
         end_of_track,
         fade_seconds,
     })
+}
+
+/// Arm "stop after this track" or "stop after this album" on one queue entry
+/// (`item_id`), or on whatever is playing when it is left out.
+/// `StopAfter::Off` clears it.
+#[tauri::command]
+pub fn player_set_stop_after(
+    state: State<'_, AppState>,
+    mode: crate::player::StopAfter,
+    item_id: Option<String>,
+) -> AppResult<()> {
+    state
+        .player
+        .send(PlayerCommand::SetStopAfter { mode, item_id })
 }
 
 fn listenbrainz_entry() -> AppResult<keyring::Entry> {

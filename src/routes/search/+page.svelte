@@ -6,9 +6,20 @@
   import { api, formatDuration } from "$lib/api";
   import { m } from "$lib/paraglide/messages";
   import Cover from "$lib/components/Cover.svelte";
+  import ContextMenu, { type ContextMenuItem } from "$lib/components/ContextMenu.svelte";
+  import AddToPlaylistMenu from "$lib/components/AddToPlaylistMenu.svelte";
+  import SongInfo from "$lib/components/SongInfo.svelte";
+  import MetadataEditor from "$lib/components/MetadataEditor.svelte";
   import EmptyState from "$lib/components/EmptyState.svelte";
+  import { contextMenuKey, menuPoint } from "$lib/menu";
+  import { trackMenuItems } from "$lib/trackMenu";
   import { player } from "$lib/state/player.svelte";
   import type { AlbumDto, ArtistDto, SearchKind, SearchPage, TrackDto } from "$lib/types";
+
+  let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
+  let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
+  let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
+  let edit = $state<{ itemId: string; name: string } | null>(null);
 
   const HISTORY_KEY = "jellysic:searchHistory";
   const HISTORY_MAX = 8;
@@ -243,6 +254,26 @@
     else playTrack(item.value);
   }
 
+  // Track results get the same right-click menu as every other track list.
+  // Album and artist results stay plain links: their own pages carry the
+  // actions, and there they act on more than one row.
+  function onTrackContextMenu(event: MouseEvent, track: TrackDto) {
+    event.preventDefault();
+    const { x, y } = menuPoint(event);
+    menu = {
+      x,
+      y,
+      items: trackMenuItems([track], {
+        play: { run: () => void playTrack(track) },
+        addToPlaylist: (tracks) => (addTo = { x, y, trackIds: tracks.map((t) => t.id) }),
+        info: (t) => (info = { itemId: t.id, name: t.name, playCount: t.playCount }),
+        edit: (t) => (edit = { itemId: t.id, name: t.name }),
+        // No delete: a result list that pages in as you scroll cannot show
+        // honestly what is left after one, and the library pages can.
+      }),
+    };
+  }
+
   function itemKey(item: SearchItem): string {
     return `${item.kind}:${item.value.id}`;
   }
@@ -355,6 +386,10 @@
               {selectedIndex === index ? 'bg-ink/15 ring-1 ring-ink/20 ring-inset' : 'hover:bg-ink/10'}
               {item.kind === 'tracks' && item.value.id === currentTrackId ? 'text-accent' : ''}"
             onclick={() => activate(item)}
+            oncontextmenu={(event) => {
+              if (item.kind === "tracks") onTrackContextMenu(event, item.value);
+            }}
+            {@attach contextMenuKey}
             onmouseenter={() => (selectedIndex = index)}
           >
             <div class="h-14 w-14 shrink-0 overflow-hidden {item.kind === 'artists' ? 'rounded-full' : 'rounded-md'}">
@@ -389,3 +424,21 @@
     <p class="shrink-0 py-2 text-center text-xs font-semibold text-ink-muted">{m.search_loading_more()}</p>
   {/if}
 </div>
+
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
+{/if}
+{#if addTo}
+  <AddToPlaylistMenu x={addTo.x} y={addTo.y} trackIds={addTo.trackIds} onclose={() => (addTo = null)} />
+{/if}
+{#if info}
+  <SongInfo
+    itemId={info.itemId}
+    name={info.name}
+    playCount={info.playCount}
+    onclose={() => (info = null)}
+  />
+{/if}
+{#if edit}
+  <MetadataEditor itemId={edit.itemId} displayName={edit.name} onclose={() => (edit = null)} />
+{/if}

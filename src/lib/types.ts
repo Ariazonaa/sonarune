@@ -102,6 +102,8 @@ export interface TrackDto {
   imageTag: string | null;
   imageBlurHash: string | null;
   normalizationGain: number | null;
+  /** The album's gain, when the server knows one (Jellyfin after 10.11). */
+  albumNormalizationGain: number | null;
   isFavorite: boolean;
   playCount: number;
   artists: ArtistRef[];
@@ -149,6 +151,7 @@ export interface QueueTrack {
    *  entries persisted by builds before it existed. */
   entryId: string;
   normalizationGain: number | null;
+  albumNormalizationGain: number | null;
   artists: ArtistRef[];
   genres: GenreRef[];
   sourcePlaylistId: string | null;
@@ -169,6 +172,8 @@ export interface DspParams {
   eqEnabled: boolean;
   eqGainsDb: number[]; // 10 bands
   normalizationEnabled: boolean;
+  /** Album mode: one gain for the whole album instead of one per track. */
+  albumNormalization: boolean;
   preampDb: number;
 }
 
@@ -202,10 +207,16 @@ export interface ExtrasSettings {
   listenbrainzConfigured: boolean;
 }
 
+/** "Stop after this track / this album", armed on one queue entry. */
+export type StopAfter = "off" | "track" | "album";
+
 export interface PlayerState {
   status: PlaybackStatus;
   current: QueueTrack | null;
   sleepRemainingMs: number | null;
+  stopAfter: StopAfter;
+  /** The queue entry the stop is armed on (item id), so the row can say so. */
+  stopAfterItem: string | null;
   index: number;
   queueLen: number;
   positionMs: number;

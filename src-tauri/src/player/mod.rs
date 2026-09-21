@@ -152,6 +152,10 @@ pub struct QueueTrack {
     /// Jellyfin `NormalizationGain` (dB), input to volume normalization.
     #[serde(default)]
     pub normalization_gain: Option<f32>,
+    /// The album's own gain, for album-mode normalization. Usually `None`:
+    /// only Jellyfin after 10.11 sends it. Empty in queues from older builds.
+    #[serde(default)]
+    pub album_normalization_gain: Option<f32>,
     /// The track's artists as linkable refs (empty in queues from old builds).
     #[serde(default)]
     pub artists: Vec<crate::api::types::ArtistRef>,
@@ -248,6 +252,81 @@ pub enum PlaybackStatus {
     Loading,
     Playing,
     Paused,
+}
+
+/// "Stop after this track" / "stop after this album", armed on one queue
+/// entry. Unlike the sleep timer this never fades: the track is supposed to
+/// end the way it was recorded, and then it is quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StopAfter {
+    #[default]
+    Off,
+    Track,
+    Album,
+}
+
+/// The gain an album is played at when the server does not name one.
+///
+/// Jellyfin only sends an album gain after 10.11, so for most servers there is
+/// nothing to read. The album's own tracks are in the queue, though, and the
+/// **median** of their gains is one constant offset for the whole album —
+/// which is the point of album mode: the quiet piece stays quieter than the
+/// loud one. It is not the album's measured loudness, so the absolute level
+/// can sit a little off; the relative one, which is what anybody switches
+/// album mode on for, is right.
+///
+/// `None` when no track of that album carries a gain at all.
+fn album_gain_from_queue(queue: &[QueueTrack], album_id: &str) -> Option<f32> {
+    let mut gains: Vec<f32> = queue
+        .iter()
+        .filter(|track| track.album_id.as_deref() == Some(album_id))
+        .filter_map(|track| track.normalization_gain)
+        .filter(|gain| gain.is_finite())
+        .collect();
+    if gains.is_empty() {
+        return None;
+    }
+    gains.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = gains.len() / 2;
+    Some(if gains.len().is_multiple_of(2) {
+        (gains[middle - 1] + gains[middle]) / 2.0
+    } else {
+        gains[middle]
+    })
+}
+
+/// Does an armed stop fire at this boundary?
+///
+/// `finished` is the track that just ended, `next` the one that would follow —
+/// `None` when the queue is out. An album ends where the next track belongs to
+/// a different one, which is also how a single-track album behaves.
+///
+/// Free function, and deliberately so: this is the whole rule, and it is worth
+/// testing without a player thread around it.
+fn stop_after_due(
+    mode: StopAfter,
+    armed_item: Option<&str>,
+    armed_album: Option<&str>,
+    finished: &QueueTrack,
+    next: Option<&QueueTrack>,
+) -> bool {
+    match mode {
+        StopAfter::Off => false,
+        StopAfter::Track => armed_item == Some(finished.item_id.as_str()),
+        StopAfter::Album => {
+            // No album, no album end. The command refuses to arm this, and the
+            // rule refuses to fire on it: a loose track has no last track.
+            let Some(armed_album) = armed_album else {
+                return false;
+            };
+            // Armed on an album the player has since left: nothing to end.
+            if finished.album_id.as_deref() != Some(armed_album) {
+                return false;
+            }
+            next.is_none_or(|track| track.album_id.as_deref() != Some(armed_album))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -527,6 +606,9 @@ pub struct PlayerState {
     /// Some while a sleep timer is armed; ms until it pauses playback
     /// (0 while waiting for the end of the current track).
     pub sleep_remaining_ms: Option<u64>,
+    pub stop_after: StopAfter,
+    /// The queue entry the stop is armed on, so the list can mark the row.
+    pub stop_after_item: Option<String>,
     /// Downloaded part of the current track as `[start, end]` in ms, for the
     /// seek bar. Estimated from bytes, so approximate for variable bitrates;
     /// `None` when the stream length is unknown (live transcode).
@@ -547,6 +629,8 @@ impl Default for PlayerState {
             shuffle_mode: ShuffleMode::Off,
             repeat: RepeatMode::Off,
             sleep_remaining_ms: None,
+            stop_after: StopAfter::Off,
+            stop_after_item: None,
             buffered_ms: None,
         }
     }
@@ -650,6 +734,13 @@ pub enum PlayerCommand {
         minutes: Option<u32>,
         end_of_track: bool,
         fade_seconds: u32,
+    },
+    /// Arm (or clear, with `StopAfter::Off`) a stop at the end of a track or
+    /// of its album. `item_id` names the queue entry; `None` means whatever is
+    /// playing now.
+    SetStopAfter {
+        mode: StopAfter,
+        item_id: Option<String>,
     },
     /// The active output stream died (device unplugged); sent by the cpal
     /// error callback, never by the UI.
@@ -1002,6 +1093,11 @@ struct Worker {
     /// Wall-clock moment the sleep timer fires (None = not armed).
     sleep_at: Option<Instant>,
     sleep_end_of_track: bool,
+    /// "Stop after this track / album" and the entry it was armed on: the
+    /// item id, and the album that entry belongs to.
+    stop_after: StopAfter,
+    stop_after_item: Option<String>,
+    stop_after_album: Option<String>,
     sleep_fade_duration: Duration,
     /// Item id whose source currently carries the sleep ramp.
     sleep_fade_item: Option<String>,
@@ -1171,6 +1267,9 @@ impl Worker {
             queue_undo: None,
             sleep_at: None,
             sleep_end_of_track: false,
+            stop_after: StopAfter::Off,
+            stop_after_item: None,
+            stop_after_album: None,
             sleep_fade_duration: Duration::from_secs(30),
             sleep_fade_item: None,
             sink: None,
@@ -1410,6 +1509,28 @@ impl Worker {
                     _ => 30,
                 }));
                 self.update_sleep_fade();
+                self.emit();
+            }
+            PlayerCommand::SetStopAfter { mode, item_id } => {
+                let armed = item_id.or_else(|| {
+                    self.queue
+                        .get(self.index)
+                        .map(|track| track.item_id.clone())
+                });
+                let entry = armed
+                    .as_ref()
+                    .and_then(|id| self.queue.iter().find(|track| &track.item_id == id));
+                self.stop_after_album = entry.and_then(|track| track.album_id.clone());
+                // An album stop needs an album: a loose track has none, and
+                // arming it would be a stop that never comes.
+                self.stop_after = match mode {
+                    StopAfter::Album if self.stop_after_album.is_none() => StopAfter::Off,
+                    other => other,
+                };
+                self.stop_after_item = match self.stop_after {
+                    StopAfter::Off => None,
+                    _ => armed,
+                };
                 self.emit();
             }
             PlayerCommand::Stop => {
@@ -1787,6 +1908,59 @@ impl Worker {
         }
     }
 
+    /// Whether the armed stop fires when `finished` ends. `next` is looked up
+    /// through the play order, so shuffle and repeat are accounted for.
+    fn stop_after_fires(&self, finished: &QueueTrack) -> bool {
+        // Repeat-One replays the same entry: an album that keeps restarting
+        // never reaches an end, and a track stop would fire on its own repeat.
+        let next = self
+            .auto_next_index()
+            .and_then(|index| self.queue.get(index))
+            .filter(|_| self.repeat != RepeatMode::One);
+        self.stop_after_due_now(finished, next)
+    }
+
+    /// The rule with both tracks given: `finished`, and whatever follows it.
+    fn stop_after_due_now(&self, finished: &QueueTrack, next: Option<&QueueTrack>) -> bool {
+        stop_after_due(
+            self.stop_after,
+            self.stop_after_item.as_deref(),
+            self.stop_after_album.as_deref(),
+            finished,
+            next,
+        )
+    }
+
+    /// The normalization gain a source is opened with. Album mode prefers what
+    /// the server says about the album, falls back to the album's tracks in
+    /// the queue, and finally to the track's own gain — anything else would
+    /// mean playing an album unnormalized because one server is older than
+    /// another.
+    ///
+    /// Decided when the source is opened, so a change reaches the music with
+    /// the next track. Rewrapping a playing source would mean reopening it,
+    /// and a settings toggle is not worth a gap in the sound.
+    fn normalization_gain_for(&self, track: &QueueTrack) -> Option<f32> {
+        if !self.dsp.params().album_normalization {
+            return track.normalization_gain;
+        }
+        track
+            .album_normalization_gain
+            .or_else(|| {
+                track
+                    .album_id
+                    .as_deref()
+                    .and_then(|album| album_gain_from_queue(&self.queue, album))
+            })
+            .or(track.normalization_gain)
+    }
+
+    fn clear_stop_after(&mut self) {
+        self.stop_after = StopAfter::Off;
+        self.stop_after_item = None;
+        self.stop_after_album = None;
+    }
+
     /// End-of-track sleep: fires at a boundary once the deadline (if any)
     /// has passed. Returns true when playback was put to sleep.
     fn sleep_at_boundary(&mut self) -> bool {
@@ -1807,8 +1981,16 @@ impl Worker {
     /// before the boundary.
     fn schedule_prefetch(&mut self) {
         // A pending end-of-track sleep must reach a real track end: no
-        // gapless append, no crossfade.
+        // gapless append, no crossfade. Same for an armed stop that fires at
+        // the coming boundary — the track has to end, not be overlapped.
         if self.sleep_end_of_track || self.sleep_fade_item.is_some() {
+            return;
+        }
+        if self
+            .queue
+            .get(self.index)
+            .is_some_and(|track| self.stop_after_fires(track))
+        {
             return;
         }
         // Repeat-One (and a single-track wrap) loops via handle_track_end, not a
@@ -1952,8 +2134,9 @@ impl Worker {
     /// otherwise the queue order wins.
     fn handle_transition(&mut self, appended_item_id: &str) {
         self.appended = None;
-        if let Some(prev) = self.queue.get(self.index).cloned() {
-            self.report_stopped(&prev, prev.duration_ms);
+        let finished = self.queue.get(self.index).cloned();
+        if let Some(prev) = finished.as_ref() {
+            self.report_stopped(prev, prev.duration_ms);
         }
         let invalidated_undo = self.queue_undo.take().is_some();
         let target = self.auto_next_index();
@@ -1982,8 +2165,17 @@ impl Worker {
             self.update_media_playback();
             self.emit();
             // "Sleep at end of track" armed while the next was already
-            // appended: pause right at the start of the new track.
-            self.sleep_at_boundary();
+            // appended: pause right at the start of the new track. An armed
+            // stop that slipped past the append guard -- the queue changed
+            // after the hand-off -- lands the same way; here the track that is
+            // now playing *is* the one that follows the finished one.
+            let stop_due = finished
+                .as_ref()
+                .is_some_and(|track| self.stop_after_due_now(track, self.queue.get(self.index)));
+            if !self.sleep_at_boundary() && stop_due {
+                self.clear_stop_after();
+                self.pause();
+            }
         } else {
             // The queue was edited after the hand-off (next track removed,
             // moved, or something inserted before it): the appended audio no
@@ -2018,6 +2210,21 @@ impl Worker {
             self.sleep_fade_item = None;
             // Position at the next track so resume continues naturally (but not
             // onto itself under Repeat-One).
+            if let Some(n) = self.next_index() {
+                self.index = n;
+                self.sync_queue();
+            } else if invalidated_undo {
+                self.sync_queue();
+            }
+            self.stop_internal();
+            return;
+        }
+        if self
+            .queue
+            .get(self.index)
+            .is_some_and(|t| self.stop_after_fires(t))
+        {
+            self.clear_stop_after();
             if let Some(n) = self.next_index() {
                 self.index = n;
                 self.sync_queue();
@@ -2522,6 +2729,7 @@ impl Worker {
             _ => None,
         };
         let auth = StreamAuth::from_client(&client);
+        let gain_db = self.normalization_gain_for(&track);
         let dsp = self.dsp.clone();
         let tap = self.tap.clone();
         let waveform = self.waveform.clone();
@@ -2539,10 +2747,13 @@ impl Worker {
                     source::open_track_source(
                         &auth,
                         &track,
-                        &session,
+                        source::Attempt {
+                            play_session: &session,
+                            gain_db,
+                            start_ms,
+                        },
                         dsp,
                         tap,
-                        start_ms,
                         Some(waveform),
                     )
                 }))
@@ -3147,6 +3358,14 @@ impl Worker {
 
     /// Persist the queue, refresh the shared mirror, notify the UI.
     fn sync_queue(&mut self) {
+        // The entry a stop was armed on can be removed, or the whole queue
+        // replaced. Then the stop would never fire and the marker would sit in
+        // the list forever, so it goes with the entry.
+        if let Some(armed) = self.stop_after_item.as_deref() {
+            if !self.queue.iter().any(|track| track.item_id == armed) {
+                self.clear_stop_after();
+            }
+        }
         let order = if self.shuffle { &self.order[..] } else { &[] };
         let queue_snapshot = QueueSnapshot {
             tracks: self.queue.clone(),
@@ -3241,6 +3460,8 @@ impl Worker {
             shuffle_mode: self.shuffle_mode,
             repeat: self.repeat,
             sleep_remaining_ms,
+            stop_after: self.stop_after,
+            stop_after_item: self.stop_after_item.clone(),
             buffered_ms,
         };
         *self.shared_state.lock().unwrap() = state.clone();
@@ -3371,11 +3592,12 @@ pub fn load_persisted_queue(store: &Store) -> Option<(Vec<QueueTrack>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        buffered_range_ms, build_album_shuffle_order, build_shuffle_order, choose_auto_dj_seed,
-        duplicate_indices, load_persisted_queue, order_next, order_prev, played_indices,
-        queue_write, remap_after_removals, remap_move, remap_order_after_removals, restored_index,
-        should_crossfade, should_start_prefetch, AutoDjSeedMode, CrossfadeMode, PersistedQueue,
-        PersistedQueueMark, PlayMode, QueueTrack, QueueWrite, ShuffleMode,
+        album_gain_from_queue, buffered_range_ms, build_album_shuffle_order, build_shuffle_order,
+        choose_auto_dj_seed, duplicate_indices, load_persisted_queue, order_next, order_prev,
+        played_indices, queue_write, remap_after_removals, remap_move, remap_order_after_removals,
+        restored_index, should_crossfade, should_start_prefetch, stop_after_due, AutoDjSeedMode,
+        CrossfadeMode, PersistedQueue, PersistedQueueMark, PlayMode, QueueTrack, QueueWrite,
+        ShuffleMode, StopAfter,
     };
     use crate::store::{keys, Store};
     use proptest::prelude::*;
@@ -3517,6 +3739,115 @@ mod tests {
         assert_eq!(remap_move(0, 3, 1), 0);
     }
 
+    fn gain_track(item_id: &str, album_id: &str, gain: Option<f32>) -> QueueTrack {
+        QueueTrack {
+            normalization_gain: gain,
+            ..album_track(item_id, album_id)
+        }
+    }
+
+    #[test]
+    fn an_album_gain_is_the_median_of_its_tracks() {
+        let queue = vec![
+            gain_track("a", "one", Some(-6.0)),
+            gain_track("b", "one", Some(-2.0)),
+            gain_track("c", "one", Some(-4.0)),
+            // Another album's loud single must not drag the album down.
+            gain_track("d", "two", Some(-20.0)),
+        ];
+        assert_eq!(album_gain_from_queue(&queue, "one"), Some(-4.0));
+        assert_eq!(album_gain_from_queue(&queue, "two"), Some(-20.0));
+        assert_eq!(album_gain_from_queue(&queue, "three"), None);
+    }
+
+    #[test]
+    fn an_even_number_of_tracks_averages_the_middle_two() {
+        let queue = vec![
+            gain_track("a", "one", Some(-6.0)),
+            gain_track("b", "one", Some(-2.0)),
+        ];
+        assert_eq!(album_gain_from_queue(&queue, "one"), Some(-4.0));
+    }
+
+    #[test]
+    fn tracks_without_a_usable_gain_are_left_out() {
+        let queue = vec![
+            gain_track("a", "one", None),
+            gain_track("b", "one", Some(f32::NAN)),
+            gain_track("c", "one", Some(-3.0)),
+        ];
+        // Only the one real value is left, so it is the median.
+        assert_eq!(album_gain_from_queue(&queue, "one"), Some(-3.0));
+        // Nothing usable at all: no album gain, and the caller falls back to
+        // the track's own.
+        let empty = vec![gain_track("a", "one", None)];
+        assert_eq!(album_gain_from_queue(&empty, "one"), None);
+    }
+
+    fn album_track(item_id: &str, album_id: &str) -> QueueTrack {
+        QueueTrack {
+            album_id: Some(album_id.into()),
+            ..queue_track(item_id)
+        }
+    }
+
+    #[test]
+    fn stop_after_track_fires_on_the_entry_it_was_armed_on() {
+        let a = album_track("a", "album-1");
+        let b = album_track("b", "album-1");
+        let armed = |finished: &QueueTrack| {
+            stop_after_due(StopAfter::Track, Some("a"), None, finished, Some(&b))
+        };
+        assert!(armed(&a));
+        // Another track of the same album ends: not the one that was armed.
+        assert!(!armed(&b));
+        assert!(!stop_after_due(
+            StopAfter::Off,
+            Some("a"),
+            None,
+            &a,
+            Some(&b)
+        ));
+    }
+
+    #[test]
+    fn stop_after_album_fires_where_the_album_ends() {
+        let first = album_track("a", "album-1");
+        let last = album_track("b", "album-1");
+        let other = album_track("c", "album-2");
+        let due = |finished: &QueueTrack, next: Option<&QueueTrack>| {
+            stop_after_due(StopAfter::Album, Some("a"), Some("album-1"), finished, next)
+        };
+        // Inside the album nothing happens; at its last track it fires,
+        // whether another album follows or the queue simply runs out.
+        assert!(!due(&first, Some(&last)));
+        assert!(due(&last, Some(&other)));
+        assert!(due(&last, None));
+        // A track from somewhere else ending is not this album ending, even
+        // when what follows is not the armed album either.
+        assert!(!due(&other, Some(&first)));
+    }
+
+    #[test]
+    fn a_track_without_an_album_never_ends_an_album() {
+        let loose = queue_track("a");
+        assert!(!stop_after_due(
+            StopAfter::Album,
+            Some("a"),
+            Some("album-1"),
+            &loose,
+            None
+        ));
+        // Armed with no album at all: a loose track ends nothing either.
+        assert!(!stop_after_due(
+            StopAfter::Album,
+            Some("a"),
+            None,
+            &loose,
+            None
+        ));
+    }
+
     fn queue_track(item_id: &str) -> QueueTrack {
         QueueTrack {
             item_id: item_id.into(),
@@ -3533,6 +3864,7 @@ mod tests {
             stream_url: String::new(),
             entry_id: String::new(),
             normalization_gain: None,
+            album_normalization_gain: None,
             artists: Vec::new(),
             genres: Vec::new(),
             source_playlist_id: None,

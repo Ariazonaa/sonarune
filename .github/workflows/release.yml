@@ -57,7 +57,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # A tag that disagrees with the manifests would ship an installer whose
       # file name lies about what is inside it. Catch that before building.
@@ -84,7 +84,7 @@ jobs:
           }
           "VERSION=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -157,9 +157,21 @@ jobs:
             # and the tag a release of this version would carry is known.
             $tag = if ($env:GITHUB_REF -like "refs/tags/*") { $env:GITHUB_REF_NAME } else { "v$($env:VERSION)" }
             $name = Split-Path $setup -Leaf
+
+            # What the app itself shows when it finds this update, so it has to
+            # say what changed rather than point at a file the dialog cannot
+            # open. The sentence stays as the fallback for a version the
+            # changelog does not name -- a missing section is worth a warning,
+            # not a failed release.
+            $notes = (node scripts/changelog-section.mjs $env:VERSION) -join ([string][char]10)
+            if (-not $notes) {
+              "::warning::CHANGELOG.md has no section for $($env:VERSION); the update notes only point at it"
+              $notes = "See the release notes and CHANGELOG.md for what changed in $($env:VERSION)."
+            }
+
             $manifest = [ordered]@{
               version   = $env:VERSION
-              notes     = "See the release notes and CHANGELOG.md for what changed in $($env:VERSION)."
+              notes     = $notes
               pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
               platforms = [ordered]@{
                 "windows-x86_64" = [ordered]@{
@@ -206,7 +218,35 @@ jobs:
           $bt = [string][char]96
           $fence = $bt * 3
           $setup = "jellysic_$($env:VERSION)_x64-setup.exe"
+
+          # Only a signed build can be installed as an update, so these two
+          # paragraphs appear only when there was a key to sign with. Promising
+          # self-updates on a release that carries no latest.json would be a
+          # lie told to everyone who reads the page.
+          $updates = if ($env:SIGNED -eq "1") {
+            @(
+              "**Jellysic keeps itself up to date.** The installed app asks this"
+              "page once per start whether a newer version exists -- that can be"
+              "switched off in Settings -> Updates, where there is also a button"
+              "to check on demand. An update is verified against the project's"
+              "signing key before the installer is opened, and it is never"
+              "installed while a track is playing, because the installer closes"
+              "the app. The portable zip cannot update itself and says so."
+              ""
+            )
+          } else { @() }
+          $signature = if ($env:SIGNED -eq "1") {
+            @(
+              "That is Authenticode, and a different thing from the update"
+              "signature: ${bt}latest.json${bt} and ${bt}$setup.sig${bt} carry a"
+              "minisign signature, which is what the app checks before it opens"
+              "an installer."
+              ""
+            )
+          } else { @() }
+
           @(
+            $updates
             "Windows 10 or 11, 64-bit. The installer runs for the current user,"
             "so it does not ask for administrator rights, and it needs nothing"
             "else on the machine: WebView2 already ships with Windows."
@@ -217,6 +257,7 @@ jobs:
             "The build is not code-signed, so SmartScreen reports an unknown"
             "publisher: **More info -> Run anyway**."
             ""
+            $signature
             "Checksums are in ${bt}SHA256SUMS.txt${bt}. To verify a download:"
             ""
             ($fence + "powershell")

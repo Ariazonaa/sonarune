@@ -12,6 +12,7 @@ export const SHORTCUT_ACTIONS = [
   "favorite",
   "shuffle",
   "repeat",
+  "jumpToCurrent",
 ] as const;
 
 export type ShortcutAction = (typeof SHORTCUT_ACTIONS)[number];
@@ -31,6 +32,7 @@ const DEFAULT_SHORTCUTS: ShortcutBindings = {
   favorite: ["L"],
   shuffle: ["S"],
   repeat: ["R"],
+  jumpToCurrent: ["J"],
 };
 
 const STORAGE_KEY = "jellysic.shortcuts.v1";

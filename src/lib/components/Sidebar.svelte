@@ -1,9 +1,17 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { page } from "$app/state";
+  import { api } from "$lib/api";
+  import { apiLibrary } from "$lib/api/library";
   import { m } from "$lib/paraglide/messages";
   import BrandMark from "$lib/components/BrandMark.svelte";
   import SyncStatus from "$lib/components/SyncStatus.svelte";
   import { layoutPreferences } from "$lib/state/layout.svelte";
+  import { playlists } from "$lib/state/playlists.svelte";
+  import { player } from "$lib/state/player.svelte";
+  import { toast } from "$lib/state/toast.svelte";
+  import { isOurDrag, readDrag } from "$lib/dragToPlaylist";
+  import type { PlaylistDto } from "$lib/types";
 
   const links = [
     {
@@ -91,6 +99,31 @@
       icon: "M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z",
     },
   ];
+
+  onMount(() => playlists.refresh());
+
+  /** The playlist a drag is hovering, so it can light up. */
+  let dropTarget = $state<string | null>(null);
+
+  async function onDrop(event: DragEvent, playlist: PlaylistDto) {
+    const payload = readDrag(event);
+    dropTarget = null;
+    if (!payload) return;
+    event.preventDefault();
+    try {
+      // An album arrives as an id: the card that was dragged does not know its
+      // tracks, and asking now costs one request instead of one per album
+      // dragged past.
+      const trackIds =
+        payload.trackIds ?? (await api.getAlbum(payload.albumId!)).tracks.map((track) => track.id);
+      if (trackIds.length === 0) return;
+      await apiLibrary.playlistAdd(playlist.id, trackIds);
+      playlists.refresh();
+      toast.show(m.add_to_playlist_done({ name: playlist.name }));
+    } catch (e) {
+      player.error = String(e);
+    }
+  }
 </script>
 
 <aside
@@ -118,6 +151,41 @@
       {link.label}
     </a>
   {/each}
+
+  {#if playlists.items.length > 0}
+    <div class="mt-4 border-t border-edge pt-3">
+      <a
+        href="/playlists"
+        class="flex items-center justify-between px-3 pb-1 text-[11px] font-bold uppercase tracking-wider text-ink-muted transition-colors hover:text-ink"
+      >
+        {m.nav_playlists()}
+        <span class="tabular-nums">{playlists.items.length}</span>
+      </a>
+      {#each playlists.items as playlist (playlist.id)}
+        <a
+          href="/playlist/{playlist.id}"
+          class="block truncate rounded-md px-3 py-1.5 text-sm transition-colors
+            {page.url.pathname === `/playlist/${playlist.id}`
+            ? 'text-ink'
+            : 'text-ink-muted hover:text-ink'}
+            {dropTarget === playlist.id ? 'bg-accent text-(--color-on-accent)' : ''}"
+          ondragover={(event) => {
+            // Only ours: a file or a link dragged in must not look droppable.
+            if (!isOurDrag(event)) return;
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+            dropTarget = playlist.id;
+          }}
+          ondragleave={() => {
+            if (dropTarget === playlist.id) dropTarget = null;
+          }}
+          ondrop={(event) => void onDrop(event, playlist)}
+        >
+          {playlist.name}
+        </a>
+      {/each}
+    </div>
+  {/if}
 
   <SyncStatus />
 </aside>

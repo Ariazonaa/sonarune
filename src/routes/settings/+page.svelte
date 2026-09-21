@@ -91,6 +91,10 @@
   };
 
   let settings = $state<DspParams | null>(null);
+  // The three states the two flags stand for, as one value for the select.
+  const normalizationMode = $derived(
+    !settings?.normalizationEnabled ? "off" : settings.albumNormalization ? "album" : "track",
+  );
   let playback = $state<PlaybackSettings | null>(null);
   let audioDevices = $state<AudioDeviceSnapshot>({ devices: [], fallbackDevice: null });
   let theme = $state<ThemeSettings>(loadTheme());
@@ -582,19 +586,33 @@
         {m.settings_playback()}
       </h2>
 
-      <label class="flex items-center justify-between gap-4">
+      <label class="flex items-start justify-between gap-4">
         <div>
           <p class="text-sm font-medium">{m.settings_normalization()}</p>
           <p class="mt-0.5 max-w-md text-xs text-ink-muted">
             {m.settings_normalization_hint()}
           </p>
+          {#if settings.normalizationEnabled && settings.albumNormalization}
+            <p class="mt-1 max-w-md text-xs text-ink-muted">
+              {m.settings_normalization_album_hint()}
+            </p>
+          {/if}
         </div>
-        <input
-          type="checkbox"
-          class="h-4 w-4 accent-(--color-accent)"
-          bind:checked={settings.normalizationEnabled}
-          onchange={save}
-        />
+        <select
+          class="w-40 shrink-0 rounded-md border border-edge bg-base px-3 py-2 text-sm outline-none focus:border-accent"
+          value={normalizationMode}
+          onchange={(event) => {
+            const mode = (event.currentTarget as HTMLSelectElement).value;
+            if (!settings) return;
+            settings.normalizationEnabled = mode !== "off";
+            settings.albumNormalization = mode === "album";
+            save();
+          }}
+        >
+          <option value="off">{m.settings_normalization_off()}</option>
+          <option value="track">{m.settings_normalization_track()}</option>
+          <option value="album">{m.settings_normalization_album()}</option>
+        </select>
       </label>
 
       <label class="mt-5 block">

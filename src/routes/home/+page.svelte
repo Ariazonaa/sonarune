@@ -10,6 +10,8 @@
   import { player } from "$lib/state/player.svelte";
   import { library } from "$lib/state/library.svelte";
   import { createAlbumMenu } from "$lib/state/albumMenu.svelte";
+  import { homeRows, type HomeRowId } from "$lib/state/homeRows.svelte";
+  import { startDrag } from "$lib/dragToPlaylist";
   import { contextMenuKey } from "$lib/menu";
   import { swrGet, swrSet } from "$lib/swr";
   import type { AlbumDto, HomeData } from "$lib/types";
@@ -49,21 +51,30 @@
     if (library.revision > 0) load();
   });
 
-  const rows = $derived(
-    home
-      ? [
-          { title: m.home_recently_played(), albums: home.recentlyPlayed },
-          { title: m.home_recently_added(), albums: home.recentlyAdded },
-          { title: m.home_most_played(), albums: home.mostPlayed },
-          { title: m.home_forgotten_favorites(), albums: home.forgottenFavorites },
-        ].filter((row) => row.albums.length > 0)
-      : [],
-  );
+  // The headings, by the field each row reads. The order and which of them
+  // show at all is the user's (homeRows); a row the server has nothing for
+  // still drops out, because an empty row is noise, not a setting.
+  const ROW_TITLE: Record<HomeRowId, () => string> = {
+    recentlyPlayed: m.home_recently_played,
+    recentlyAdded: m.home_recently_added,
+    mostPlayed: m.home_most_played,
+    forgottenFavorites: m.home_forgotten_favorites,
+  };
+
+  const rows = $derived.by(() => {
+    const data = home;
+    if (!data) return [];
+    return homeRows.visible
+      .map((id) => ({ id, title: ROW_TITLE[id](), albums: data[id] }))
+      .filter((row) => row.albums.length > 0);
+  });
 </script>
 
 {#snippet albumCard(album: AlbumDto)}
   <a
     href="/album/{album.id}"
+    draggable="true"
+    ondragstart={(e) => startDrag(e, { albumId: album.id, label: album.name })}
     oncontextmenu={(e) => am.open(e, album)}
     {@attach contextMenuKey}
     class="group w-44 shrink-0 rounded-lg bg-card p-3 transition-colors duration-200 hover:bg-panel-2"
@@ -120,9 +131,51 @@
     {/each}
   {/if}
 
-  {#each rows as row (row.title)}
-    <section class="mb-8">
-      <h2 class="mb-3 text-lg font-bold tracking-tight">{row.title}</h2>
+  {#each rows as row, position (row.id)}
+    <section class="group/row mb-8">
+      <div class="mb-3 flex items-center gap-1">
+        <h2 class="text-lg font-bold tracking-tight">{row.title}</h2>
+        <!-- Arranging the page is a rare act, so the controls stay out of the
+             way until the row is under the pointer or holds the focus. -->
+        <span
+          class="flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/row:opacity-100"
+        >
+          <button
+            class="rounded p-1 text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent"
+            disabled={position === 0}
+            onclick={() => homeRows.moveAmongVisible(row.id, -1)}
+            aria-label={m.home_row_move_up()}
+            title={m.home_row_move_up()}
+          >
+            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor" aria-hidden="true">
+              <path d="M12 8l6 6H6l6-6z" />
+            </svg>
+          </button>
+          <button
+            class="rounded p-1 text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent"
+            disabled={position === rows.length - 1}
+            onclick={() => homeRows.moveAmongVisible(row.id, 1)}
+            aria-label={m.home_row_move_down()}
+            title={m.home_row_move_down()}
+          >
+            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor" aria-hidden="true">
+              <path d="M12 16l-6-6h12l-6 6z" />
+            </svg>
+          </button>
+          <button
+            class="rounded p-1 text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink"
+            onclick={() => homeRows.toggle(row.id)}
+            aria-label={m.home_row_hide()}
+            title={m.home_row_hide_hint()}
+          >
+            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor" aria-hidden="true">
+              <path
+                d="M12 7c-4.4 0-8 4.1-8 5s3.6 5 8 5 8-4.1 8-5-3.6-5-8-5zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM3.3 2.3 1.9 3.7l18.4 18.4 1.4-1.4L3.3 2.3z"
+              />
+            </svg>
+          </button>
+        </span>
+      </div>
       <div data-card-row class="flex gap-4 overflow-x-auto pb-2">
         {#each row.albums as album (album.id)}
           {@render albumCard(album)}

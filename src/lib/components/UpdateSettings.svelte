@@ -4,6 +4,7 @@
   import { m } from "$lib/paraglide/messages";
   import { player } from "$lib/state/player.svelte";
   import { updates } from "$lib/state/updates.svelte";
+  import { updateErrorMessage } from "$lib/updateErrors";
   import type { DesktopSettings } from "$lib/types";
 
   let {
@@ -11,9 +12,8 @@
     onsave,
   }: { desktop: DesktopSettings | null; onsave: () => void } = $props();
 
-  // The running version, so the section says something before a check ran.
-  // A check answers with it too, and that answer wins — it comes from the same
-  // package metadata.
+  // The running version, so the section says something before a check ran; a
+  // check answers with it too, and that answer wins — same package metadata.
   // No check is fired here on purpose: switching the automatic check off has
   // to mean the app really does not ask on its own, opening Settings included.
   let version = $state<string | null>(null);
@@ -33,16 +33,7 @@
     return Math.min(100, Math.round((progress.downloaded / progress.total) * 100));
   });
 
-  /** Rust answers the refusals with a short code; everything else is a real
-   *  failure and keeps its message. */
-  const problem = $derived.by(() => {
-    const error = updates.error;
-    if (!error) return null;
-    if (error.includes("update:playing")) return m.settings_update_playing();
-    if (error.includes("update:portable")) return m.settings_update_portable();
-    if (error.includes("update:none")) return m.settings_update_none();
-    return m.error_generic({ message: error });
-  });
+  const problem = $derived(updates.error ? updateErrorMessage(updates.error) : null);
 </script>
 
 <section class="mb-8 rounded-lg bg-card p-5">

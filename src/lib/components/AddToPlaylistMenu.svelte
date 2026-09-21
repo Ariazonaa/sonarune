@@ -2,6 +2,8 @@
   import { apiLibrary } from "$lib/api/library";
   import { player } from "$lib/state/player.svelte";
   import { toast } from "$lib/state/toast.svelte";
+  // Aliased: this file has its own `playlists` — the list it renders.
+  import { playlists as playlistStore } from "$lib/state/playlists.svelte";
   import { m } from "$lib/paraglide/messages";
   import type { PlaylistDto } from "$lib/types";
   import Popover from "./Popover.svelte";
@@ -48,6 +50,7 @@
     onclose();
     try {
       await apiLibrary.createPlaylist(name, trackIds);
+      playlistStore.refresh();
       toast.show(m.add_to_playlist_done({ name }));
     } catch (e) {
       player.error = String(e);

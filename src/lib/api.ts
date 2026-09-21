@@ -139,6 +139,10 @@ export const api = {
   playInstantMix: (itemId: string) => invoke<void>("play_instant_mix", { itemId }),
   setSleepTimer: (minutes: number | null, endOfTrack: boolean, fadeSeconds = 30) =>
     invoke<void>("set_sleep_timer", { minutes, endOfTrack, fadeSeconds }),
+  /** Arm "stop after this track / album" on a queue entry, or on what is
+   *  playing when `itemId` is left out. `"off"` clears it. */
+  playerSetStopAfter: (mode: import("./types").StopAfter, itemId: string | null = null) =>
+    invoke<void>("player_set_stop_after", { mode, itemId }),
   getExtrasSettings: () => invoke<ExtrasSettings>("get_extras_settings"),
   setExtrasSettings: (settings: ExtrasSettings) =>
     invoke<void>("set_extras_settings", { settings }),

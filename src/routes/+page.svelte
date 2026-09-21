@@ -11,6 +11,7 @@
   import CardSkeleton from "$lib/components/CardSkeleton.svelte";
   import EmptyState from "$lib/components/EmptyState.svelte";
   import { player } from "$lib/state/player.svelte";
+  import { startDrag } from "$lib/dragToPlaylist";
   import { library } from "$lib/state/library.svelte";
   import { createAlbumMenu } from "$lib/state/albumMenu.svelte";
   import { layoutPreferences } from "$lib/state/layout.svelte";
@@ -295,6 +296,8 @@
               {#each row as album (album.id)}
                 <a
                   href="/album/{album.id}"
+                  draggable="true"
+                  ondragstart={(e) => startDrag(e, { albumId: album.id, label: album.name })}
                   oncontextmenu={(e) => am.open(e, album)}
                   {@attach contextMenuKey}
                   class="group rounded-lg bg-card p-3 transition-colors duration-200 hover:bg-panel-2"

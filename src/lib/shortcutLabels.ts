@@ -29,5 +29,7 @@ export function shortcutActionLabel(action: ShortcutAction): string {
       return m.player_shuffle();
     case "repeat":
       return m.player_repeat();
+    case "jumpToCurrent":
+      return m.queue_jump_to_current();
   }
 }

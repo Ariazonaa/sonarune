@@ -10,14 +10,11 @@
   import SongInfo from "$lib/components/SongInfo.svelte";
   import MetadataEditor from "$lib/components/MetadataEditor.svelte";
   import NewContentPill from "$lib/components/NewContentPill.svelte";
-  import { apiLibrary } from "$lib/api/library";
   import { player } from "$lib/state/player.svelte";
   import { library } from "$lib/state/library.svelte";
-  import { session } from "$lib/state/session.svelte";
-  import { confirm } from "$lib/state/confirm.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { downloads } from "$lib/state/downloads.svelte";
   import { contextMenuKey } from "$lib/menu";
+  import { trackMenuItems } from "$lib/trackMenu";
+  import { startDrag } from "$lib/dragToPlaylist";
   import type { TrackDto } from "$lib/types";
 
   const PAGE_SIZE = 200;
@@ -105,74 +102,13 @@
     }
   }
 
-  /** Selected ids in list order (not click order) — keeps queue order sane. */
-  function selectedIds(): string[] {
-    return songs.filter((s) => selected.has(s.id)).map((s) => s.id);
-  }
-
-  const icons = {
-    play: "M8 5v14l11-7L8 5z",
-    playNext: "M3 10h11v2H3v-2zm0-4h11v2H3V6zm0 8h7v2H3v-2zm13-1v8l6-4-6-4z",
-    addQueue: "M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z",
-    addPlaylist: "M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z",
-    mix: "M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.03 3.03L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z",
-    album: "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z",
-    person: "M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z",
-    info: "M11 7h2v2h-2V7zm0 4h2v6h-2v-6zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z",
-    download: "M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z",
-    edit: "M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z",
-    trash: "M6 7h12l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7zm3-3h6l1 2H8l1-2z",
-  };
-
-  async function downloadTracks(tracks: TrackDto[]) {
-    if (tracks.length === 0) return;
-    try {
-      await downloads.enqueue(tracks.map((track) => ({ itemId: track.id, name: track.name })));
-      toast.show(
-        tracks.length === 1
-          ? m.download_queued_one()
-          : m.download_queued_many({ count: tracks.length }),
-        { kind: "info" },
-      );
-    } catch (e) {
-      player.error = String(e);
-    }
-  }
-
-  /** "Go to artist" context-menu entries — one per linkable artist. */
-  function artistEntries(track: TrackDto): ContextMenuItem[] {
-    return track.artists.map((a) => ({
-      label: track.artists.length === 1 ? m.ctx_go_to_artist() : `${m.ctx_go_to_artist()}: ${a.name}`,
-      icon: icons.person,
-      action: () => goto(`/artist/${a.id}`),
-    }));
-  }
-
-  /** Permanently delete the given tracks from the server, after confirming. */
-  async function deleteTracks(ids: string[]) {
-    if (ids.length === 0) return;
-    const first = songs.find((s) => s.id === ids[0]);
-    const ok = await confirm.ask({
-      title: m.delete_confirm_title(),
-      body:
-        ids.length === 1
-          ? m.delete_track_confirm({ name: first?.name ?? "" })
-          : m.delete_tracks_confirm({ count: ids.length }),
-      confirmLabel: m.delete_action(),
-      danger: true,
-    });
-    if (!ok) return;
-    try {
-      await apiLibrary.deleteItems(ids);
-      const removed = new Set(ids);
-      songs = songs.filter((s) => !removed.has(s.id));
-      if (total !== null) total = Math.max(0, total - ids.length);
-      selected = new Set();
-      anchorIndex = -1;
-      toast.show(m.delete_done());
-    } catch (e) {
-      player.error = String(e);
-    }
+  /** Drop rows the server no longer has, without asking it again. */
+  function dropTracks(ids: string[]) {
+    const removed = new Set(ids);
+    songs = songs.filter((song) => !removed.has(song.id));
+    if (total !== null) total = Math.max(0, total - ids.length);
+    selected = new Set();
+    anchorIndex = -1;
   }
 
   function onRowContextMenu(event: MouseEvent, song: TrackDto, index: number) {
@@ -186,108 +122,23 @@
     const y = event.clientY;
     // Snapshot the selection as the menu opens: a library refresh while it is
     // open clears `selected`, and an action must still act on the rows the
-    // menu was opened for — never on an emptied or different set.
-    const ids = selectedIds();
+    // menu was opened for — never on an emptied or different set. In list
+    // order, so what is queued follows the list rather than the clicks.
     const picked = songs.filter((track) => selected.has(track.id));
-    const items: ContextMenuItem[] =
-      ids.length > 1
-        ? [
-            {
-              label: m.album_play_next(),
-              icon: icons.playNext,
-              action: () => player.run(api.enqueueTracks(ids, true)),
-            },
-            {
-              label: m.album_add_to_queue(),
-              icon: icons.addQueue,
-              action: () => player.run(api.enqueueTracks(ids, false)),
-            },
-            {
-              label: m.add_to_playlist(),
-              icon: icons.addPlaylist,
-              action: () => (addTo = { x, y, trackIds: ids }),
-            },
-            {
-              label: m.ctx_download(),
-              icon: icons.download,
-              action: () => downloadTracks(picked),
-            },
-            ...(session.info?.canDelete
-              ? [
-                  {
-                    label: m.delete_from_server(),
-                    icon: icons.trash,
-                    danger: true,
-                    action: () => deleteTracks(ids),
-                  },
-                ]
-              : []),
-          ]
-        : [
-            {
-              label: m.album_play(),
-              icon: icons.play,
-              disabled: !song.albumId,
-              action: () => playTrack(song),
-            },
-            {
-              label: m.album_play_next(),
-              icon: icons.playNext,
-              action: () => player.run(api.enqueueTracks([song.id], true)),
-            },
-            {
-              label: m.album_add_to_queue(),
-              icon: icons.addQueue,
-              action: () => player.run(api.enqueueTracks([song.id], false)),
-            },
-            {
-              label: m.add_to_playlist(),
-              icon: icons.addPlaylist,
-              action: () => (addTo = { x, y, trackIds: [song.id] }),
-            },
-            {
-              label: m.ctx_instant_mix(),
-              icon: icons.mix,
-              action: () => player.run(api.playInstantMix(song.id)),
-            },
-            {
-              label: m.ctx_go_to_album(),
-              icon: icons.album,
-              disabled: !song.albumId,
-              action: () => goto(`/album/${song.albumId}`),
-            },
-            ...artistEntries(song),
-            {
-              label: m.ctx_info(),
-              icon: icons.info,
-              action: () => (info = { itemId: song.id, name: song.name, playCount: song.playCount }),
-            },
-            ...(session.info?.canEdit
-              ? [
-                  {
-                    label: m.ctx_edit(),
-                    icon: icons.edit,
-                    action: () => (edit = { itemId: song.id, name: song.name }),
-                  },
-                ]
-              : []),
-            {
-              label: m.ctx_download(),
-              icon: icons.download,
-              action: () => downloadTracks([song]),
-            },
-            ...(session.info?.canDelete
-              ? [
-                  {
-                    label: m.delete_from_server(),
-                    icon: icons.trash,
-                    danger: true,
-                    action: () => deleteTracks([song.id]),
-                  },
-                ]
-              : []),
-          ];
-    menu = { x: event.clientX, y: event.clientY, items };
+    menu = {
+      x,
+      y,
+      items: trackMenuItems(picked.length > 1 ? picked : [song], {
+        // A song plays in its album's context here, so without an album there
+        // is nothing to play it in.
+        play: { run: () => void playTrack(song), disabled: !song.albumId },
+        addToPlaylist: (tracks) => (addTo = { x, y, trackIds: tracks.map((track) => track.id) }),
+        info: (track) =>
+          (info = { itemId: track.id, name: track.name, playCount: track.playCount }),
+        edit: (track) => (edit = { itemId: track.id, name: track.name }),
+        onRemoved: dropTracks,
+      }),
+    };
   }
 
   onMount(() => {
@@ -343,6 +194,16 @@
       {#snippet children(song, index)}
         <button
           data-list-row
+          draggable="true"
+          ondragstart={(event) =>
+            startDrag(event, {
+              // Dragging a row of the selection takes the whole selection;
+              // dragging anything else takes just that row.
+              trackIds: selected.has(song.id)
+                ? songs.filter((track) => selected.has(track.id)).map((track) => track.id)
+                : [song.id],
+              label: song.name,
+            })}
           class="flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-left transition-colors
             {selected.has(song.id) ? 'bg-ink/10 ring-1 ring-ink/20 ring-inset' : 'hover:bg-ink/10'}
             {song.id === currentTrackId ? 'text-accent' : ''}"

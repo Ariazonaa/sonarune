@@ -8,11 +8,16 @@
   import Cover from "$lib/components/Cover.svelte";
   import EmptyState from "$lib/components/EmptyState.svelte";
   import AddToPlaylistMenu from "$lib/components/AddToPlaylistMenu.svelte";
-  import { menuPoint } from "$lib/menu";
+  import ContextMenu, { type ContextMenuItem } from "$lib/components/ContextMenu.svelte";
+  import SongInfo from "$lib/components/SongInfo.svelte";
+  import MetadataEditor from "$lib/components/MetadataEditor.svelte";
+  import { contextMenuKey, menuPoint } from "$lib/menu";
+  import { TRACK_ICON, trackMenuItems } from "$lib/trackMenu";
   import PlaylistDuplicatesDialog from "$lib/components/PlaylistDuplicatesDialog.svelte";
   import PlaylistTransferDialog from "$lib/components/PlaylistTransferDialog.svelte";
   import { player } from "$lib/state/player.svelte";
   import { toast } from "$lib/state/toast.svelte";
+  import { playlists } from "$lib/state/playlists.svelte";
   import { listFlip } from "$lib/motion";
   import { portal } from "$lib/portal";
   import { swrGet, swrSet, swrDelete } from "$lib/swr";
@@ -24,6 +29,9 @@
   let renameValue = $state("");
   let confirmDelete = $state(false);
   let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
+  let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
+  let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
+  let edit = $state<{ itemId: string; name: string } | null>(null);
   let filterQuery = $state("");
   let duplicatePreview = $state(false);
   let duplicatePreviewTracks = $state<PlaylistTrackDto[]>([]);
@@ -56,6 +64,7 @@
     detail.playlist.name = name; // optimistic
     try {
       await apiLibrary.renamePlaylist(id, name);
+      playlists.refresh();
     } catch (e) {
       error = String(e);
       load(id);
@@ -66,6 +75,7 @@
     confirmDelete = false;
     try {
       await apiLibrary.deletePlaylist(playlistId);
+      playlists.refresh();
       swrDelete(`playlist:${playlistId}`);
       toast.show(m.playlist_deleted());
       goto("/playlists");
@@ -167,6 +177,32 @@
     });
   }
 
+  function onRowContextMenu(event: MouseEvent, entry: PlaylistTrackDto, index: number) {
+    event.preventDefault();
+    const { x, y } = menuPoint(event);
+    menu = {
+      x,
+      y,
+      items: trackMenuItems([entry.track], {
+        // A row plays the playlist from here, which is what clicking it does.
+        play: { run: () => player.run(apiLibrary.playPlaylist(playlistId, index)) },
+        addToPlaylist: (tracks) => (addTo = { x, y, trackIds: tracks.map((track) => track.id) }),
+        info: (track) =>
+          (info = { itemId: track.id, name: track.name, playCount: track.playCount }),
+        edit: (track) => (edit = { itemId: track.id, name: track.name }),
+        // Removal goes by entry id: the same track can sit in a playlist twice,
+        // and the item id cannot tell the two rows apart.
+        extra: () => [
+          {
+            label: m.playlist_remove_track(),
+            icon: TRACK_ICON.trash,
+            action: () => removeEntry(entry.entryId),
+          },
+        ],
+      }),
+    };
+  }
+
   function openDuplicatePreview() {
     if (!detail || duplicateEntryCount === 0) return;
     duplicatePreviewTracks = [...detail.tracks];
@@ -216,6 +252,7 @@
     duplicatePlaylistError = null;
     try {
       const newId = await apiLibrary.duplicatePlaylist(playlistId, name);
+      playlists.refresh();
       duplicateOpen = false;
       toast.show(m.playlist_duplicate_done({ name }));
       await goto("/playlist/" + newId);
@@ -477,6 +514,8 @@
                   dragFrom = null;
                   dropAt = null;
                 }}
+                oncontextmenu={(event) => onRowContextMenu(event, entry, originalIndex)}
+                {@attach contextMenuKey}
                 onclick={() => player.run(apiLibrary.playPlaylist(playlistId, originalIndex))}
                 onkeydown={(event) => {
                   if (event.key === "Enter" || event.key === " ") {
@@ -555,6 +594,28 @@
   {/if}
 </div>
 
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
+{/if}
+{#if info}
+  <SongInfo
+    itemId={info.itemId}
+    name={info.name}
+    playCount={info.playCount}
+    onclose={() => (info = null)}
+  />
+{/if}
+{#if edit}
+  <MetadataEditor
+    itemId={edit.itemId}
+    displayName={edit.name}
+    onclose={() => (edit = null)}
+    onsaved={() => {
+      edit = null;
+      load(playlistId);
+    }}
+  />
+{/if}
 {#if addTo}
   <AddToPlaylistMenu
     x={addTo.x}

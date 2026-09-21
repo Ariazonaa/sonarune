@@ -68,6 +68,9 @@ function runAction(action: ShortcutAction) {
       return;
     case "repeat":
       player.run(player.cycleRepeat());
+      return;
+    case "jumpToCurrent":
+      player.jumpToCurrent();
   }
 }
 

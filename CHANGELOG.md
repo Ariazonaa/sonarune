@@ -7,6 +7,56 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-21
+
+### Added
+
+- **Volume normalization has an album mode.** Settings → Playback now offers
+  off, per track or per album. Per album plays every track of an album at one
+  gain, so a quiet piece stays quieter than a loud one — what the album was
+  mixed for. Jellyfin only sends an album value after 10.11; without one the
+  gain is the median of the album's tracks in the queue, which is the same
+  constant offset even if the absolute level can sit a little off. A change
+  takes effect from the next track.
+- **Stop after this track, or after this album.** Right-click a queue entry:
+  playback ends where you said it would, without a fade — the track finishes
+  the way it was recorded and then it is quiet. The armed row is marked, and
+  the gapless hand-off is held back for that one boundary so the track really
+  does end. An album stop knows where its album ends, even when the queue
+  continues with another one.
+- **Every track list has the same right-click menu.** Album, playlist,
+  favorites and search results had a few hover buttons and no menu at all;
+  they now offer what the song list has offered all along — play, play next,
+  add to the queue, add to a playlist, instant mix, go to album or artist,
+  info, edit, download, delete — plus what only that list can do, such as
+  removing an entry from the playlist it sits in or taking a track out of the
+  favorites.
+- **The playlists are in the sidebar**, and tracks and albums can be dragged
+  onto them. Drag a row from the song list, an album's track list or the
+  favorites — or a whole album from a grid — and drop it on a playlist to add
+  it. A drag from outside the window is not accepted; only the app's own
+  payload lights a playlist up.
+- **The home page can be arranged.** Each row can be moved or hidden from its
+  own heading; Settings → View lists them all, which is where a hidden one
+  comes back from. A row the server has nothing for still stays out — that is
+  not a setting, that is an empty row.
+- **Jump to the playing track.** `J`, the command palette, or the pill that
+  appears in the queue while the current entry is scrolled out of sight. The
+  queue also opens on the playing track now, and follows along to the next one
+  while it is on screen — but never while you are reading somewhere else in
+  the list.
+
+### Changed
+
+- The update panel now shows what actually changed. `latest.json` carries the
+  release's changelog section instead of a sentence pointing at a file the
+  dialog cannot open.
+- A failed update check says what went wrong in words: the releases page was
+  unreachable, it holds no release for this platform, the download broke off,
+  or — the one worth its own sentence — the download did not match the
+  project's signature and was discarded. The technical detail stays in the log
+  and in the diagnostic export.
+
 ## [0.2.0] — 2026-09-21
 
 ### Added
@@ -116,6 +166,7 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/jellysic/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Ariazonaa/jellysic/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Ariazonaa/jellysic/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Ariazonaa/jellysic/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Ariazonaa/jellysic/releases/tag/v0.1.0

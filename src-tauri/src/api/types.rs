@@ -394,10 +394,17 @@ pub struct BaseItem {
     pub run_time_ticks: Option<i64>,
     pub image_tags: HashMap<String, String>,
     pub album_primary_image_tag: Option<String>,
-    /// dB gain toward the server's loudness target; track gain only
-    /// (album gain is unavailable, jellyfin#14346). Needs
+    /// dB gain toward the server's loudness target for this track. Needs
     /// `fields=NormalizationGain` in the query.
     pub normalization_gain: Option<f32>,
+    /// The same for the album the track belongs to — what album-mode
+    /// normalization is supposed to use. Jellyfin only started sending it
+    /// after 10.11 (jellyfin#14346), so it is usually absent and the player
+    /// derives an album gain from the queue instead. Not requested through
+    /// `fields`: the server fills it along with the album itself, and naming
+    /// an unknown field would only get the whole request refused.
+    #[serde(default)]
+    pub album_normalization_gain: Option<f32>,
     /// ImageType -> (image tag -> blurhash). Included whenever images are.
     pub image_blur_hashes: HashMap<String, HashMap<String, String>>,
     /// Needs `enableUserData=true` in the query.
@@ -522,6 +529,8 @@ pub struct TrackDto {
     pub image_tag: Option<String>,
     pub image_blur_hash: Option<String>,
     pub normalization_gain: Option<f32>,
+    /// The album's gain, when the server knows one (see `ItemWire`).
+    pub album_normalization_gain: Option<f32>,
     pub is_favorite: bool,
     /// Server-side play count for this track.
     pub play_count: i32,
@@ -747,6 +756,7 @@ impl TrackDto {
             image_tag,
             image_blur_hash,
             normalization_gain: item.normalization_gain,
+            album_normalization_gain: item.album_normalization_gain,
             is_favorite: item
                 .user_data
                 .as_ref()
