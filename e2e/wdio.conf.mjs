@@ -42,6 +42,16 @@ function resolveTargetDir() {
       /* fall through */
     }
   }
+  // Say why the fallback is being used. Without this the run dies much later
+  // with "no msedge binary at src-tauri/target/debug/jellysic.exe", which
+  // points at the wrong thing entirely: the binary is fine, it just is not
+  // there. `~/.cargo/bin` is not enough on a machine where cargo lives in the
+  // rustup toolchain directory and only cargo-installed tools sit in that bin.
+  console.warn(
+    "[e2e] could not run `cargo metadata` (is cargo on PATH?) — assuming the " +
+      "in-tree target dir. If src-tauri/.cargo/config.toml redirects it, the " +
+      "binary will not be found; put cargo on PATH or set E2E_APP_BINARY.",
+  );
   return path.join(srcTauri, "target");
 }
 

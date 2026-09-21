@@ -106,6 +106,7 @@ UI shows it, it never computes it.
   so a playlist that contains the same track twice behaves.
 - **In the sidebar**, and tracks and albums can be dragged onto them from any
   list or grid.
+
 </details>
 
 <details>

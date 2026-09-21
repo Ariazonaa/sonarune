@@ -73,10 +73,15 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustc --version --verbose
 
-      # Puts cl.exe / link.exe and the Windows SDK on PATH for the cargo steps
-      # and for the cmake build of libopus.
-      - name: Set up MSVC environment
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      # No vcvars step here, on purpose. cargo finds the MSVC linker and cmake
+      # finds Visual Studio through the registry, not through PATH, so nothing
+      # has to be prepared for them. Measured on 21.09.2026 by running this
+      # workflow without `ilammy/msvc-dev-cmd` (run 35648922194) and then the
+      # release workflow, which has no cache at all and therefore built libopus
+      # with cmake from source in the same run (35649841406, 11 minutes). Do not
+      # add it back without a measurement saying it is needed: it was the last
+      # third-party action in the release path, and it is pinned to node 20,
+      # which GitHub no longer runs.
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2

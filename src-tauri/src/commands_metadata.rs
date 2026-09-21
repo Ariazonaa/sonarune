@@ -42,6 +42,10 @@ pub async fn update_items_metadata(
     item_ids: Vec<String>,
     edits: BulkMetadataEdits,
 ) -> AppResult<BulkMetadataResult> {
+    // Logged on the way in as well as out: a save that "did nothing" is
+    // otherwise indistinguishable from a click that never reached the backend,
+    // and only one of those two is a bug in here.
+    tracing::info!("bulk metadata write: {} items", item_ids.len());
     let mut result = BulkMetadataResult::default();
     for item_id in item_ids {
         let outcome = with_retry(&state, |c| {
@@ -63,6 +67,11 @@ pub async fn update_items_metadata(
             }
         }
     }
+    tracing::info!(
+        "bulk metadata write done: {} changed, {} failed",
+        result.changed,
+        result.failed
+    );
     Ok(result)
 }
 
@@ -74,7 +83,7 @@ pub async fn update_item_metadata(
     item_id: String,
     edits: MetadataEdits,
 ) -> AppResult<()> {
-    with_retry(&state, |c| {
+    let outcome = with_retry(&state, |c| {
         let item_id = item_id.clone();
         let edits = edits.clone();
         async move {
@@ -83,5 +92,12 @@ pub async fn update_item_metadata(
             c.update_item(&item_id, item).await
         }
     })
-    .await
+    .await;
+    // Same reason as the bulk write: without this, a refused write leaves no
+    // trace anywhere but in the dialog the user is looking at.
+    match &outcome {
+        Ok(()) => tracing::info!("metadata write done for {item_id}"),
+        Err(e) => tracing::warn!("metadata write failed for {item_id}: {e}"),
+    }
+    outcome
 }

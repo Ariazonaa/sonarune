@@ -3,7 +3,7 @@
   import { m } from "$lib/paraglide/messages";
   import { portal } from "$lib/portal";
   import { toast } from "$lib/state/toast.svelte";
-  import type { BulkMetadataEdits } from "$lib/types";
+  import type { BulkMetadataEdits, BulkMetadataResult } from "$lib/types";
 
   let {
     itemIds,
@@ -72,26 +72,47 @@
     if (!canSave) return;
     saving = true;
     saveError = null;
+    let result: BulkMetadataResult;
     try {
-      const result = await apiLibrary.updateItemsMetadata(itemIds, edits);
-      if (result.changed > 0) {
-        toast.show(m.edit_bulk_done({ count: result.changed }));
-        onsaved?.();
-      }
-      if (result.failed > 0) {
-        // Partly through: say how many, and keep the dialog open with the
-        // reason rather than closing on a half-done write.
-        saveError = m.edit_bulk_partial({
-          count: result.failed,
-          message: result.error ?? "",
-        });
-        return;
-      }
-      onclose();
+      result = await apiLibrary.updateItemsMetadata(itemIds, edits);
     } catch (e) {
       saveError = String(e);
+      return;
     } finally {
       saving = false;
+    }
+
+    // Past this line the server has answered. What follows must not be able to
+    // present a finished write as a failed one, which is what happened while
+    // the caller's refresh ran inside this try: a list that threw on reload
+    // landed in `catch`, put an error in the dialog and kept it open —
+    // although every track had been written.
+    if (result.changed > 0) {
+      toast.show(m.edit_bulk_done({ count: result.changed }));
+      tellCaller();
+    }
+    if (result.failed > 0) {
+      // Partly through: say how many, and keep the dialog open with the
+      // reason rather than closing on a half-done write.
+      saveError = m.edit_bulk_partial({
+        count: result.failed,
+        message: result.error ?? "",
+      });
+      return;
+    }
+    onclose();
+  }
+
+  /**
+   * Let the list know it is stale, without letting it decide this dialog's
+   * outcome. Reloading a list is the caller's business and can throw for its
+   * own reasons; the write already happened.
+   */
+  function tellCaller() {
+    try {
+      onsaved?.();
+    } catch (e) {
+      console.error("refreshing the list after a metadata save failed", e);
     }
   }
 

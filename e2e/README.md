@@ -66,7 +66,7 @@ and then runs every spec.
 
 | Var | Effect |
 |-----|--------|
-| `E2E_SKIP_BUILD=1` | Skip the debug build (the binary must already exist). Use while iterating on specs. |
+| `E2E_SKIP_BUILD=1` | Skip the debug build (the binary must already exist). Use while iterating on specs. **Not with a binary `tauri dev` produced**: that one is compiled to load the frontend from `devUrl` (`localhost:1420`), so without Vite running it opens a blank window and every spec fails with "neither the setup screen nor the app shell mounted". The skip is only safe after a `tauri build --debug`, which embeds the frontend. |
 | `E2E_APP_BINARY=<path>` | Use a specific `jellysic.exe` instead of the resolved debug build. |
 | `MSEDGEDRIVER=<path>` | Path to `msedgedriver.exe` if it isn't on PATH. |
 | `JELLYSIC_TEST_URL` / `JELLYSIC_TEST_USER` / `JELLYSIC_TEST_PASS` | Let `visualizer.e2e.js` sign in when no session is restored. Use a throwaway/test library. |

@@ -137,13 +137,29 @@
     saveError = null;
     try {
       await apiLibrary.updateItemMetadata(itemId, edits);
-      toast.show(m.edit_saved());
-      onsaved?.();
-      onclose();
     } catch (e) {
       saveError = String(e);
+      return;
     } finally {
       saving = false;
+    }
+    // Past this line the write is done. What follows is housekeeping, and it
+    // must not be able to present a finished save as a failed one.
+    toast.show(m.edit_saved());
+    tellCaller();
+    onclose();
+  }
+
+  /**
+   * Let the list know it is stale, without letting it decide this dialog's
+   * outcome. Reloading a list is the caller's business and can throw for its
+   * own reasons; the write already happened, so the dialog closes either way.
+   */
+  function tellCaller() {
+    try {
+      onsaved?.();
+    } catch (e) {
+      console.error("refreshing the list after a metadata save failed", e);
     }
   }
 

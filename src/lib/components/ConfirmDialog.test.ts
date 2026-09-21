@@ -55,6 +55,23 @@ describe("ConfirmDialog", () => {
     expect(dialog()).toBeNull();
   });
 
+  it("puts its overlay in <body>, not where it is declared", () => {
+    // It is asked for by dialogs that are themselves portaled to <body>. Left
+    // where the layout declares it, it painted *behind* the dialog that had
+    // asked — same z-index, earlier in the document — so the prompt sat under
+    // that dialog's backdrop and pressing Save looked like it did nothing.
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    instance = mount(ConfirmDialog, { target: host });
+    flushSync();
+    askDestructive();
+
+    const overlay = dialog()?.parentElement;
+    expect(overlay).not.toBeNull();
+    expect(overlay?.parentElement).toBe(document.body);
+    expect(host.contains(overlay!)).toBe(false);
+  });
+
   it("opens a modal dialog for a confirm request", () => {
     render();
     askDestructive();

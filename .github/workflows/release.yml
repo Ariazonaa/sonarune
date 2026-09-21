@@ -98,10 +98,14 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustc --version --verbose
 
-      # Puts cl.exe / link.exe and the Windows SDK on PATH for cargo and for the
-      # cmake build of libopus.
-      - name: Set up MSVC environment
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      # No vcvars step: cargo finds the MSVC linker and cmake finds Visual
+      # Studio through the registry rather than through PATH. Proven on
+      # 21.09.2026 by running this very workflow, on a branch and without the
+      # action, as a manual run: uncached, so every dependency including
+      # libopus was compiled from source, and the installer came out
+      # (35649841406). With that gone, nothing third-party runs in the workflow
+      # that signs and publishes the installer -- only actions/checkout and
+      # actions/setup-node.
 
       # Deliberately uncached: a release is worth the extra minutes of building
       # every dependency from source rather than trusting a restored cache.

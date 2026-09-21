@@ -54,6 +54,15 @@ export default defineConfig(async () => ({
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
+      // 4. `JELLYSIC_POLL_WATCH=1` watches by polling instead of by OS events.
+      //    On a checkout that lives on a network share, the native watcher
+      //    dies with `ETIMEDOUT: connection timed out, watch` the moment the
+      //    share stalls for a second — and it takes the whole dev server with
+      //    it, before it ever answers on port 1420. Polling costs a little CPU
+      //    and survives that. Off by default: on a local disk the OS events
+      //    are both faster and free.
+      usePolling: process.env.JELLYSIC_POLL_WATCH === "1",
+      interval: 400,
     },
   },
 }));
