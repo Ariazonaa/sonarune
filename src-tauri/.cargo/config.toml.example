@@ -1,0 +1,13 @@
+# Optional developer setting, NOT checked in.
+#
+# Cargo writes build artifacts next to the sources by default. If your checkout
+# lives somewhere slow -- a network share, a synced folder, a spinning disk --
+# point the target dir at fast local storage instead. Copy this file to
+# `config.toml` (same directory) and set an absolute path for your machine:
+#
+#   [build]
+#   target-dir = "/absolute/path/on/a/fast/local/disk"
+#
+# `config.toml` is git-ignored precisely because the path is machine-specific;
+# a checked-in absolute path would point at a directory nobody else has. CI
+# overrides it with the CARGO_TARGET_DIR environment variable either way.

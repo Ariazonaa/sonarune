@@ -1,0 +1,92 @@
+name: Bug report
+description: Something works differently than it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The fields below are the ones that get
+        asked for anyway — filling them in now saves a round trip.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        1. Open an album with more than one disc
+        2. Press play on the second disc
+        3. The first disc starts instead
+    validations:
+      required: true
+
+  - type: input
+    id: jellysic-version
+    attributes:
+      label: Jellysic version
+      description: Settings → About, or the installer file name.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: jellyfin-version
+    attributes:
+      label: Jellyfin server version
+      description: Your server's dashboard shows it.
+      placeholder: "10.11.2"
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: "`winver` tells you. Include the build number if you have it."
+      placeholder: "Windows 11 24H2 (26100.2033)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part
+      options:
+        - Playback (gapless, crossfade, seeking, output device)
+        - Library and browsing
+        - Queue and playlists
+        - Visualizer or projector
+        - Lyrics
+        - Sign-in, certificates, connection
+        - Window, tray, mini player
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics export
+      description: |
+        Settings → Diagnostics → Export writes a redacted log. URLs,
+        credentials, absolute paths and long ids are stripped before it is
+        written, so it is safe to attach. Drag the file in here.
+
+  - type: textarea
+    id: media
+    attributes:
+      label: The file, if it is about one track
+      description: |
+        Format, sample rate, bit depth, and whether the server transcodes it.
+        For a gapless or decoding problem this is usually the deciding detail.
+      placeholder: "FLAC 44.1 kHz/16, direct play, part of a live album with no gaps"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you post
+      options:
+        - label: I searched the existing issues
+          required: true
+        - label: This happens with the current version
+          required: true

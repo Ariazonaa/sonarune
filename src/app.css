@@ -1,0 +1,270 @@
+@import "tailwindcss";
+
+/* Low windows (the app allows 600px): views trade secondary rows for room. */
+@custom-variant short (@media (max-height: 56rem));
+
+/*
+ * Design tokens — AMOLED dark (per explicit user request). One theme, no light
+ * mode. The window ground is true black and the surfaces are a short ladder of
+ * near blacks separated by hairlines, not glass. Only the cover art and the
+ * accent carry color: `--cover-*` are set at runtime from the playing cover
+ * (routes/+layout.svelte + lib/ambient.ts) and tint the thin seam around the
+ * panels, `--color-accent*` are set inline on <html> by lib/theme.ts.
+ *
+ * Surface tokens are OPAQUE — a translucent fill over black reads grey and
+ * depends on whatever happens to sit behind it. The single exception is
+ * `--color-overlay`, the fill of floating overlays, which stays translucent so
+ * their backdrop blur has something to do.
+ */
+@theme {
+  --color-base: #000000; /* window ground */
+  --color-panel: #0a0a0c; /* chrome: sidebar, main, player bar, queue, lyrics */
+  --color-card: #101013; /* cards and panes inside the chrome */
+  --color-panel-2: #141417; /* hover / active / raised surface */
+  --color-overlay: rgb(22 22 26 / 0.78); /* floating overlays (blurred) */
+  --color-edge: rgb(255 255 255 / 0.1); /* hairline borders */
+  --color-ink: #f2f2f4; /* primary text */
+  --color-ink-muted: #8a8a93; /* secondary text; opaque, so it reads the same over a cover */
+  --color-accent: #1db954; /* user-configurable via theme.ts */
+  --color-accent-hover: #1ed760;
+  --color-on-accent: #000000; /* text/icons on accent-colored surfaces */
+
+  /* The close button's hover red — the only fixed hue in the chrome, and
+     declared here so the title bar carries no literal color. Minimize and
+     maximize hover on --color-panel-2, like every Windows title bar. */
+  --color-window-close: #c42b1c;
+
+  /* Overlay material — the only backdrop-filter left in the app. */
+  --overlay-blur: 18px;
+  --overlay-saturate: 130%;
+  /* Cover-derived field colors (set at runtime; cool default before playback) */
+  --cover-a: #2a2350;
+  --cover-b: #10283f;
+
+  /* Windows first. -apple-system stays at the back for a future macOS build. */
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system,
+    sans-serif;
+
+  /* Corner radii. Nothing inside a panel may be rounder than the panel it sits
+     in, so these two are the ceiling for everything else. */
+  --radius-panel: 0.75rem; /* 12px -> `rounded-panel` */
+  --radius-overlay: 0.625rem; /* 10px -> `rounded-overlay` */
+
+  /* 16px body size. Tailwind's own `text-base` is unusable here: with the
+     `--color-base` token above it compiles to `color: var(--color-base)` (the
+     background color) and sets no font size at all. Use `text-md` for the
+     size and `text-(--color-base)` for the color. */
+  --text-md: 1rem;
+  --text-md--line-height: 1.5;
+}
+
+html,
+body {
+  height: 100%;
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+  -webkit-font-smoothing: antialiased;
+  background: transparent;
+}
+
+/*
+ * The whole app is a single rounded, floating pane. The OS window is frameless
+ * + transparent (tauri.conf.json), so .app-root's rounded corners cut straight
+ * to the desktop — no native title bar to square them off. Its ::before tints
+ * the ground with the playing cover's colors. The panels above it are opaque,
+ * so what stays visible of that is a thin colored seam: the gaps between the
+ * panels, the title bar strip and the margin around the player bar.
+ */
+.app-root {
+  position: relative;
+  height: 100vh;
+  border-radius: 16px;
+  overflow: hidden;
+  background-color: var(--color-base);
+  box-shadow: inset 0 0 0 1px var(--color-edge);
+}
+.app-root::before {
+  content: "";
+  position: absolute;
+  inset: -20%;
+  pointer-events: none;
+  background:
+    radial-gradient(45% 55% at 18% 22%, var(--cover-a) 0%, transparent 62%),
+    radial-gradient(50% 55% at 82% 78%, var(--cover-b) 0%, transparent 60%),
+    radial-gradient(60% 60% at 60% 15%, color-mix(in oklab, var(--cover-a) 55%, transparent) 0%, transparent 70%);
+  filter: saturate(1.25);
+  opacity: 0.12;
+  transition: background 1.6s ease;
+}
+
+/*
+ * Surfaces.
+ *
+ * `.surface` is the chrome hairline — sidebar, main, player bar, queue,
+ * lyrics. It is its own class rather than a rule on `.bg-panel` because the
+ * panel color is also used for small inner panes that bring their own border.
+ *
+ * `.overlay` is the only surface left with a backdrop-filter, which makes it
+ * the only containing block for `position: fixed` in the app. Overlays are
+ * themselves portaled to <body> (lib/portal.ts), so nothing lands inside one.
+ *
+ * All three live in `@layer components` so a utility always wins. They set
+ * `box-shadow`, and so do `shadow-*` and `ring-*` — only one of them can
+ * apply. Letting the class win reads tidier but loses silently: a `ring-1` put
+ * on an element for emphasis simply stops rendering, with nothing to see in
+ * the markup. If an element needs both, give it a `border`, which is a
+ * different property and composes.
+ */
+@layer components {
+  .surface {
+    box-shadow: inset 0 0 0 1px var(--color-edge);
+  }
+
+  .overlay {
+    background-color: var(--color-overlay);
+    -webkit-backdrop-filter: blur(var(--overlay-blur)) saturate(var(--overlay-saturate));
+    backdrop-filter: blur(var(--overlay-blur)) saturate(var(--overlay-saturate));
+    box-shadow:
+      inset 0 0 0 1px var(--color-edge),
+      0 18px 48px -12px rgb(0 0 0 / 0.8);
+  }
+
+  /* Cards get the same hairline against the panel they sit on. */
+  .bg-card {
+    box-shadow: inset 0 0 0 1px var(--color-edge);
+  }
+}
+
+/* Text content stays selectable where it makes sense */
+input,
+textarea {
+  user-select: text;
+}
+
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+/* On black a 20% thumb disappears; these sit a step above the hairline. */
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.38);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Keyboard focus: a visible accent outline on interactive elements that don't
+   manage their own focus ring. In `@layer base` so Tailwind's `utilities`
+   layer wins — a component that sets `outline-none` (its own ring) suppresses
+   this, and `rounded-full` keeps its shape. No border-radius here so round
+   buttons aren't deformed while focused. */
+@layer base {
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Loading placeholder: a shimmering block for skeleton screens. The
+   reduced-motion rule below flattens the shimmer to a static panel-2 block. */
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+.skeleton {
+  background-color: var(--color-panel-2);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.07) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+main [data-card-grid] {
+  grid-template-columns: repeat(auto-fill, minmax(var(--view-card-min), 1fr)) !important;
+}
+
+/* A horizontal card row must never scroll vertically. `overflow-x: auto` alone
+   does not say so: CSS forces the other axis to `auto` as soon as one axis is
+   not `visible`, so anything taller than the row raises a vertical scrollbar,
+   which then takes 12px of height and clips the very cards it reacted to.
+   /discover did exactly that, because a card root that was not a flex item
+   stayed inline and overflowed its own box (fixed at the source, in the card
+   components). This keeps the next such overflow from turning into a scrollbar. */
+main [data-card-row] {
+  overflow-y: hidden;
+}
+
+main [data-card-row] > * {
+  width: var(--view-card-row) !important;
+}
+
+main[data-view-density="compact"] :where(.p-6) {
+  padding: 0.875rem !important;
+}
+
+main[data-view-density="compact"] :where(.px-6) {
+  padding-left: 0.875rem !important;
+  padding-right: 0.875rem !important;
+}
+
+main[data-view-density="compact"] :where(.py-4) {
+  padding-top: 0.625rem !important;
+  padding-bottom: 0.625rem !important;
+}
+
+main[data-view-density="compact"] :where(.gap-4) {
+  gap: 0.625rem !important;
+}
+
+main[data-view-density="compact"] :where(table td) {
+  padding-top: 0.35rem;
+  padding-bottom: 0.35rem;
+}
+
+main[data-view-density="compact"] :where([data-list-row]) {
+  padding-top: 0.25rem !important;
+  padding-bottom: 0.25rem !important;
+}
+
+/* Route cross-fade via the View Transitions API (see +layout onNavigate). */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 240ms;
+  animation-timing-function: ease;
+}
+
+/* Honor the OS "reduce motion" setting: strip transitions/animations that are
+   purely decorative (cover fades, hover lifts, panel slides, route fades). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none !important;
+  }
+}

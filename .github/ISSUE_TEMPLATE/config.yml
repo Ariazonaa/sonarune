@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Ariazonaa/jellysic/security/advisories/new
+    about: >-
+      Report it privately here instead of opening an issue. SECURITY.md has the
+      details.

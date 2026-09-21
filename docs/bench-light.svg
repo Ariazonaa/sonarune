@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="818" viewBox="0 0 1000 818" role="img" aria-label="Four Jellyfin music clients for Windows, measured on the same library. Shorter is better. Installer: Jellysic 7.2, Supersonic 49.8, Feishin 178, Sonixd 81.7 MB. On disk: Jellysic 28, Supersonic 169, Feishin 644, Sonixd 332 MB. Launch → window: Jellysic 177, Supersonic 594, Feishin 722, Sonixd 719 ms. Memory, working set: Jellysic 427, Supersonic 198, Feishin 760, Sonixd 406 MB. Memory, private bytes: Jellysic 273, Supersonic 404, Feishin 464, Sonixd 213 MB. CPU: Jellysic 0.65, Supersonic 0.2, Feishin 2.1, Sonixd 4.95 %. Processes: Jellysic 7, Supersonic 1, Feishin 6, Sonixd 5 .">
+<rect width="1000" height="818" fill="#fcfcfb"/>
+<g font-family='-apple-system, "Segoe UI Variable Text", "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif'>
+<text x="32" y="38" fill="#14141a" font-size="21" font-weight="700" letter-spacing="-0.3">Four clients, one library</text>
+<text x="32" y="62" fill="#5c5b63" font-size="12.5">Shorter is better · each row scaled to its own worst value · median of two runs, 45 s each after a 15 s settle</text>
+<rect x="638" y="26" width="9" height="9" rx="2" fill="#2a78d6"/>
+<text x="653" y="34" fill="#14141a" font-size="11.5">Jellysic 0.1.0</text>
+<text x="653" y="45" fill="#5c5b63" font-size="10">Rust + WebView2</text>
+<rect x="808" y="26" width="9" height="9" rx="2" fill="#1baf7a"/>
+<text x="823" y="34" fill="#14141a" font-size="11.5">Supersonic 0.22.1</text>
+<text x="823" y="45" fill="#5c5b63" font-size="10">Go + Fyne</text>
+<rect x="638" y="52" width="9" height="9" rx="2" fill="#eb6834"/>
+<text x="653" y="60" fill="#14141a" font-size="11.5">Feishin 1.17.0</text>
+<text x="653" y="71" fill="#5c5b63" font-size="10">Electron</text>
+<rect x="808" y="52" width="9" height="9" rx="2" fill="#eda100"/>
+<text x="823" y="60" fill="#14141a" font-size="11.5">Sonixd 0.15.5</text>
+<text x="823" y="71" fill="#5c5b63" font-size="10">Electron, archived</text>
+<text x="32" y="118" fill="#5c5b63" font-size="10.5" font-weight="700" letter-spacing="1.1">FOOTPRINT</text>
+<line x1="32" y1="126" x2="968" y2="126" stroke="#14141a12" stroke-width="1"/>
+<text x="32" y="153" fill="#14141a" font-size="13.5" font-weight="600">Installer</text>
+<text x="32" y="171" fill="#5c5b63" font-size="11">best 7.2 MB</text>
+<path d="M218 140 H240.94 a4 4 0 0 1 4 4 V146 a4 4 0 0 1 -4 4 H218 Z" fill="#2a78d6"/>
+<text x="254.94" y="149" fill="#14141a" font-size="11.5" font-weight="600">7.2 MB</text>
+<path d="M218 155 H400.33 a4 4 0 0 1 4 4 V161 a4 4 0 0 1 -4 4 H218 Z" fill="#1baf7a"/>
+<text x="414.33" y="164" fill="#5c5b63" font-size="11.5" font-weight="400">49.8 MB</text>
+<path d="M218 170 H880 a4 4 0 0 1 4 4 V176 a4 4 0 0 1 -4 4 H218 Z" fill="#eb6834"/>
+<text x="894" y="179" fill="#5c5b63" font-size="11.5" font-weight="400">178 MB</text>
+<path d="M218 185 H519.69 a4 4 0 0 1 4 4 V191 a4 4 0 0 1 -4 4 H218 Z" fill="#eda100"/>
+<text x="533.69" y="194" fill="#5c5b63" font-size="11.5" font-weight="400">81.7 MB</text>
+<text x="32" y="233" fill="#14141a" font-size="13.5" font-weight="600">On disk</text>
+<text x="32" y="251" fill="#5c5b63" font-size="11">best 28 MB</text>
+<path d="M218 220 H242.96 a4 4 0 0 1 4 4 V226 a4 4 0 0 1 -4 4 H218 Z" fill="#2a78d6"/>
+<text x="256.96" y="229" fill="#14141a" font-size="11.5" font-weight="600">28 MB</text>
+<path d="M218 235 H388.77 a4 4 0 0 1 4 4 V241 a4 4 0 0 1 -4 4 H218 Z" fill="#1baf7a"/>
+<text x="402.77" y="244" fill="#5c5b63" font-size="11.5" font-weight="400">169 MB</text>
+<path d="M218 250 H880 a4 4 0 0 1 4 4 V256 a4 4 0 0 1 -4 4 H218 Z" fill="#eb6834"/>
+<text x="894" y="259" fill="#5c5b63" font-size="11.5" font-weight="400">644 MB</text>
+<path d="M218 265 H557.34 a4 4 0 0 1 4 4 V271 a4 4 0 0 1 -4 4 H218 Z" fill="#eda100"/>
+<text x="571.34" y="274" fill="#5c5b63" font-size="11.5" font-weight="400">332 MB</text>
+<text x="32" y="312" fill="#5c5b63" font-size="10.5" font-weight="700" letter-spacing="1.1">STARTUP</text>
+<line x1="32" y1="320" x2="968" y2="320" stroke="#14141a12" stroke-width="1"/>
+<text x="32" y="347" fill="#14141a" font-size="13.5" font-weight="600">Launch → window</text>
+<text x="32" y="365" fill="#5c5b63" font-size="11">best 177 ms</text>
+<path d="M218 334 H377.27 a4 4 0 0 1 4 4 V340 a4 4 0 0 1 -4 4 H218 Z" fill="#2a78d6"/>
+<text x="391.27" y="343" fill="#14141a" font-size="11.5" font-weight="600">177 ms</text>
+<path d="M218 349 H761.93 a4 4 0 0 1 4 4 V355 a4 4 0 0 1 -4 4 H218 Z" fill="#1baf7a"/>
+<text x="775.93" y="358" fill="#5c5b63" font-size="11.5" font-weight="400">594 ms</text>
+<path d="M218 364 H880 a4 4 0 0 1 4 4 V370 a4 4 0 0 1 -4 4 H218 Z" fill="#eb6834"/>
+<text x="894" y="373" fill="#5c5b63" font-size="11.5" font-weight="400">722 ms</text>
+<path d="M218 379 H877.23 a4 4 0 0 1 4 4 V385 a4 4 0 0 1 -4 4 H218 Z" fill="#eda100"/>
+<text x="891.23" y="388" fill="#5c5b63" font-size="11.5" font-weight="400">719 ms</text>
+<text x="32" y="426" fill="#5c5b63" font-size="10.5" font-weight="700" letter-spacing="1.1">AT REST, SIGNED IN AND IDLE</text>
+<line x1="32" y1="434" x2="968" y2="434" stroke="#14141a12" stroke-width="1"/>
+<text x="32" y="461" fill="#14141a" font-size="13.5" font-weight="600">Memory, working set</text>
+<text x="32" y="479" fill="#5c5b63" font-size="11">best 198 MB</text>
+<path d="M218 448 H588.19 a4 4 0 0 1 4 4 V454 a4 4 0 0 1 -4 4 H218 Z" fill="#2a78d6"/>
+<text x="602.19" y="457" fill="#5c5b63" font-size="11.5" font-weight="400">427 MB</text>
+<path d="M218 463 H387.51 a4 4 0 0 1 4 4 V469 a4 4 0 0 1 -4 4 H218 Z" fill="#1baf7a"/>
+<text x="401.51" y="472" fill="#14141a" font-size="11.5" font-weight="600">198 MB</text>
+<path d="M218 478 H880 a4 4 0 0 1 4 4 V484 a4 4 0 0 1 -4 4 H218 Z" fill="#eb6834"/>
+<text x="894" y="487" fill="#5c5b63" font-size="11.5" font-weight="400">760 MB</text>
+<path d="M218 493 H569.78 a4 4 0 0 1 4 4 V499 a4 4 0 0 1 -4 4 H218 Z" fill="#eda100"/>
+<text x="583.78" y="502" fill="#5c5b63" font-size="11.5" font-weight="400">406 MB</text>
+<text x="32" y="541" fill="#14141a" font-size="13.5" font-weight="600">Memory, private bytes</text>
+<text x="32" y="559" fill="#5c5b63" font-size="11">best 213 MB</text>
+<path d="M218 528 H605.85 a4 4 0 0 1 4 4 V534 a4 4 0 0 1 -4 4 H218 Z" fill="#2a78d6"/>
+<text x="619.85" y="537" fill="#5c5b63" font-size="11.5" font-weight="400">273 MB</text>
+<path d="M218 543 H793.88 a4 4 0 0 1 4 4 V549 a4 4 0 0 1 -4 4 H218 Z" fill="#1baf7a"/>
+<text x="807.88" y="552" fill="#5c5b63" font-size="11.5" font-weight="400">404 MB</text>
+<path d="M218 558 H880 a4 4 0 0 1 4 4 V564 a4 4 0 0 1 -4 4 H218 Z" fill="#eb6834"/>
+<text x="894" y="567" fill="#5c5b63" font-size="11.5" font-weight="400">464 MB</text>
+<path d="M218 573 H519.73 a4 4 0 0 1 4 4 V579 a4 4 0 0 1 -4 4 H218 Z" fill="#eda100"/>
+<text x="533.73" y="582" fill="#14141a" font-size="11.5" font-weight="600">213 MB</text>
+<text x="32" y="621" fill="#14141a" font-size="13.5" font-weight="600">CPU</text>
+<text x="32" y="639" fill="#5c5b63" font-size="11">best 0.2 %</text>
+<path d="M218 608 H301.45 a4 4 0 0 1 4 4 V614 a4 4 0 0 1 -4 4 H218 Z" fill="#2a78d6"/>
+<text x="315.45" y="617" fill="#5c5b63" font-size="11.5" font-weight="400">0.65 %</text>
+<path d="M218 623 H240.91 a4 4 0 0 1 4 4 V629 a4 4 0 0 1 -4 4 H218 Z" fill="#1baf7a"/>
+<text x="254.91" y="632" fill="#14141a" font-size="11.5" font-weight="600">0.2 %</text>
+<path d="M218 638 H496.55 a4 4 0 0 1 4 4 V644 a4 4 0 0 1 -4 4 H218 Z" fill="#eb6834"/>
+<text x="510.55" y="647" fill="#5c5b63" font-size="11.5" font-weight="400">2.1 %</text>
+<path d="M218 653 H880 a4 4 0 0 1 4 4 V659 a4 4 0 0 1 -4 4 H218 Z" fill="#eda100"/>
+<text x="894" y="662" fill="#5c5b63" font-size="11.5" font-weight="400">4.95 %</text>
+<text x="32" y="701" fill="#14141a" font-size="13.5" font-weight="600">Processes</text>
+<text x="32" y="719" fill="#5c5b63" font-size="11">best 1</text>
+<path d="M218 688 H880 a4 4 0 0 1 4 4 V694 a4 4 0 0 1 -4 4 H218 Z" fill="#2a78d6"/>
+<text x="894" y="697" fill="#5c5b63" font-size="11.5" font-weight="400">7</text>
+<path d="M218 703 H309.14 a4 4 0 0 1 4 4 V709 a4 4 0 0 1 -4 4 H218 Z" fill="#1baf7a"/>
+<text x="323.14" y="712" fill="#14141a" font-size="11.5" font-weight="600">1</text>
+<path d="M218 718 H784.86 a4 4 0 0 1 4 4 V724 a4 4 0 0 1 -4 4 H218 Z" fill="#eb6834"/>
+<text x="798.86" y="727" fill="#5c5b63" font-size="11.5" font-weight="400">6</text>
+<path d="M218 733 H689.71 a4 4 0 0 1 4 4 V739 a4 4 0 0 1 -4 4 H218 Z" fill="#eda100"/>
+<text x="703.71" y="742" fill="#5c5b63" font-size="11.5" font-weight="400">5</text>
+<text x="32" y="798" fill="#5c5b63" font-size="11">Same machine, same demo library, each client signed in and idle on its library view. Memory is summed across the whole process tree. Method: scripts/bench.mjs</text>
+</g></svg>

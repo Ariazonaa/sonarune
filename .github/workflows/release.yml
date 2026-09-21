@@ -1,0 +1,155 @@
+name: Release
+
+# Cuts a release from a tag, so the installer people download is one CI built
+# from a commit anyone can check out -- not one somebody produced on their own
+# machine. Push a `v*` tag and a DRAFT release appears with the installer, a
+# portable zip and their checksums; review it, then publish by hand.
+#
+# A manual run builds the same way but creates nothing. That is the way to find
+# out whether the release path still works without cutting a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Only the release job writes, and only to releases.
+permissions:
+  contents: write
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+  # audiopus_sys builds bundled libopus, whose CMakeLists declares a pre-3.5
+  # cmake_minimum_required; CMake 4.x needs this escape hatch to configure it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CARGO_INCREMENTAL: "0"
+
+# Action SHAs are the same ones ci.yml pins, for the same reason: a tag can be
+# repointed by whoever controls the action repository.
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # A tag that disagrees with the manifests would ship an installer whose
+      # file name lies about what is inside it. Catch that before building.
+      - name: Check the version agrees everywhere
+        shell: pwsh
+        run: |
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          "package.json      $pkg"
+          "tauri.conf.json   $conf"
+          "Cargo.toml        $cargo"
+          if ($pkg -ne $conf -or $pkg -ne $cargo) {
+            "::error::the three manifests disagree on the version"
+            exit 1
+          }
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tag = $env:GITHUB_REF -replace '^refs/tags/v?', ''
+            "tag               $tag"
+            if ($tag -ne $pkg) {
+              "::error::tag $tag does not match the manifest version $pkg"
+              exit 1
+            }
+          }
+          "VERSION=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc --version --verbose
+
+      # Puts cl.exe / link.exe and the Windows SDK on PATH for cargo and for the
+      # cmake build of libopus.
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      # Deliberately uncached: a release is worth the extra minutes of building
+      # every dependency from source rather than trusting a restored cache.
+      - name: Build the app and the installer
+        run: npm run tauri build
+
+      - name: Collect the artefacts
+        shell: pwsh
+        run: |
+          $out = "dist"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $setup = "src-tauri/target/release/bundle/nsis/jellysic_${env:VERSION}_x64-setup.exe"
+          if (-not (Test-Path $setup)) { "::error::installer not found at $setup"; exit 1 }
+          Copy-Item $setup $out
+
+          # A portable build for people who do not want an installer: the exe is
+          # self-contained, the frontend is embedded in it.
+          $exe = "src-tauri/target/release/jellysic.exe"
+          if (-not (Test-Path $exe)) { "::error::jellysic.exe not found at $exe"; exit 1 }
+          Compress-Archive -Path $exe -DestinationPath "$out/jellysic_${env:VERSION}_x64-portable.zip"
+
+          # The list is materialized with @() before anything is written: a
+          # PowerShell pipeline streams, so writing the sums file straight out of
+          # a Get-ChildItem over the same directory makes it try to hash the file
+          # it is at that moment creating.
+          $files = @(Get-ChildItem $out -File)
+          $sums = $files | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) }
+
+          # LF, no BOM. This file exists to be fed to `sha256sum -c`, and there a
+          # CRLF ending becomes part of the file name -- every line fails to open.
+          # Set-Content would write CRLF on Windows, so go through .NET directly.
+          $lf = [string][char]10
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) "$out/SHA256SUMS.txt"),
+            (($sums -join $lf) + $lf),
+            (New-Object System.Text.UTF8Encoding $false))
+          Get-Content "$out/SHA256SUMS.txt"
+          Get-ChildItem $out | Select-Object Name, Length
+
+      - name: Draft the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Built from an array rather than a here-string: inside a PowerShell
+          # here-string the backtick is the escape character, and release notes
+          # are full of them.
+          $bt = [string][char]96
+          $fence = $bt * 3
+          $setup = "jellysic_$($env:VERSION)_x64-setup.exe"
+          @(
+            "Windows 10 or 11, 64-bit. The installer runs for the current user,"
+            "so it does not ask for administrator rights, and it needs nothing"
+            "else on the machine: WebView2 already ships with Windows."
+            ""
+            "There is also a portable zip. The exe is self-contained; the"
+            "interface is embedded in it."
+            ""
+            "The build is not code-signed, so SmartScreen reports an unknown"
+            "publisher: **More info -> Run anyway**."
+            ""
+            "Checksums are in ${bt}SHA256SUMS.txt${bt}. To verify a download:"
+            ""
+            ($fence + "powershell")
+            "Get-FileHash .\$setup -Algorithm SHA256"
+            $fence
+            ""
+            "What changed is in [CHANGELOG.md](https://github.com/$($env:GITHUB_REPOSITORY)/blob/$($env:GITHUB_REF_NAME)/CHANGELOG.md)."
+          ) | Out-File -FilePath notes.md -Encoding utf8
+
+          $assets = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
+          gh release create $env:GITHUB_REF_NAME --draft --title "Jellysic $($env:VERSION)" --notes-file notes.md $assets

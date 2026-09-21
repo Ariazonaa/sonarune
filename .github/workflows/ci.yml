@@ -1,0 +1,101 @@
+name: CI
+
+# The public quality gate. Runs on Windows because that is the primary target:
+# the `opus` crate compiles bundled libopus via cmake, and the crate pulls in
+# Windows-only dependencies (SMTC via souvlaki, WebView2), so the Rust gates
+# only compile there. Mirrors `npm run verify` step for step.
+#
+# GitHub's hosted `windows-latest` image already ships Node, rustup, MSVC and
+# cmake, so this only pins versions and adds caching.
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+# Nothing in this pipeline writes to the repository or to a registry.
+permissions:
+  contents: read
+
+# Third-party actions are pinned to commit SHAs rather than moving tags: a tag
+# can be repointed by whoever controls the action repository. The comment after
+# each SHA names the release; change both together when updating
+# (`git ls-remote --tags https://github.com/<owner>/<action>`).
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+  # audiopus_sys builds bundled libopus, whose CMakeLists declares a pre-3.5
+  # cmake_minimum_required. CMake 4.x removed that compatibility and errors
+  # out; this is CMake's documented escape hatch for configuring the old
+  # project anyway. Harmless on CMake 3.x.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # Incremental compilation only costs time and disk on a one-shot CI build.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  quality:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Node 20 went end-of-life in April 2026.
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Type check (svelte-check)
+        run: npm run check
+
+      - name: Frontend tests
+        run: npm run test
+
+      - name: Frontend production build
+        run: npm run build
+
+      # The image ships rustup; take the current stable so a new clippy lint
+      # surfaces here rather than in someone's editor.
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup component add rustfmt clippy
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc --version --verbose
+
+      # Puts cl.exe / link.exe and the Windows SDK on PATH for the cargo steps
+      # and for the cmake build of libopus.
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: rustfmt
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: clippy (warnings are errors)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib

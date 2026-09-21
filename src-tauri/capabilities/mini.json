@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mini",
+  "description": "The mini player window: player state and transport, dragging and closing itself.",
+  "windows": ["mini"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
+    "mini-window"
+  ]
+}

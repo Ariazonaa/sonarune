@@ -1,0 +1,57 @@
+[package]
+name = "jellysic"
+version = "0.1.0"
+description = "A fast Jellyfin desktop music client"
+authors = ["Ariazonaa"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Ariazonaa/jellysic"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "jellysic_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+uuid = { version = "1.23.4", features = ["v4"] }
+rodio = { version = "0.22.2", features = ["symphonia-all"] }
+stream-download = { version = "0.24.1", features = ["reqwest-rustls"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "http2", "query"] }
+keyring = { version = "4.1.2", features = ["windows-native-keyring-store"] }
+rustls = "0.23"
+rustls-native-certs = "0.8"
+sha2 = "0.10"
+# Butterchurn Weekly presets are served gzip-encoded (commands_visualizer.rs).
+# Already in the dependency graph; reqwest's own `gzip` feature would change
+# every client's Accept-Encoding and Content-Length handling.
+flate2 = "1"
+tauri-plugin-window-state = "2.4.1"
+tauri-plugin-single-instance = "2"
+souvlaki = "0.8.3"
+opus = "0.3.1"
+ogg = "0.9.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
+# Suspending the WebView in the background (see webview_power.rs). Versions
+# follow wry's, or the controller type would not match across crate copies.
+webview2-com = "0.38"
+windows = { version = "0.61", features = ["Win32_Foundation"] }
+
+[dev-dependencies]
+proptest = "1"

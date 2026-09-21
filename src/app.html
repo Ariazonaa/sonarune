@@ -1,0 +1,66 @@
+<!doctype html>
+<!-- Frameless, transparent window: the app rounds its own corners (.app-root),
+     so the html/body must stay transparent. -->
+<html lang="en" style="background-color: transparent">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%sveltekit.assets%/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Jellysic</title>
+    <script>
+      // Re-apply the persisted accent before first paint (kept in sync with
+      // src/lib/theme.ts, which handles changes from the settings UI). The app
+      // is AMOLED dark only, so there is no mode to restore here.
+      function onAccentFor(hex) {
+        var h = String(hex || "").replace("#", "");
+        if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+        if (!/^[0-9a-f]{6}$/i.test(h)) return "#000000";
+        var n = parseInt(h, 16);
+        var lum = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+          .map(function (v) {
+            v /= 255;
+            return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+          })
+          .reduce(function (acc, c, i) {
+            return acc + [0.2126, 0.7152, 0.0722][i] * c;
+          }, 0);
+        return (lum + 0.05) / 0.05 >= 1.05 / (lum + 0.05) ? "#000000" : "#ffffff";
+      }
+      try {
+        var jellysicTheme = JSON.parse(localStorage.getItem("jellysic.theme") || "null");
+        if (jellysicTheme) {
+          var root = document.documentElement;
+          if (jellysicTheme.accent)
+            root.style.setProperty("--color-accent", jellysicTheme.accent);
+          if (jellysicTheme.accentHover)
+            root.style.setProperty("--color-accent-hover", jellysicTheme.accentHover);
+          // Black or white on the accent, whichever contrasts more -- a dark
+          // custom accent with black icons hides the play button. Same rule as
+          // onAccentFor() in src/lib/theme.ts; keep the two in sync.
+          root.style.setProperty(
+            "--color-on-accent",
+            onAccentFor(jellysicTheme.accent)
+          );
+          // Accent from the cover: start with the last cover accent rather
+          // than flashing the fixed one until the cover is read.
+          if (jellysicTheme.accentMode !== "fixed") {
+            var coverAccent = JSON.parse(
+              localStorage.getItem("jellysic.coverAccent.v2") || "null"
+            );
+            if (coverAccent) {
+              root.style.setProperty("--color-accent", coverAccent.accent);
+              root.style.setProperty("--color-accent-hover", coverAccent.hover);
+              root.style.setProperty("--color-on-accent", coverAccent.onAccent);
+            }
+          }
+        }
+      } catch (e) {
+        /* corrupt storage: keep defaults */
+      }
+    </script>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

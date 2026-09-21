@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "projector",
+  "description": "The visualizer projector window: session restore, player state, lyrics, the PCM feed and its own fullscreen/close.",
+  "windows": ["projector"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-set-fullscreen",
+    "projector-window"
+  ]
+}

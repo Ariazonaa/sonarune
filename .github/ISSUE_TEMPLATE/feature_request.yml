@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest something the app should do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A few things are deliberately out of scope for v1: offline downloads,
+        casting, podcasts and audiobooks, multiple servers at once, and
+        Subsonic or Navidrome backends. Suggestions in those areas are still
+        welcome, they will just be answered with a reason rather than a plan.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: |
+        The situation, not the solution. "I keep losing my place in long mixes"
+        tells more than "add bookmarks", and often has a better answer.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you had in mind
+      description: How you imagine it working, if you have a picture of it.
+
+  - type: textarea
+    id: prior-art
+    attributes:
+      label: Somewhere this already exists
+      description: |
+        Another client that does it well, and what specifically it gets right.
+        Concepts are fine to borrow; code and assets are not.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you post
+      options:
+        - label: I searched the existing issues
+          required: true

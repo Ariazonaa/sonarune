@@ -1,0 +1,31 @@
+# Store text with LF and check it out however the platform wants it. Without
+# this, a contributor whose git has core.autocrlf off commits CRLF and the next
+# diff shows every line of the file as changed.
+* text=auto
+
+# Generated. GitHub collapses them in a diff; `git diff` still works locally,
+# which matters when a lockfile change is the thing under review.
+package-lock.json linguist-generated=true
+src-tauri/Cargo.lock linguist-generated=true
+
+# Assets git must never try to normalise or diff as text.
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.bmp binary
+*.gif binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.wav binary
+*.flac binary
+*.mp3 binary
+*.ogg binary
+*.exe binary
+
+# The repository is Rust and Svelte; without this the language bar is dominated
+# by the screenshots and the docs.
+docs/* linguist-documentation
