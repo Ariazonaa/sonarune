@@ -10,6 +10,7 @@ use crate::error::{AppError, AppResult};
 use crate::player::PlayerCommand;
 use crate::AppState;
 use serde::Serialize;
+use std::collections::HashMap;
 use tauri::State;
 
 #[derive(Debug, Clone, Serialize)]
@@ -392,6 +393,96 @@ pub struct StatsData {
     pub recently_played: Vec<TrackDto>,
     pub most_played_tracks: Vec<TrackDto>,
     pub most_played_albums: Vec<AlbumDto>,
+    pub totals: LibraryTotals,
+    pub top_artists: Vec<ArtistPlays>,
+    pub decades: Vec<DecadeAlbums>,
+}
+
+/// What the library holds, and how much of it has been played. Counted by the
+/// server, not summed here: a library of fifty thousand tracks must not be
+/// fetched to be counted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryTotals {
+    pub tracks: i64,
+    pub albums: i64,
+    pub artists: i64,
+    pub played_tracks: i64,
+}
+
+/// An artist and the plays counted for them.
+///
+/// Jellyfin cannot sort artists by play count, so this is added up from the
+/// most played *tracks* — which is why the page says so next to the chart.
+/// Beyond that sample the numbers would only get more wrong, not more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistPlays {
+    pub id: Option<String>,
+    pub name: String,
+    pub plays: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecadeAlbums {
+    pub start_year: i32,
+    pub label: String,
+    pub albums: i64,
+}
+
+/// How many tracks to add up for the artist chart. Enough that a handful of
+/// favourites stand out, few enough to stay one request.
+const ARTIST_SAMPLE: u32 = 200;
+/// Decades on the chart, newest first. Older than that is a long tail nobody
+/// reads.
+const DECADES_SHOWN: usize = 10;
+
+/// Add plays per artist over a set of tracks, most plays first.
+///
+/// A track is counted for every artist credited on it: a duet belongs to both,
+/// and dropping the second name would quietly rewrite who made the music.
+/// Tracks the server never counted as played contribute nothing.
+pub fn top_artists(tracks: &[TrackDto], limit: usize) -> Vec<ArtistPlays> {
+    let mut by_artist: HashMap<String, ArtistPlays> = HashMap::new();
+    for track in tracks {
+        let plays = i64::from(track.play_count.max(0));
+        if plays == 0 {
+            continue;
+        }
+        if track.artists.is_empty() {
+            // No linkable artist: keep the credit under the name the track
+            // shows, so the chart is not quietly missing plays.
+            if track.artist.trim().is_empty() {
+                continue;
+            }
+            let entry = by_artist
+                .entry(track.artist.to_lowercase())
+                .or_insert_with(|| ArtistPlays {
+                    id: None,
+                    name: track.artist.clone(),
+                    plays: 0,
+                });
+            entry.plays += plays;
+            continue;
+        }
+        for artist in &track.artists {
+            let entry = by_artist
+                .entry(artist.id.clone())
+                .or_insert_with(|| ArtistPlays {
+                    id: Some(artist.id.clone()),
+                    name: artist.name.clone(),
+                    plays: 0,
+                });
+            entry.plays += plays;
+        }
+    }
+    let mut out: Vec<ArtistPlays> = by_artist.into_values().collect();
+    // Ties sort by name, so the chart does not reshuffle itself between two
+    // visits that saw the same numbers.
+    out.sort_by(|a, b| b.plays.cmp(&a.plays).then_with(|| a.name.cmp(&b.name)));
+    out.truncate(limit);
+    out
 }
 
 /// Size of each favorites section's first page. The page loads the rest on
@@ -466,16 +557,143 @@ pub async fn get_favorite_artists(
 #[tauri::command]
 pub async fn get_stats(state: State<'_, AppState>) -> AppResult<StatsData> {
     with_retry(&state, |c| async move {
-        let (recently_played, most_played_tracks, most_played_albums) = tokio::try_join!(
-            c.recently_played_tracks(40),
-            c.most_played_tracks(40),
-            c.home_albums("PlayCount", 12),
-        )?;
+        let (recently_played, sample, most_played_albums, audio_counts, albums, artists, years) =
+            tokio::try_join!(
+                c.recently_played_tracks(40),
+                c.most_played_tracks(ARTIST_SAMPLE),
+                c.home_albums("PlayCount", 12),
+                c.audio_counts(),
+                c.album_count(),
+                c.artist_count(),
+                c.music_years(),
+            )?;
+
+        // The decades the library actually has, newest first, each counted by
+        // the server.
+        let mut starts: Vec<i32> = years
+            .into_iter()
+            .map(|year| year - year.rem_euclid(10))
+            .filter(|start| *start >= 10)
+            .collect();
+        starts.sort_unstable_by(|a, b| b.cmp(a));
+        starts.dedup();
+        starts.truncate(DECADES_SHOWN);
+        // One small request per decade, in sequence: ten of them cost less
+        // than the round trip of coordinating them, and a home server thanks
+        // you for not firing them all at once.
+        let mut decades = Vec::new();
+        for start_year in starts {
+            let albums = c.decade_album_count(start_year).await?;
+            if albums > 0 {
+                decades.push(DecadeAlbums {
+                    start_year,
+                    label: format!("{start_year}s"),
+                    albums,
+                });
+            }
+        }
+
+        let top_artists = top_artists(&sample, 8);
         Ok(StatsData {
             recently_played,
-            most_played_tracks,
+            // The chart needs a wide sample; the list under it does not.
+            most_played_tracks: sample.into_iter().take(40).collect(),
             most_played_albums,
+            totals: LibraryTotals {
+                tracks: audio_counts.0,
+                albums,
+                artists,
+                played_tracks: audio_counts.1,
+            },
+            top_artists,
+            decades,
         })
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{top_artists, ArtistPlays};
+    use crate::api::types::{ArtistRef, TrackDto};
+
+    fn track(name: &str, artist: &str, refs: &[(&str, &str)], plays: i32) -> TrackDto {
+        TrackDto {
+            id: name.into(),
+            name: name.into(),
+            artist: artist.into(),
+            play_count: plays,
+            artists: refs
+                .iter()
+                .map(|(id, name)| ArtistRef {
+                    id: (*id).into(),
+                    name: (*name).into(),
+                })
+                .collect(),
+            ..TrackDto::default()
+        }
+    }
+
+    #[test]
+    fn plays_add_up_per_artist_and_a_duet_counts_for_both() {
+        let tracks = vec![
+            track("a", "One", &[("1", "One")], 5),
+            track("b", "One", &[("1", "One")], 3),
+            track("c", "One & Two", &[("1", "One"), ("2", "Two")], 2),
+        ];
+        assert_eq!(
+            top_artists(&tracks, 8),
+            vec![
+                ArtistPlays {
+                    id: Some("1".into()),
+                    name: "One".into(),
+                    plays: 10,
+                },
+                ArtistPlays {
+                    id: Some("2".into()),
+                    name: "Two".into(),
+                    plays: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn what_was_never_played_never_shows_up() {
+        let tracks = vec![
+            track("a", "One", &[("1", "One")], 0),
+            track("b", "Two", &[("2", "Two")], -1),
+        ];
+        assert!(top_artists(&tracks, 8).is_empty());
+    }
+
+    #[test]
+    fn a_track_without_a_linkable_artist_keeps_its_credit() {
+        let tracks = vec![
+            track("a", "Nameless Band", &[], 4),
+            track("b", "nameless band", &[], 1),
+            // Nothing to credit at all.
+            track("c", "  ", &[], 9),
+        ];
+        let top = top_artists(&tracks, 8);
+        assert_eq!(top.len(), 1);
+        // The two spellings are one artist, and the first one seen names it.
+        assert_eq!(top[0].name, "Nameless Band");
+        assert_eq!(top[0].plays, 5);
+        assert_eq!(top[0].id, None);
+    }
+
+    #[test]
+    fn the_list_is_cut_to_the_limit_and_ties_sort_by_name() {
+        let tracks = vec![
+            track("a", "Beta", &[("b", "Beta")], 2),
+            track("b", "Alpha", &[("a", "Alpha")], 2),
+            track("c", "Gamma", &[("g", "Gamma")], 1),
+        ];
+        let top = top_artists(&tracks, 2);
+        assert_eq!(
+            top.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["Alpha", "Beta"]
+        );
+    }
 }

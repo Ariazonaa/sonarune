@@ -73,10 +73,11 @@ Folded up by area; the full list, with the reasoning, is in
   decoder for Ogg-Opus.
 - **True gapless** (next track opened ahead and appended sample-accurately) and
   opt-in **smart crossfade**.
-- 10-band EQ, normalization and click-free pause/resume (a sample-accurate fade
-  stage); seeking even inside a live server transcode.
+- 10-band EQ, normalization **per track or per album** and click-free
+  pause/resume (a sample-accurate fade stage); seeking even inside a live
+  server transcode.
 - Output-device selection with automatic fallback on device hotplug; sleep timer
-  with fade-out.
+  with fade-out, and **stop after this track or this album** from the queue.
 
 </details>
 
@@ -85,12 +86,17 @@ Folded up by area; the full list, with the reasoning, is in
 
 - Albums / artists / genres with an A–Z scrubber, virtualized grids, favorites,
   home rows, recently-added, multi-disc, play counts.
-- Search 2.0 with history; instant mix and similar-artists.
+- Search 2.0 with history; instant mix and similar-artists; a **statistics
+  dashboard** with the library's numbers, the most played artists and the
+  albums per decade.
+- **Tag editing for a whole selection** — album artist, genres or year across
+  many tracks at once.
 - The **queue is a single source of truth in Rust** — shuffle / repeat /
   album-shuffle, one-step undo, dedup and played-cleanup, and it **survives
   restarts** (persisted to SQLite).
 - Playlists: full CRUD, drag-and-drop reorder, dedup, duplicate, cross-playlist
-  transfer, and "save the queue as a playlist".
+  transfer, "save the queue as a playlist", and **in the sidebar with tracks
+  and albums dropped onto them**.
 
 </details>
 

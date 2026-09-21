@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AlbumDto,
   ArtistDto,
+  BulkMetadataEdits,
+  BulkMetadataResult,
   EditableMetadata,
   FavoritesData,
   HomeData,
@@ -55,6 +57,10 @@ export const apiLibrary = {
   /** Write the whitelisted metadata edits back to the server (admin-only). */
   updateItemMetadata: (itemId: string, edits: MetadataEdits) =>
     invoke<void>("update_item_metadata", { itemId, edits }),
+  /** The same for many tracks, with only the named fields written. Resolves
+   *  with how many went through; a single refusal does not stop the rest. */
+  updateItemsMetadata: (itemIds: string[], edits: BulkMetadataEdits) =>
+    invoke<BulkMetadataResult>("update_items_metadata", { itemIds, edits }),
   getHome: () => invoke<HomeData>("get_home"),
   getStats: () => invoke<StatsData>("get_stats"),
   /** First page of every favorites section, each with its total. */

@@ -7,6 +7,36 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-21
+
+### Added
+
+- **The stats page is a dashboard now.** Four numbers about the library —
+  tracks, albums, artists, and how much of it has been played at least once —
+  and two charts: the most played artists, and albums by decade. Both bars are
+  walkable: a row leads to that artist or that decade. The artist numbers are
+  added up from your most played tracks, because the server counts plays per
+  track and not per artist, and the chart says so rather than pretending
+  otherwise.
+- **Metadata for many tracks at once.** Select rows in the song list,
+  right-click, and set album artist, genres or the year for all of them —
+  genres can be added to what each track already has instead of replacing it.
+  Only what you fill in is written: everything left empty stays as it is on
+  each track, and titles and track numbers are not offered at all, because
+  they are not something several tracks share. A track the server refuses is
+  counted and the rest still go through.
+
+### Changed
+
+- The Opus decoder now builds on libopus 1.6.1 instead of 1.3. The `opus`
+  crate moved to a maintained `-sys` crate in August; the one it used before
+  had been sitting untouched since 2021 and carries an "unmaintained" advisory
+  (RUSTSEC-2026-0150). Nothing in the app had to change, and the binary grew
+  by 80 KB.
+- An update check now says in the log what it found — the version offered and
+  the one it was compared against. The panel only ever shows the answer, and a
+  diagnostic export should be able to answer the next question by itself.
+
 ## [0.3.0] — 2026-09-21
 
 ### Added
@@ -166,7 +196,8 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/jellysic/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Ariazonaa/jellysic/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Ariazonaa/jellysic/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Ariazonaa/jellysic/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Ariazonaa/jellysic/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Ariazonaa/jellysic/releases/tag/v0.1.0

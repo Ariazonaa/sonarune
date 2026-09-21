@@ -26,6 +26,15 @@
 //!   like it silently did nothing.
 //!
 //! Update channels (stable/beta) are not a thing yet; there is one endpoint.
+//!
+//! One thing to know when testing this right after cutting a release: the
+//! endpoint is `releases/latest/download/latest.json`, and GitHub serves that
+//! redirect from a cache. For the first minutes after publishing it can still
+//! point at the release before it, so a check in that window truthfully
+//! reports "up to date" — the app asked, and that is what it was told. It
+//! sorts itself out on its own; there is nothing to fix here, and a
+//! cache-busting parameter on every check would cost everyone a cached
+//! response to spare one person a few minutes once per release.
 
 use std::time::Duration;
 
@@ -226,6 +235,17 @@ fn refuse_while_playing(app: &AppHandle) -> Result<(), UpdateError> {
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> AppResult<UpdateInfo> {
     let update = check(&app).await?;
+    // Logged like the background check, so the diagnostic export can answer
+    // "what did the server actually say" — the panel only ever shows the
+    // answer, never which version it was compared against.
+    match update.as_ref() {
+        Some(update) => tracing::info!(
+            version = %update.version,
+            current = %update.current_version,
+            "update available"
+        ),
+        None => tracing::info!("checked for updates: nothing newer"),
+    }
     Ok(info(&app, update.as_ref()))
 }
 

@@ -76,6 +76,83 @@ pub struct MetadataEdits {
     pub disc_number: Option<i32>,
 }
 
+/// Edits meant for many tracks at once.
+///
+/// The single-track editor sends every field and rewrites them all; that is
+/// exactly wrong here. A field left out stays untouched on every item — so a
+/// hundred tracks can be given a genre without their titles, track numbers or
+/// years being flattened into each other. There is no title here at all: a
+/// title is not something several tracks share.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BulkMetadataEdits {
+    /// Replaces the album artists. An empty list clears them; `None` (absent)
+    /// leaves them alone.
+    pub album_artists: Option<Vec<String>>,
+    /// Genres to write. With `add_genres` they are merged into what is already
+    /// there instead of replacing it.
+    pub genres: Option<Vec<String>>,
+    pub add_genres: bool,
+    pub year: Option<i32>,
+    /// Empty the year. Separate from `year` because "clear it" and "set it to
+    /// 2001" are two different wishes, and a sentinel year would be a third.
+    pub clear_year: bool,
+}
+
+/// What a bulk write did. Failures are counted rather than fatal: with fifty
+/// tracks selected, one item the server refuses must not hide that the other
+/// forty-nine went through.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkMetadataResult {
+    pub changed: usize,
+    pub failed: usize,
+    /// The first failure, for the message; the rest are only counted.
+    pub error: Option<String>,
+}
+
+/// Merge a bulk edit onto a fetched item, in place. Touches only the fields
+/// the edit actually names — everything else on the item, whitelisted or not,
+/// stays exactly as the server had it.
+pub fn apply_bulk_metadata_edits(item: &mut Value, edits: &BulkMetadataEdits) -> AppResult<()> {
+    let obj = item
+        .as_object_mut()
+        .ok_or_else(|| AppError::Other("server item is not a JSON object".into()))?;
+
+    if let Some(artists) = &edits.album_artists {
+        let artists = clean_names(artists);
+        obj.insert(
+            "AlbumArtists".into(),
+            Value::Array(artists.iter().map(|n| json!({ "Name": n })).collect()),
+        );
+    }
+
+    if let Some(genres) = &edits.genres {
+        let wanted = clean_names(genres);
+        let genres = if edits.add_genres {
+            // Keep what the item has, in its order, and add what is new — a
+            // bulk "add genre" that quietly dropped the others would be a
+            // replace with a friendlier label.
+            let mut merged = str_list(&Value::Object(obj.clone()), "Genres");
+            merged.extend(wanted);
+            clean_names(&merged)
+        } else {
+            wanted
+        };
+        obj.insert("Genres".into(), json!(genres));
+    }
+
+    if edits.clear_year {
+        obj.insert("ProductionYear".into(), Value::Null);
+    } else if let Some(year) = edits.year {
+        if !(1..=9999).contains(&year) {
+            return Err(AppError::Other("year must be between 1 and 9999".into()));
+        }
+        obj.insert("ProductionYear".into(), json!(year));
+    }
+    Ok(())
+}
+
 /// Typed projection of the raw server item for the editor form + diff preview.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -225,6 +302,88 @@ mod metadata_tests {
             "ProviderIds": { "MusicBrainzTrack": "mb-123" },
             "RunTimeTicks": 1234567_i64
         })
+    }
+
+    #[test]
+    fn a_bulk_edit_only_touches_what_it_names() {
+        let mut item = sample();
+        apply_bulk_metadata_edits(
+            &mut item,
+            &BulkMetadataEdits {
+                genres: Some(vec!["Jazz".into()]),
+                ..BulkMetadataEdits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(item["Genres"], json!(["Jazz"]));
+        // Everything the edit did not name is exactly as the server had it -
+        // this is the whole point of the bulk path.
+        assert_eq!(item["Name"], "Old Title");
+        assert_eq!(item["ProductionYear"], 1999);
+        assert_eq!(item["IndexNumber"], 3);
+        assert_eq!(item["AlbumArtists"][0]["Name"], "Old Artist");
+        assert_eq!(item["ProviderIds"]["MusicBrainzTrack"], "mb-123");
+    }
+
+    #[test]
+    fn adding_genres_keeps_the_ones_already_there() {
+        let mut item = sample();
+        apply_bulk_metadata_edits(
+            &mut item,
+            &BulkMetadataEdits {
+                genres: Some(vec!["Jazz".into(), "ROCK".into()]),
+                add_genres: true,
+                ..BulkMetadataEdits::default()
+            },
+        )
+        .unwrap();
+        // "Rock" was there, "ROCK" is the same genre in a different shape, and
+        // the order the item had comes first.
+        assert_eq!(item["Genres"], json!(["Rock", "Jazz"]));
+    }
+
+    #[test]
+    fn clearing_a_year_and_setting_one_are_different_wishes() {
+        let mut item = sample();
+        apply_bulk_metadata_edits(
+            &mut item,
+            &BulkMetadataEdits {
+                year: Some(2020),
+                ..BulkMetadataEdits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(item["ProductionYear"], 2020);
+
+        // `clear_year` wins over a year that is still in the form.
+        apply_bulk_metadata_edits(
+            &mut item,
+            &BulkMetadataEdits {
+                year: Some(2020),
+                clear_year: true,
+                ..BulkMetadataEdits::default()
+            },
+        )
+        .unwrap();
+        assert!(item["ProductionYear"].is_null());
+
+        // An impossible year is refused rather than written.
+        assert!(apply_bulk_metadata_edits(
+            &mut item,
+            &BulkMetadataEdits {
+                year: Some(0),
+                ..BulkMetadataEdits::default()
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_empty_bulk_edit_changes_nothing() {
+        let mut item = sample();
+        let before = item.clone();
+        apply_bulk_metadata_edits(&mut item, &BulkMetadataEdits::default()).unwrap();
+        assert_eq!(item, before);
     }
 
     fn edits() -> MetadataEdits {
@@ -513,7 +672,9 @@ pub struct AlbumDto {
     pub artists: Vec<ArtistRef>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+// `Default` is for tests that care about three of these fields and nothing
+// else; every field of a track DTO has a sensible empty value anyway.
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackDto {
     pub id: String,

@@ -216,6 +216,7 @@ pub fn run() {
             commands::get_track_info,
             commands_metadata::get_item_metadata,
             commands_metadata::update_item_metadata,
+            commands_metadata::update_items_metadata,
             commands::queue_downloads,
             commands::get_downloads,
             commands::cancel_download,

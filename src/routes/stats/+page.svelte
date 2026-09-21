@@ -3,8 +3,10 @@
   import { api, formatDuration } from "$lib/api";
   import { apiLibrary } from "$lib/api/library";
   import { m } from "$lib/paraglide/messages";
+  import { getLocale } from "$lib/paraglide/runtime";
   import Cover from "$lib/components/Cover.svelte";
   import EmptyState from "$lib/components/EmptyState.svelte";
+  import BarList, { type BarItem } from "$lib/components/BarList.svelte";
   import { player } from "$lib/state/player.svelte";
   import { library } from "$lib/state/library.svelte";
   import { swrGet, swrSet } from "$lib/swr";
@@ -47,6 +49,34 @@
     }
   }
 
+  /** Plain thousands separators, in the language the app is in. */
+  const number = $derived(new Intl.NumberFormat(getLocale()));
+
+  const artistBars = $derived<BarItem[]>(
+    (stats?.topArtists ?? []).map((artist) => ({
+      label: artist.name,
+      value: artist.plays,
+      valueLabel: m.stats_plays({ count: artist.plays }),
+      href: artist.id ? `/artist/${artist.id}` : undefined,
+    })),
+  );
+
+  const decadeBars = $derived<BarItem[]>(
+    (stats?.decades ?? []).map((decade) => ({
+      label: decade.label,
+      value: decade.albums,
+      valueLabel: number.format(decade.albums),
+      href: `/discover/decade/${decade.startYear}`,
+    })),
+  );
+
+  /** Share of the library that has been played at least once. */
+  const playedShare = $derived.by(() => {
+    const totals = stats?.totals;
+    if (!totals || totals.tracks <= 0) return null;
+    return Math.round((totals.playedTracks / totals.tracks) * 100);
+  });
+
   const isEmpty = $derived(
     stats !== null &&
       stats.recentlyPlayed.length === 0 &&
@@ -85,6 +115,16 @@
   </table>
 {/snippet}
 
+{#snippet tile(label: string, value: string, hint: string | null)}
+  <div class="rounded-lg bg-card p-4">
+    <p class="text-xs font-semibold uppercase tracking-wider text-ink-muted">{label}</p>
+    <p class="mt-1 text-2xl font-bold tracking-tight tabular-nums">{value}</p>
+    {#if hint}
+      <p class="mt-0.5 text-xs text-ink-muted">{hint}</p>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet albumRow(albums: AlbumDto[])}
   <div data-card-row class="flex gap-4 overflow-x-auto pb-2">
     {#each albums as album (album.id)}
@@ -117,6 +157,40 @@
       action={{ label: m.empty_cta_albums(), href: "/" }}
     />
   {:else if stats}
+    <!-- Four numbers, no chart: a single value has nothing to compare itself
+         to, and a bar of one is decoration. -->
+    <div class="mb-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      {@render tile(m.stats_tile_tracks(), number.format(stats.totals.tracks), null)}
+      {@render tile(m.stats_tile_albums(), number.format(stats.totals.albums), null)}
+      {@render tile(m.stats_tile_artists(), number.format(stats.totals.artists), null)}
+      {@render tile(
+        m.stats_tile_played(),
+        number.format(stats.totals.playedTracks),
+        playedShare === null ? null : m.stats_tile_played_share({ percent: playedShare }),
+      )}
+    </div>
+
+    <div class="mb-8 grid gap-4 lg:grid-cols-2">
+      {#if artistBars.length > 0}
+        <section class="rounded-lg bg-card p-5">
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted">
+            {m.stats_top_artists()}
+          </h2>
+          <p class="mt-1 mb-4 text-xs text-ink-muted">{m.stats_top_artists_hint()}</p>
+          <BarList items={artistBars} />
+        </section>
+      {/if}
+      {#if decadeBars.length > 0}
+        <section class="rounded-lg bg-card p-5">
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted">
+            {m.stats_decades()}
+          </h2>
+          <p class="mt-1 mb-4 text-xs text-ink-muted">{m.stats_decades_hint()}</p>
+          <BarList items={decadeBars} />
+        </section>
+      {/if}
+    </div>
+
     {#if stats.mostPlayedAlbums.length > 0}
       <section class="mb-8">
         <h2 class="mb-3 text-lg font-bold tracking-tight">{m.stats_most_played_albums()}</h2>

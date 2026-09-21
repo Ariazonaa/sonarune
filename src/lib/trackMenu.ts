@@ -91,6 +91,9 @@ export interface TrackMenuHooks {
   info?: (track: TrackDto) => void;
   /** Open the metadata editor. Only offered when the account may edit. */
   edit?: (track: TrackDto) => void;
+  /** Open the editor for a whole selection. Only offered when the account may
+   *  edit and the list can select several rows. */
+  editMany?: (tracks: TrackDto[]) => void;
   /** Drop the ids from the list after a server-side delete. Without it the
    *  delete entry is not offered — a deletion the list does not notice looks
    *  like a failure. */
@@ -168,6 +171,14 @@ export function trackMenuItems(tracks: TrackDto[], hooks: TrackMenuHooks): Conte
         action: () => hooks.edit?.(track),
       });
     }
+  }
+
+  if (many && hooks.editMany && session.info?.canEdit) {
+    items.push({
+      label: m.edit_bulk_menu({ count: tracks.length }),
+      icon: TRACK_ICON.edit,
+      action: () => hooks.editMany?.(tracks),
+    });
   }
 
   items.push(...(hooks.extra?.(tracks) ?? []));

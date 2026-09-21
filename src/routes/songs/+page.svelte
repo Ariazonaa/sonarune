@@ -9,6 +9,7 @@
   import AddToPlaylistMenu from "$lib/components/AddToPlaylistMenu.svelte";
   import SongInfo from "$lib/components/SongInfo.svelte";
   import MetadataEditor from "$lib/components/MetadataEditor.svelte";
+  import BulkMetadataEditor from "$lib/components/BulkMetadataEditor.svelte";
   import NewContentPill from "$lib/components/NewContentPill.svelte";
   import { player } from "$lib/state/player.svelte";
   import { library } from "$lib/state/library.svelte";
@@ -40,6 +41,7 @@
   let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
   let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
   let edit = $state<{ itemId: string; name: string } | null>(null);
+  let bulkEdit = $state<string[] | null>(null);
 
   async function loadMore(): Promise<boolean> {
     if (loading || !hasMore) return false;
@@ -136,6 +138,7 @@
         info: (track) =>
           (info = { itemId: track.id, name: track.name, playCount: track.playCount }),
         edit: (track) => (edit = { itemId: track.id, name: track.name }),
+        editMany: (tracks) => (bulkEdit = tracks.map((track) => track.id)),
         onRemoved: dropTracks,
       }),
     };
@@ -248,4 +251,7 @@
 {/if}
 {#if edit}
   <MetadataEditor itemId={edit.itemId} displayName={edit.name} onclose={() => (edit = null)} onsaved={refresh} />
+{/if}
+{#if bulkEdit}
+  <BulkMetadataEditor itemIds={bulkEdit} onclose={() => (bulkEdit = null)} onsaved={refresh} />
 {/if}

@@ -45,9 +45,6 @@ permissions:
 
 env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
-  # audiopus_sys builds bundled libopus, whose CMakeLists declares a pre-3.5
-  # cmake_minimum_required; CMake 4.x needs this escape hatch to configure it.
-  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
   CARGO_INCREMENTAL: "0"
 
 # Action SHAs are the same ones ci.yml pins, for the same reason: a tag can be

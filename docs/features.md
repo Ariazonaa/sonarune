@@ -23,6 +23,10 @@ the current build does.
 - **10-band equalizer** with presets and your own saved presets, **volume
   normalization**, and a clamp against clipping. Changes apply to the running
   track, no restart.
+- **Normalization per track or per album.** Album mode plays every track of an
+  album at one gain, so the quiet piece stays quieter than the loud one — what
+  the album was mixed for. Jellyfin sends an album value only from 10.11;
+  without one the gain is the median of the album's tracks in the queue.
 - **Click-free pause and resume** through a sample-accurate fade stage — the
   same one that fades a sleep timer out.
 - **Seeking inside a live transcode**: a server transcode restarts at the new
@@ -34,6 +38,10 @@ the current build does.
   position.
 - **Sleep timer**, by minutes or at the end of the current track, with an
   optional fade-out.
+- **Stop after this track, or after this album**, from a queue entry's context
+  menu. No fade: the track finishes the way it was recorded and then it is
+  quiet, and the gapless hand-off is held back for that one boundary so it
+  really does end.
 - **Playback reporting**: Jellyfin sees the session, the position (about every
   10 s) and the stop, each with a play-session id, so the server can correlate
   and kill its own transcode jobs.
@@ -47,14 +55,21 @@ the current build does.
   smooth on a large library, and an **A–Z scrubber** that jumps by first
   letter.
 - **Home rows** — recently added, recently played, most played, and the rest of
-  what the server offers.
+  what the server offers. Each row can be moved or hidden from its own
+  heading; a row the server has nothing for stays out by itself.
 - **Multi-disc albums**, play counts, release years, durations.
 - **Favorites** for tracks, albums and artists, with their own pages.
 - **Recently added** as its own route.
 - **Search 2.0**: paged results per kind, search history, and the same context
   menus as everywhere else.
 - **Instant mix** and **similar artists** from any track, album or artist.
-- **Tag and metadata editing** for what Jellyfin lets a client change.
+- **Tag and metadata editing** for what Jellyfin lets a client change, **for
+  one track or for a whole selection** — album artist, genres and year across
+  many tracks at once, with genres added to what each track already has
+  instead of replacing it. Empty fields are left alone.
+- **A statistics dashboard**: how much the library holds and how much of it has
+  been played at least once, plus the most played artists and the albums per
+  decade as bars you can walk into.
 - **Deleting** items on the server, when the account is allowed to.
 - **Library watch**: the server is polled for changes (and on window focus), so
   music added while the app is open shows up without a manual refresh.
@@ -75,6 +90,8 @@ UI shows it, it never computes it.
 - **Survives restarts**: the queue and its position are persisted to SQLite and
   come back paused after a restart.
 - **Save the queue as a playlist** in one action.
+- **Jump to the playing track**: a shortcut, the palette, or the pill that
+  appears while the current entry is scrolled out of sight.
 
 </details>
 
@@ -87,7 +104,8 @@ UI shows it, it never computes it.
 - Add anything to a playlist from its context menu, including multi-selections.
 - Reorders and removals use the playlist's *entry id* rather than the track id,
   so a playlist that contains the same track twice behaves.
-
+- **In the sidebar**, and tracks and albums can be dragged onto them from any
+  list or grid.
 </details>
 
 <details>

@@ -33,6 +33,25 @@ export interface MetadataEdits {
   discNumber: number | null;
 }
 
+/** Edits for many tracks at once. A field left out stays as it is on every
+ *  one of them — see `BulkMetadataEdits` in src-tauri/src/api/types.rs. */
+export interface BulkMetadataEdits {
+  albumArtists?: string[];
+  genres?: string[];
+  /** Merge the genres into what each track already has instead of replacing. */
+  addGenres?: boolean;
+  year?: number;
+  /** Empty the year; wins over `year`. */
+  clearYear?: boolean;
+}
+
+export interface BulkMetadataResult {
+  changed: number;
+  failed: number;
+  /** The first failure; the others are only counted. */
+  error: string | null;
+}
+
 export interface ArtistDto {
   id: string;
   name: string;
@@ -368,6 +387,30 @@ export interface StatsData {
   recentlyPlayed: TrackDto[];
   mostPlayedTracks: TrackDto[];
   mostPlayedAlbums: AlbumDto[];
+  totals: LibraryTotals;
+  /** Added up from the most played tracks — Jellyfin cannot sort artists by
+   *  plays, so the page says where the number comes from. */
+  topArtists: ArtistPlays[];
+  decades: DecadeAlbums[];
+}
+
+export interface LibraryTotals {
+  tracks: number;
+  albums: number;
+  artists: number;
+  playedTracks: number;
+}
+
+export interface ArtistPlays {
+  id: string | null;
+  name: string;
+  plays: number;
+}
+
+export interface DecadeAlbums {
+  startYear: number;
+  label: string;
+  albums: number;
 }
 
 /** First page of each favorites section, with its total (`get_favorites`). */

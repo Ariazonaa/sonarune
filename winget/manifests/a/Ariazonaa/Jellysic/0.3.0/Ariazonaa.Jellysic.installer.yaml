@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.28.0.schema.json
+
+PackageIdentifier: Ariazonaa.Jellysic
+PackageVersion: 0.3.0
+MinimumOSVersion: 10.0.0.0
+InstallerType: nullsoft
+Scope: user
+UpgradeBehavior: install
+ReleaseDate: 2026-09-21
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+AppsAndFeaturesEntries:
+  - DisplayName: jellysic
+    Publisher: jellysic
+    DisplayVersion: 0.3.0
+    ProductCode: jellysic
+    InstallerType: nullsoft
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Ariazonaa/jellysic/releases/download/v0.3.0/jellysic_0.3.0_x64-setup.exe
+    InstallerSha256: 18F6C0AE6F2F30F24610ED96573D6F8494B36DA0B3AFCF1F3AA951975D91EAE9
+ManifestType: installer
+ManifestVersion: 1.28.0

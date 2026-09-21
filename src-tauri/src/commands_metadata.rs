@@ -7,7 +7,10 @@
 //! The server enforces admin-only (`RequiresElevation`); the UI additionally
 //! gates every entry point on `can_edit`.
 
-use crate::api::types::{apply_metadata_edits, EditableMetadata, MetadataEdits};
+use crate::api::types::{
+    apply_bulk_metadata_edits, apply_metadata_edits, BulkMetadataEdits, BulkMetadataResult,
+    EditableMetadata, MetadataEdits,
+};
 use crate::commands::with_retry;
 use crate::error::AppResult;
 use crate::AppState;
@@ -24,6 +27,43 @@ pub async fn get_item_metadata(
         async move { Ok(EditableMetadata::from_raw(&c.get_item_raw(&item_id).await?)) }
     })
     .await
+}
+
+/// The same round-trip for many items, with one set of edits.
+///
+/// One item at a time on purpose: every write is a fetch and a POST of the
+/// whole item, and firing fifty of those at a home server at once is a good
+/// way to make it refuse the lot. A single failure is counted and the run goes
+/// on — the alternative is stopping halfway and leaving the user to guess
+/// which half.
+#[tauri::command]
+pub async fn update_items_metadata(
+    state: State<'_, AppState>,
+    item_ids: Vec<String>,
+    edits: BulkMetadataEdits,
+) -> AppResult<BulkMetadataResult> {
+    let mut result = BulkMetadataResult::default();
+    for item_id in item_ids {
+        let outcome = with_retry(&state, |c| {
+            let item_id = item_id.clone();
+            let edits = edits.clone();
+            async move {
+                let mut item = c.get_item_raw(&item_id).await?;
+                apply_bulk_metadata_edits(&mut item, &edits)?;
+                c.update_item(&item_id, item).await
+            }
+        })
+        .await;
+        match outcome {
+            Ok(()) => result.changed += 1,
+            Err(e) => {
+                tracing::warn!("bulk metadata write failed for {item_id}: {e}");
+                result.failed += 1;
+                result.error.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Fetch the full item, apply only the whitelisted edits, and POST it back —

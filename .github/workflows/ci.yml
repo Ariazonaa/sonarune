@@ -33,11 +33,6 @@ concurrency:
 
 env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
-  # audiopus_sys builds bundled libopus, whose CMakeLists declares a pre-3.5
-  # cmake_minimum_required. CMake 4.x removed that compatibility and errors
-  # out; this is CMake's documented escape hatch for configuring the old
-  # project anyway. Harmless on CMake 3.x.
-  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
   # Incremental compilation only costs time and disk on a one-shot CI build.
   CARGO_INCREMENTAL: "0"
 

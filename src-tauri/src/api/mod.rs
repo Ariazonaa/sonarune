@@ -1896,6 +1896,67 @@ impl JellyfinClient {
     }
 
     /// Music years exposed by Jellyfin's dedicated Years endpoint.
+    /// How many items match, without fetching any of them: `limit=0` and the
+    /// count the server puts in every items response.
+    async fn count_items(&self, path: &str, extra: &[(&str, String)]) -> AppResult<i64> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("userId", self.user_id()?.to_string()),
+            ("recursive", "true".into()),
+            ("limit", "0".into()),
+            ("enableImages", "false".into()),
+            ("enableUserData", "false".into()),
+        ];
+        params.extend(extra.iter().cloned());
+        let response: ItemsResponse = self.get_json(path, &params).await?;
+        Ok(response.total_record_count.max(0))
+    }
+
+    /// Tracks in the library, and how many of them the server counts as
+    /// played.
+    pub async fn audio_counts(&self) -> AppResult<(i64, i64)> {
+        let total = self
+            .count_items("/Items", &[("includeItemTypes", "Audio".into())])
+            .await?;
+        let played = self
+            .count_items(
+                "/Items",
+                &[
+                    ("includeItemTypes", "Audio".into()),
+                    ("filters", "IsPlayed".into()),
+                ],
+            )
+            .await?;
+        Ok((total, played))
+    }
+
+    pub async fn album_count(&self) -> AppResult<i64> {
+        self.count_items("/Items", &[("includeItemTypes", "MusicAlbum".into())])
+            .await
+    }
+
+    /// Album artists, the same set the artists page browses.
+    pub async fn artist_count(&self) -> AppResult<i64> {
+        self.count_items("/Artists/AlbumArtists", &[]).await
+    }
+
+    /// Albums released in one decade, counted without fetching them.
+    pub async fn decade_album_count(&self, start_year: i32) -> AppResult<i64> {
+        if !(1..=9990).contains(&start_year) || start_year % 10 != 0 {
+            return Err(AppError::Other(
+                "startYear must be a decade between 10 and 9990".into(),
+            ));
+        }
+        let years = (start_year..=start_year + 9)
+            .map(|year| year.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.count_items(
+            "/Items",
+            &[("includeItemTypes", "MusicAlbum".into()), ("years", years)],
+        )
+        .await
+    }
+
     pub async fn music_years(&self) -> AppResult<Vec<i32>> {
         let user_id = self.user_id()?.to_string();
         let response: ItemsResponse = self
