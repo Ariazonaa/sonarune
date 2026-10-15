@@ -7,6 +7,15 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-10-15
+
+### Security
+
+- Three dependencies updated for published advisories: `serialize-javascript`
+  7.1.2 (GHSA-gfhx-hw2g-v5hg), `source-map-js` 1.2.2 (CVE-2026-93749) and
+  `brace-expansion` 2.1.7 / 1.1.21. All three are build- and test-time tools;
+  nothing else changed in the app.
+
 ## [0.5.0] — 2026-09-22
 
 ### Removed

@@ -226,7 +226,7 @@ jobs:
           # lie told to everyone who reads the page.
           $updates = if ($env:SIGNED -eq "1") {
             @(
-              "**Jellysic keeps itself up to date.** The installed app asks this"
+              "**The app keeps itself up to date.** The installed app asks this"
               "page once per start whether a newer version exists -- that can be"
               "switched off in Settings -> Updates, where there is also a button"
               "to check on demand. An update is verified against the project's"
@@ -269,4 +269,4 @@ jobs:
           ) | Out-File -FilePath notes.md -Encoding utf8
 
           $assets = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
-          gh release create $env:GITHUB_REF_NAME --draft --title "Jellysic $($env:VERSION)" --notes-file notes.md $assets
+          gh release create $env:GITHUB_REF_NAME --draft --title "$($env:VERSION)" --notes-file notes.md $assets
