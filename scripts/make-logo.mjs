@@ -1,4 +1,4 @@
-// The Jellysic mark, described once as geometry and emitted in every form the
+// The Sonarune mark, described once as geometry and emitted in every form the
 // project needs: the Windows icon set (.ico), the macOS one (.icns), the PNG
 // sizes Tauri bundles, the favicon, and an SVG for the interface.
 //
@@ -299,7 +299,7 @@ function glyphSvg(color, indent) {
 
 function iconSvg() {
   return [
-    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\" role=\"img\" aria-label=\"Jellysic\">",
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\" role=\"img\" aria-label=\"Sonarune\">",
     "  <rect width=\"100\" height=\"100\" rx=\"" + n(FIELD.r) + "\" fill=\"" + ACCENT + "\" />",
     glyphSvg(ON_ACCENT, 2),
     "</svg>",

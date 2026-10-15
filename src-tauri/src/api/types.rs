@@ -708,7 +708,7 @@ pub struct Page<T> {
     pub total: i64,
 }
 
-/// Read-only Jellyfin collection (`BaseItemKind::BoxSet`). Jellysic exposes
+/// Read-only Jellyfin collection (`BaseItemKind::BoxSet`). Sonarune exposes
 /// album membership but deliberately no collection mutation commands.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

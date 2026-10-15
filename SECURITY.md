@@ -3,7 +3,7 @@
 ## Reporting
 
 Use GitHub's private reporting: **Security → Report a vulnerability** on
-[the repository](https://github.com/Ariazonaa/jellysic/security/advisories/new).
+[the repository](https://github.com/Ariazonaa/sonarune/security/advisories/new).
 That channel is private until an advisory is published, so nothing is disclosed
 while a fix is being written. Please do not open a public issue for a
 vulnerability.
@@ -25,7 +25,7 @@ next version may change things freely.
 
 Some of this is worth knowing before you report something as a finding.
 
-**Your server is trusted, your network is not.** Jellysic talks to a Jellyfin
+**Your server is trusted, your network is not.** Sonarune talks to a Jellyfin
 server you chose. A malicious server can obviously serve malicious metadata, and
 that is not a vulnerability in the client. A malicious *network* between you and
 the server is what the design defends against.

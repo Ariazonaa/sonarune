@@ -46,7 +46,7 @@ pub async fn get_collection(
                 client.collection_albums(&collection_id)
             )?;
             // ChildCount can include non-music members. The detail count is
-            // the exact read-only album membership Jellysic presents.
+            // the exact read-only album membership Sonarune presents.
             collection.album_count = albums.len() as i32;
             Ok(CollectionDetail { collection, albums })
         }

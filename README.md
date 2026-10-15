@@ -2,19 +2,19 @@
 
 <img src="docs/logo.png" alt="" width="96" height="96">
 
-# Jellysic
+# Sonarune
 
 **A fast, native-feeling desktop music client for [Jellyfin](https://jellyfin.org).**
 
 Tauri 2 and Svelte 5 for the interface, a Rust audio engine underneath.
 No Electron, no external mpv binary.
 
-[![Download](https://img.shields.io/github/v/release/Ariazonaa/jellysic?display_name=tag&label=download&color=1db954)](https://github.com/Ariazonaa/jellysic/releases/latest)
-[![CI](https://github.com/Ariazonaa/jellysic/actions/workflows/ci.yml/badge.svg)](https://github.com/Ariazonaa/jellysic/actions/workflows/ci.yml)
+[![Download](https://img.shields.io/github/v/release/Ariazonaa/sonarune?display_name=tag&label=download&color=1db954)](https://github.com/Ariazonaa/sonarune/releases/latest)
+[![CI](https://github.com/Ariazonaa/sonarune/actions/workflows/ci.yml/badge.svg)](https://github.com/Ariazonaa/sonarune/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 
-<img src="docs/screenshots/home.png" alt="The Jellysic library view: a black interface with album rows" width="860">
+<img src="docs/screenshots/home.png" alt="The Sonarune library view: a black interface with album rows" width="860">
 
 [Download](#download) · [Screenshots](#screenshots) ·
 [How it works](#architecture-in-one-paragraph) ·
@@ -25,20 +25,25 @@ No Electron, no external mpv binary.
 
 ---
 
-Jellysic started as an answer to "Feishin, but better". The audio path lives in
+Sonarune started as an answer to "Feishin, but better". The audio path lives in
 Rust: decode, DSP, gapless, crossfade, output device. The WebView draws the
 interface and nothing else.
 
 > **Status:** actively developed, feature-rich, and daily-usable. Not yet 1.0.
 > Planned work and known gaps are tracked in
-> [issues](https://github.com/Ariazonaa/jellysic/issues). Windows-first, but
+> [issues](https://github.com/Ariazonaa/sonarune/issues). Windows-first, but
 > the architecture keeps Linux/macOS open (no Windows-only shortcuts baked into
 > the core).
+
+> **AI disclosure:** Sonarune was developed substantially with assistance from
+> large language models. The maintainers review and test the resulting code and
+> remain responsible for it. The project is clean-room: it includes no Feishin
+> code or assets, and third-party licences and credits are kept explicit.
 
 ## Download
 
 The installer is on the
-[releases page](https://github.com/Ariazonaa/jellysic/releases/latest). Windows
+[releases page](https://github.com/Ariazonaa/sonarune/releases/latest). Windows
 10 or 11, 64-bit, about 7 MB. It installs for the current user, so it does not
 ask for administrator rights, and it does not need anything else on the machine:
 WebView2 already ships with Windows.
@@ -259,14 +264,14 @@ the exact digits.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/bench-dark.svg">
-    <img src="docs/bench-light.svg" alt="Four Jellyfin music clients measured on the same library, shorter is better. Installer: Jellysic 7.2, Supersonic 49.8, Sonixd 81.7, Feishin 178 MB. On disk: 28, 169, 332, 644 MB. Launch to window: 177, 594, 719, 722 ms. Working set: 427, 198, 406, 760 MB. Private bytes: 273, 404, 213, 464 MB. Idle CPU: 0.65, 0.2, 4.95, 2.1 percent." width="900">
+    <img src="docs/bench-light.svg" alt="Four Jellyfin music clients measured on the same library, shorter is better. Installer: Sonarune 7.2, Supersonic 49.8, Sonixd 81.7, Feishin 178 MB. On disk: 28, 169, 332, 644 MB. Launch to window: 177, 594, 719, 722 ms. Working set: 427, 198, 406, 760 MB. Private bytes: 273, 404, 213, 464 MB. Idle CPU: 0.65, 0.2, 4.95, 2.1 percent." width="900">
   </picture>
 </p>
 
 <details>
 <summary><b>The same figures as a table</b></summary>
 
-| | Jellysic 0.1.0 | Supersonic 0.22.1 | Feishin 1.17.0 | Sonixd 0.15.5 |
+| | Sonarune 0.1.0 | Supersonic 0.22.1 | Feishin 1.17.0 | Sonixd 0.15.5 |
 | --- | ---: | ---: | ---: | ---: |
 | Runtime | Rust + WebView2 | Go + Fyne | Electron | Electron |
 | Installer | **7.2 MB** | 49.8 MB | 178 MB | 81.7 MB |
@@ -292,15 +297,15 @@ comes from `node scripts/bench-chart.mjs`.
 
 </details>
 
-Jellysic ships the smallest installer, takes the least disk and opens its
+Sonarune ships the smallest installer, takes the least disk and opens its
 window first, by a wide margin in all three. Supersonic uses the least memory
 and the least CPU. Neither result is an accident.
 
-Of Jellysic's 427 MB, about 47 MB is its own process. The rest is WebView2:
+Of Sonarune's 427 MB, about 47 MB is its own process. The rest is WebView2:
 116 MB for the browser process, 104 MB for the GPU process, 88 MB for the
 renderer, and a handful of utility processes. Supersonic has none of that. It
 is a Go program drawing its own widgets, so 198 MB is the whole thing in one
-process. That is the trade Jellysic makes: a browser engine for the interface,
+process. That is the trade Sonarune makes: a browser engine for the interface,
 paid for in resident memory, in exchange for the web toolchain and a 7 MB
 installer, because the engine is already on the machine.
 
@@ -319,7 +324,7 @@ right now".
 
 Features overlap more than the framing suggests. Feishin and Supersonic both
 have an equalizer, scrobbling and lyrics, and Feishin has a visualizer too.
-What Jellysic does differently is where the audio lives.
+What Sonarune does differently is where the audio lives.
 
 ## Tech stack
 
@@ -406,7 +411,7 @@ User-facing strings live in `messages/{en,de}.json`, aria-labels included.
 Colors come from the design tokens in `src/app.css`, never as literals in a
 component. A patch that breaks one of those gets sent back.
 
-Jellysic is clean-room: no Feishin code or assets, only concepts. The licence
+Sonarune is clean-room: no Feishin code or assets, only concepts. The licence
 now permits more than that. The provenance stays as it is anyway.
 
 By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
@@ -423,11 +428,11 @@ something privately — please use that channel rather than an issue.
 
 [GPL-3.0-or-later](LICENSE). Copyright (C) 2026 Ariazonaa.
 
-Jellysic bundles no third-party source. The dependencies are permissively
+Sonarune bundles no third-party source. The dependencies are permissively
 licensed (MIT, Apache-2.0, ISC). The one exception is **Symphonia** under
 MPL-2.0, a file-level copyleft that binds changes to Symphonia's own files.
-Jellysic makes none. Decoding also uses **libopus** (BSD-3-Clause), the
+Sonarune makes none. Decoding also uses **libopus** (BSD-3-Clause), the
 visualizer uses **Butterchurn** (MIT).
 
-Jellyfin is a trademark of the Jellyfin project. Jellysic is an independent
+Jellyfin is a trademark of the Jellyfin project. Sonarune is an independent
 client and is not affiliated with or endorsed by it.

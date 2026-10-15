@@ -9,7 +9,7 @@ use std::{
 };
 use types::*;
 
-pub const CLIENT_NAME: &str = "Jellysic";
+pub const CLIENT_NAME: &str = "Sonarune";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The download name from a Content-Disposition header.
@@ -4107,7 +4107,7 @@ mod smoke {
             let seed: Vec<String> = tracks.iter().take(2).map(|t| t.id.clone()).collect();
             if !seed.is_empty() {
                 let pid = client
-                    .create_playlist("Jellysic smoke test — delete me", &seed[..1])
+                    .create_playlist("Sonarune smoke test — delete me", &seed[..1])
                     .await
                     .expect("create_playlist");
                 eprintln!("✓ created playlist {pid}");
@@ -4123,7 +4123,7 @@ mod smoke {
                 // The key contract to verify: a Name-only rename must NOT drop
                 // the tracks (older UpdatePlaylistDto implementations did).
                 client
-                    .rename_playlist(&pid, "Jellysic smoke test — renamed")
+                    .rename_playlist(&pid, "Sonarune smoke test — renamed")
                     .await
                     .expect("rename");
                 let after = client
@@ -4138,7 +4138,7 @@ mod smoke {
                 );
                 let renamed = client.playlist(&pid).await.expect("playlist after rename");
                 assert_eq!(
-                    renamed.name, "Jellysic smoke test — renamed",
+                    renamed.name, "Sonarune smoke test — renamed",
                     "name updated"
                 );
                 eprintln!("✓ rename preserved {n_before} tracks");

@@ -50,9 +50,9 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCHEMA = "1.28.0";
 /** `Publisher.Package`, and the directory names under `manifests/`. */
 const PUBLISHER = "Ariazonaa";
-const PACKAGE = "Jellysic";
+const PACKAGE = "Sonarune";
 const IDENTIFIER = `${PUBLISHER}.${PACKAGE}`;
-const REPO = "Ariazonaa/jellysic";
+const REPO = "Ariazonaa/sonarune";
 /** What the release notes say the app runs on: Windows 10, any build, 64-bit. */
 const MINIMUM_OS = "10.0.0.0";
 
@@ -121,7 +121,7 @@ function header(kind) {
 
 async function fetchJson(url) {
   const res = await fetch(url, {
-    headers: { accept: "application/vnd.github+json", "user-agent": "jellysic-winget-manifest" },
+    headers: { accept: "application/vnd.github+json", "user-agent": "sonarune-winget-manifest" },
   });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`GitHub API answered ${res.status} for ${url}`);
@@ -146,7 +146,7 @@ async function release(version) {
     );
   }
 
-  const installerName = `jellysic_${version}_x64-setup.exe`;
+  const installerName = `sonarune_${version}_x64-setup.exe`;
   const asset = (name) => found.assets.find((a) => a.name === name);
   const installer = asset(installerName);
   const sums = asset("SHA256SUMS.txt");
@@ -235,7 +235,7 @@ function manifests(version, info) {
     "  - silent",
     "  - silentWithProgress",
     // Without these, winget compares the manifest's name and publisher against
-    // the uninstall entry, finds "jellysic" where it expected "Jellysic" by
+    // the uninstall entry, finds "jellysic" where it expected "Sonarune" by
     // "Ariazonaa", and cannot tell that the package is installed or which
     // version it is.
     "AppsAndFeaturesEntries:",
@@ -281,7 +281,7 @@ function manifests(version, info) {
       CopyrightUrl: scalar(`https://github.com/${REPO}/blob/main/LICENSE`),
       ShortDescription: scalar(conf.bundle?.shortDescription ?? ""),
       Description: folded(DESCRIPTION, 2),
-      Moniker: "jellysic",
+      Moniker: "sonarune",
     }),
     "Tags:",
     ...TAGS.map((tag) => `  - ${tag}`),
@@ -303,7 +303,7 @@ function manifests(version, info) {
 
 /** The store listing. One paragraph, the same claim the README opens with. */
 const DESCRIPTION = [
-  "Jellysic is a desktop music client for a Jellyfin server. The interface is",
+  "Sonarune is a desktop music client for a Jellyfin server. The interface is",
   "Tauri 2 and Svelte 5; the audio path -- decoding, DSP, gapless playback,",
   "crossfade, output device -- lives in Rust, so there is no Electron and no",
   "external mpv binary. It plays your library with a queue, playlists, smart",

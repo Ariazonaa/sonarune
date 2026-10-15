@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const APPS = [
-  { key: "jellysic", name: "Jellysic 0.1.0", runtime: "Rust + WebView2" },
+  { key: "jellysic", name: "Sonarune 0.1.0", runtime: "Rust + WebView2" },
   { key: "supersonic", name: "Supersonic 0.22.1", runtime: "Go + Fyne" },
   { key: "feishin", name: "Feishin 1.17.0", runtime: "Electron" },
   { key: "sonixd", name: "Sonixd 0.15.5", runtime: "Electron, archived" },

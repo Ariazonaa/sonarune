@@ -1,5 +1,5 @@
 {
-  "name": "jellysic",
+  "name": "sonarune",
   "version": "0.5.0",
   "private": true,
   "description": "A fast Jellyfin desktop music client",
@@ -7,9 +7,9 @@
   "author": "Ariazonaa",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ariazonaa/jellysic.git"
+    "url": "git+https://github.com/Ariazonaa/sonarune.git"
   },
-  "homepage": "https://github.com/Ariazonaa/jellysic",
+  "homepage": "https://github.com/Ariazonaa/sonarune",
   "type": "module",
   "scripts": {
     "dev": "vite dev",

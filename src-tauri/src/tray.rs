@@ -30,14 +30,14 @@ impl Default for TrayLabels {
         // Neutral symbols are visible only for the brief period before the
         // frontend supplies localized labels from Paraglide.
         Self {
-            show: "Jellysic".into(),
-            hide: "Jellysic".into(),
+            show: "Sonarune".into(),
+            hide: "Sonarune".into(),
             play: "▶".into(),
             pause: "⏸".into(),
             previous: "⏮".into(),
             next: "⏭".into(),
             quit: "⏻".into(),
-            nothing_playing: "Jellysic".into(),
+            nothing_playing: "Sonarune".into(),
         }
     }
 }
@@ -81,7 +81,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 
     let mut builder = TrayIconBuilder::with_id("jellysic-tray")
         .menu(&menu)
-        .tooltip("Jellysic")
+        .tooltip("Sonarune")
         .show_menu_on_left_click(false)
         .on_menu_event(handle_menu_event)
         .on_tray_icon_event(handle_tray_event);
@@ -219,9 +219,9 @@ pub fn update_player(app: &AppHandle, state: &PlayerState) {
     let _ = tray.previous.set_enabled(has_queue);
     let _ = tray.next.set_enabled(has_queue);
     let tooltip = if state.current.is_some() {
-        format!("Jellysic — {now_playing}")
+        format!("Sonarune — {now_playing}")
     } else {
-        "Jellysic".to_string()
+        "Sonarune".to_string()
     };
     let _ = tray._tray.set_tooltip(Some(tooltip));
 }

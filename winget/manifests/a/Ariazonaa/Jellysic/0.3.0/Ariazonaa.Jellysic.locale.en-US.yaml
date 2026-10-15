@@ -1,21 +1,21 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
 
-PackageIdentifier: Ariazonaa.Jellysic
+PackageIdentifier: Ariazonaa.Sonarune
 PackageVersion: 0.3.0
 PackageLocale: en-US
 Publisher: Ariazonaa
 PublisherUrl: https://github.com/Ariazonaa
-PublisherSupportUrl: https://github.com/Ariazonaa/jellysic/issues
+PublisherSupportUrl: https://github.com/Ariazonaa/sonarune/issues
 Author: Ariazonaa
-PackageName: Jellysic
-PackageUrl: https://github.com/Ariazonaa/jellysic
+PackageName: Sonarune
+PackageUrl: https://github.com/Ariazonaa/sonarune
 License: GPL-3.0-or-later
-LicenseUrl: https://github.com/Ariazonaa/jellysic/blob/main/LICENSE
+LicenseUrl: https://github.com/Ariazonaa/sonarune/blob/main/LICENSE
 Copyright: Copyright (C) 2026 Ariazonaa
-CopyrightUrl: https://github.com/Ariazonaa/jellysic/blob/main/LICENSE
+CopyrightUrl: https://github.com/Ariazonaa/sonarune/blob/main/LICENSE
 ShortDescription: Third-party music client for Jellyfin
 Description: >-
-  Jellysic is a desktop music client for a Jellyfin server. The interface is Tauri 2 and Svelte
+  Sonarune is a desktop music client for a Jellyfin server. The interface is Tauri 2 and Svelte
   5; the audio path -- decoding, DSP, gapless playback, crossfade, output device -- lives in
   Rust, so there is no Electron and no external mpv binary. It plays your library with a queue,
   playlists, smart views, lyrics, an equaliser, a visualizer, a mini player and media-key and
@@ -46,6 +46,6 @@ ReleaseNotes: |-
 
   - The update panel now shows what actually changed. latest.json carries the release's changelog section instead of a sentence pointing at a file the dialog cannot open.
   - A failed update check says what went wrong in words: the releases page was unreachable, it holds no release for this platform, the download broke off, or — the one worth its own sentence — the download did not match the project's signature and was discarded. The technical detail stays in the log and in the diagnostic export.
-ReleaseNotesUrl: https://github.com/Ariazonaa/jellysic/releases/tag/v0.3.0
+ReleaseNotesUrl: https://github.com/Ariazonaa/sonarune/releases/tag/v0.3.0
 ManifestType: defaultLocale
 ManifestVersion: 1.28.0
