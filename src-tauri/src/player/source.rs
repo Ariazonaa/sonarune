@@ -343,7 +343,7 @@ pub fn open_track_source(
     // bounded ring buffer of live transcodes, which never holds a whole file).
     let fixed_storage = if wave_job.is_some() {
         TempStorageProvider::with_tempfile_builder(move || {
-            let file = tempfile::Builder::new().prefix("jellysic-").tempfile()?;
+            let file = tempfile::Builder::new().prefix("sonarune-").tempfile()?;
             if let Ok(second) = file.reopen() {
                 *wave_file.lock().unwrap() = Some(second);
             }

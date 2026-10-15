@@ -15,25 +15,44 @@ import { PNG } from "pngjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// The mark: a bold J whose bowl ends in a tilted note head. Coordinates are a
-// 100x100 design grid. Stroke widths are full widths, as in SVG.
+// The mark: a bold S whose lower stroke ends in a tilted note head. Coordinates
+// are a 100x100 design grid. Stroke widths are full widths, as in SVG.
 const ACCENT = "#1db954"; // --color-accent
 const ON_ACCENT = "#000000"; // --color-on-accent
 
 const FIELD = { kind: "roundRect", x: 0, y: 0, w: 100, h: 100, r: 22.5 };
 const GLYPH = [
-  { kind: "line", a: [74, 20], b: [74, 60], w: 13 },
   {
     kind: "curve",
     pts: [
-      [74, 60],
-      [74, 82],
-      [52, 86],
-      [43, 74],
+      [71.5, 27],
+      [64.5, 17],
+      [35.5, 17],
+      [35.5, 34],
     ],
     w: 13,
   },
-  { kind: "ellipse", c: [36, 71], rx: 17, ry: 11, deg: -24 },
+  {
+    kind: "curve",
+    pts: [
+      [35.5, 34],
+      [35.5, 48],
+      [69.5, 45],
+      [69.5, 63],
+    ],
+    w: 13,
+  },
+  {
+    kind: "curve",
+    pts: [
+      [69.5, 63],
+      [69.5, 80],
+      [54.5, 86],
+      [46.5, 78],
+    ],
+    w: 13,
+  },
+  { kind: "ellipse", c: [36, 75], rx: 16, ry: 10.5, deg: -24 },
 ];
 
 // --- distance fields ---------------------------------------------------------

@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::{Manager, State};
 
-const KEYRING_SERVICE: &str = "jellysic";
+const KEYRING_SERVICE: &str = "sonarune";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +116,21 @@ fn keyring_entry(server_url: &str, username: &str) -> AppResult<keyring::Entry> 
         KEYRING_SERVICE,
         &format!("{server_url}::{username}"),
     )?)
+}
+
+/// Bring the signed-in account's token and password and the ListenBrainz
+/// token over from the keyring service the app used before its rename.
+pub(crate) fn migrate_legacy_credentials(store: &crate::store::Store) {
+    if let (Some(server_url), Some(username)) =
+        (store.get(keys::SERVER_URL), store.get(keys::USERNAME))
+    {
+        crate::legacy::migrate_credential(KEYRING_SERVICE, &format!("{server_url}::{username}"));
+        crate::legacy::migrate_credential(
+            KEYRING_SERVICE,
+            &format!("{server_url}::{username}::password"),
+        );
+    }
+    crate::legacy::migrate_credential(KEYRING_SERVICE, "listenbrainz");
 }
 
 /// The password is kept (Windows Credential Manager) so an expired token can
@@ -1704,7 +1719,7 @@ pub async fn export_diagnostics(
         .download_dir()
         .map_err(|e| AppError::Other(format!("no downloads folder: {e}")))?;
     let destination = tokio::task::spawn_blocking(move || {
-        write_unique(&dir, "jellysic-diagnostics.json", &bytes)
+        write_unique(&dir, "sonarune-diagnostics.json", &bytes)
     })
     .await
     .map_err(|e| AppError::Other(format!("diagnostic writer task failed: {e}")))?
@@ -1953,7 +1968,7 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         let path =
-            std::env::temp_dir().join(format!("jellysic-download-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("sonarune-download-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).expect("create test directory");
         TempDir(path)
     }

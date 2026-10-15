@@ -156,7 +156,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "jellysic-visualizer-preferences.json";
+    a.download = "sonarune-visualizer-preferences.json";
     a.click();
     URL.revokeObjectURL(url);
     backupStatus = m.visualizer_backup_exported();
@@ -189,7 +189,7 @@
     if (!url) return;
     const a = document.createElement("a");
     a.href = url;
-    a.download = "jellysic-visualizer.png";
+    a.download = "sonarune-visualizer.png";
     a.click();
   }
 

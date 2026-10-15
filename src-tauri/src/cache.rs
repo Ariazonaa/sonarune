@@ -223,7 +223,7 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         let path =
-            std::env::temp_dir().join(format!("jellysic-cache-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("sonarune-cache-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).expect("create cache test directory");
         TempDir(path)
     }

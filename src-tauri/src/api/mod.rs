@@ -3749,8 +3749,8 @@ mod token_probe_tests {
 /// end-to-end (the risky server-contract part that unit tests can't cover):
 ///
 /// ```text
-/// JELLYSIC_TEST_URL=https://jellyfin.example.com \
-/// JELLYSIC_TEST_USER=alice JELLYSIC_TEST_PASS=secret \
+/// SONARUNE_TEST_URL=https://jellyfin.example.com \
+/// SONARUNE_TEST_USER=alice SONARUNE_TEST_PASS=secret \
 /// cargo test --lib smoke -- --ignored --nocapture
 /// ```
 ///
@@ -3762,19 +3762,19 @@ mod smoke {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "needs a live server; set JELLYSIC_TEST_{URL,USER,PASS}"]
+    #[ignore = "needs a live server; set SONARUNE_TEST_{URL,USER,PASS}"]
     async fn live_flows() {
         let (Ok(url), Ok(user), Ok(pass)) = (
-            std::env::var("JELLYSIC_TEST_URL"),
-            std::env::var("JELLYSIC_TEST_USER"),
-            std::env::var("JELLYSIC_TEST_PASS"),
+            std::env::var("SONARUNE_TEST_URL"),
+            std::env::var("SONARUNE_TEST_USER"),
+            std::env::var("SONARUNE_TEST_PASS"),
         ) else {
-            eprintln!("skipping: set JELLYSIC_TEST_URL / _USER / _PASS to run");
+            eprintln!("skipping: set SONARUNE_TEST_URL / _USER / _PASS to run");
             return;
         };
 
         let mut client =
-            JellyfinClient::new(url.trim_end_matches('/'), "jellysic-smoke", Vec::new())
+            JellyfinClient::new(url.trim_end_matches('/'), "sonarune-smoke", Vec::new())
                 .expect("client");
         client.authenticate(&user, &pass).await.expect("login");
         eprintln!("✓ authenticated");

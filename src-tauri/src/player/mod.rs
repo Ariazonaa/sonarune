@@ -974,7 +974,7 @@ pub fn spawn(
     };
 
     std::thread::Builder::new()
-        .name("jellysic-player".into())
+        .name("sonarune-player".into())
         .spawn(move || {
             // Building the worker opens the audio device. If that fails, do
             // NOT return: dropping `rx` here would make every later command
@@ -2738,7 +2738,7 @@ impl Worker {
         let tx = self.tx.clone();
         let session = play_session.clone();
         let spawned = std::thread::Builder::new()
-            .name("jellysic-open".into())
+            .name("sonarune-open".into())
             .spawn(move || {
                 // A decoder panicking on a malformed file (symphonia on a WAV
                 // header with sample rate 0) must still answer, or the player
@@ -3526,7 +3526,7 @@ fn init_media_controls(
 ) -> Option<souvlaki::MediaControls> {
     let hwnd = hwnd?;
     let config = souvlaki::PlatformConfig {
-        dbus_name: "jellysic",
+        dbus_name: "sonarune",
         display_name: "Sonarune",
         hwnd: Some(hwnd as *mut std::ffi::c_void),
     };
@@ -4087,7 +4087,7 @@ mod tests {
             }
         }
         let dir = TempDir(
-            std::env::temp_dir().join(format!("jellysic-queue-test-{}", uuid::Uuid::new_v4())),
+            std::env::temp_dir().join(format!("sonarune-queue-test-{}", uuid::Uuid::new_v4())),
         );
         let store = Store::open(&dir.0).unwrap();
         store.set(keys::SERVER_URL, "https://music.home").unwrap();

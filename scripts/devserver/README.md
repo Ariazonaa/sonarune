@@ -22,7 +22,7 @@ password — authentication is not checked.
 Eight invented artists, ten albums, 56 tracks, two playlists, six genres
 (`fixtures.mjs`). Nothing is a real recording and no name refers to anything.
 
-Media is generated on first run into `~/.cache/jellysic/devserver-media`, not
+Media is generated on first run into `~/.cache/sonarune/devserver-media`, not
 into the repo:
 
 - **Covers** — abstract sleeve art, drawn with `pngjs` (already a devDependency)
@@ -55,11 +55,17 @@ The README images come from this library, captured through the real app:
 2. Build a binary with its own app identifier, so it gets its own data
    directory and cannot touch a real session:
    ```sh
-   npx tauri build --debug --no-bundle --config '{"identifier":"io.jellysic.demo"}'
+   npx tauri build --debug --no-bundle --config '{"identifier":"io.sonarune.demo"}'
    ```
 3. Drive it with a WebDriver spec that signs in via
-   `JELLYSIC_TEST_{URL,USER,PASS}` and calls `browser.saveScreenshot()` (see
+   `SONARUNE_TEST_{URL,USER,PASS}` and calls `browser.saveScreenshot()` (see
    `e2e/README.md` for the harness and its prerequisites).
+
+Without the WebDriver harness, the WebView can be driven directly: start the
+binary with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
+and talk to it over the Chrome DevTools Protocol (`http://127.0.0.1:9222/json`
+lists the page). `Emulation.setDeviceMetricsOverride` to 1440×900 and
+`Page.captureScreenshot` give the size the README images have.
 
 Redirecting `APPDATA` does **not** isolate the app: Tauri resolves the data
 directory through `SHGetKnownFolderPath`, which ignores the variable. The

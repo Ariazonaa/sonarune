@@ -357,10 +357,10 @@
     { path: "/smart", label: m.nav_smart_views },
     { path: "/collections", label: m.nav_collections },
   ];
-  let startupView = $state(localStorage.getItem("jellysic.startupView") ?? "/");
+  let startupView = $state(localStorage.getItem("sonarune.startupView") ?? "/");
   function setStartupView(path: string) {
     startupView = path;
-    localStorage.setItem("jellysic.startupView", path);
+    localStorage.setItem("sonarune.startupView", path);
   }
 
   /** Auto-DJ numbers the backend last accepted — the fallback for an emptied
@@ -422,7 +422,7 @@
       const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
       const a = document.createElement("a");
       a.href = url;
-      a.download = "jellysic-settings.json";
+      a.download = "sonarune-settings.json";
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {

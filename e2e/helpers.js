@@ -4,7 +4,7 @@
 /**
  * Make sure the app is at the signed-in shell.
  * - Restored session (this dev machine): already there → true.
- * - Setup screen showing AND JELLYSIC_TEST_{URL,USER,PASS} set (CI): sign in.
+ * - Setup screen showing AND SONARUNE_TEST_{URL,USER,PASS} set (CI): sign in.
  * - Otherwise (signed out, no creds): returns false so the caller can skip.
  */
 export async function ensureSignedIn() {
@@ -21,9 +21,9 @@ export async function ensureSignedIn() {
   );
   if (await shell.isExisting()) return true;
 
-  const url = process.env.JELLYSIC_TEST_URL;
-  const user = process.env.JELLYSIC_TEST_USER;
-  const pass = process.env.JELLYSIC_TEST_PASS;
+  const url = process.env.SONARUNE_TEST_URL;
+  const user = process.env.SONARUNE_TEST_USER;
+  const pass = process.env.SONARUNE_TEST_PASS;
   if (!(await setup.isExisting()) || !url || !user || !pass) return false;
 
   await (await $('[data-testid="setup-server"]')).setValue(url);

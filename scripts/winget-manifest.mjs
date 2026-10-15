@@ -193,12 +193,14 @@ function manifests(version, info) {
   const license = /^license = "(.+)"$/m.exec(cargo)?.[1];
   if (!license) throw new Error("Cargo.toml has no license field");
 
-  // What the NSIS installer writes into the uninstall list. Both default to the
-  // product name in Tauri's template, and the install directory and the
-  // registry key are the product name too — that key's name is the ProductCode
-  // winget correlates on for a non-MSI installer.
+  // What the NSIS installer writes into the uninstall list. The display name,
+  // the install directory and the registry key are the product name — that
+  // key's name is the ProductCode winget correlates on for a non-MSI
+  // installer. Without `bundle.publisher` Tauri falls back to the second part
+  // of the identifier, which is what 0.5.0 and earlier registered ("jellysic").
   const productName = conf.productName;
-  const publisher = conf.bundle?.publisher ?? productName;
+  const publisher =
+    conf.bundle?.publisher ?? conf.identifier.split(".")[1] ?? productName;
 
   const notes = sectionText(read("CHANGELOG.md"), version, 10000);
 
@@ -235,8 +237,8 @@ function manifests(version, info) {
     "  - silent",
     "  - silentWithProgress",
     // Without these, winget compares the manifest's name and publisher against
-    // the uninstall entry, finds "jellysic" where it expected "Sonarune" by
-    // "Ariazonaa", and cannot tell that the package is installed or which
+    // the uninstall entry, and wherever the two differ from the package's own
+    // name and publisher it cannot tell that the package is installed or which
     // version it is.
     "AppsAndFeaturesEntries:",
     fields(

@@ -370,7 +370,7 @@ impl VisualizerTap {
         let shared = Arc::new(TapShared::new());
         let forwarder_shared = shared.clone();
         let handle = std::thread::Builder::new()
-            .name("jellysic-vis-forward".into())
+            .name("sonarune-vis-forward".into())
             .spawn(move || forward(forwarder_shared))
             .expect("failed to spawn visualizer forwarder thread");
         Self {

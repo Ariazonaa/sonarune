@@ -31,7 +31,7 @@ if (!upstreamArg) {
   process.exit(2);
 }
 const upstream = new URL(upstreamArg);
-const certDir = certDirArg ?? path.join(os.tmpdir(), "jellysic-tls-test-certs");
+const certDir = certDirArg ?? path.join(os.tmpdir(), "sonarune-tls-test-certs");
 fs.mkdirSync(certDir, { recursive: true });
 
 function openssl() {
@@ -61,7 +61,7 @@ for (const name of names) {
   execFileSync(bin, [
     "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
     "-keyout", key, "-out", crt, "-days", "2",
-    "-subj", `/CN=localhost/O=jellysic test ${name}`,
+    "-subj", `/CN=localhost/O=sonarune test ${name}`,
     "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
   ], { stdio: "ignore" });
 }

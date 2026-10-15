@@ -63,6 +63,12 @@ Settings when you say so — never while a track is playing, and only after the
 download's signature checks out against the project's key. The portable zip
 cannot do that; it gets its new version by hand.
 
+Up to 0.5.0 the project was called **Jellysic**. An installed 0.5.0 picks the
+new version up through the usual update path. Your sign-in, settings and queue
+move along with it, and the new installer removes the old installation and its
+Start-menu entry itself. Only an entry pinned to the taskbar needs pinning
+again.
+
 What changed between versions is in [`CHANGELOG.md`](CHANGELOG.md). Building
 it yourself is under [Getting started](#getting-started).
 
@@ -219,7 +225,7 @@ Two worlds joined by Tauri commands (UI → Rust) and events (Rust → UI). The
 **WebView renders UI and nothing else** — every Jellyfin request (auth, browsing,
 cover art, audio streams) goes through Rust/`reqwest`, so plain-HTTP and
 self-signed home servers just work and tokens never touch the DOM. A dedicated
-`jellysic-player` OS thread owns the rodio output, the queue, playback reporting
+`sonarune-player` OS thread owns the rodio output, the queue, playback reporting
 and the Windows SMTC; sources are decoded by Symphonia (or libopus) and run
 through a DSP → fade → visualizer-tap chain. Cover art reaches the UI through a
 custom, disk-cached `jfimg://` protocol.
@@ -235,7 +241,7 @@ flowchart LR
     subgraph RS["Rust — Tauri 2"]
         direction TB
         API["api/ — JellyfinClient<br/>reqwest · rustls cert-pinning"]
-        PLAYER["player/ — jellysic-player thread<br/>Symphonia · rodio · DSP · SMTC"]
+        PLAYER["player/ — sonarune-player thread<br/>Symphonia · rodio · DSP · SMTC"]
         MISC["queue · store (SQLite) · jfimg://"]
     end
     S -- "invoke() (UI → Rust)" --> RS

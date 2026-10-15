@@ -7,6 +7,18 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+### Changed
+
+- **Jellysic is now Sonarune.** New name, new mark (an S whose tail is a note
+  head), and the name goes all the way down: the program folder, the exe, the
+  app identifier (`io.sonarune.app`), the database, the keyring entries and
+  every stored preference. An installed 0.5.0 updates as usual and keeps its
+  sign-in, settings, queue, cover cache and window position: the app moves its
+  data over from the old locations on first start, and the installer removes
+  the old installation and carries its Start-menu and desktop shortcuts over.
+  A taskbar pin has to be set again. Visualizer backups exported under the old
+  name still import.
+
 ## [0.5.0] — 2026-09-22
 
 ### Changed

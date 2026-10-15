@@ -100,7 +100,7 @@
   $effect(() => {
     if (isStandalone || !session.info || didStartupNav) return;
     didStartupNav = true;
-    const startup = localStorage.getItem("jellysic.startupView");
+    const startup = localStorage.getItem("sonarune.startupView");
     if (startup && startup !== page.url.pathname) goto(startup);
   });
 

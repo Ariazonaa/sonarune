@@ -114,7 +114,7 @@ export class VisualizerEngine {
         return null;
       }
 
-      const worklet = new AudioWorkletNode(ctx, "jellysic-vis-feed", {
+      const worklet = new AudioWorkletNode(ctx, "sonarune-vis-feed", {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [2],

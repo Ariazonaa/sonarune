@@ -26,26 +26,44 @@
           }, 0);
         return (lum + 0.05) / 0.05 >= 1.05 / (lum + 0.05) ? "#000000" : "#ffffff";
       }
+      // Up to 0.5.0 every key started with "jellysic." or "jellysic:". Give
+      // them the new prefix once, before anything below or in the app reads
+      // them; a key already written under the new name wins.
       try {
-        var jellysicTheme = JSON.parse(localStorage.getItem("jellysic.theme") || "null");
-        if (jellysicTheme) {
+        var legacyKeys = [];
+        for (var i = 0; i < localStorage.length; i++) {
+          var key = localStorage.key(i);
+          if (/^jellysic[.:]/.test(key)) legacyKeys.push(key);
+        }
+        legacyKeys.forEach(function (key) {
+          var renamed = "sonarune" + key.slice("jellysic".length);
+          if (localStorage.getItem(renamed) === null)
+            localStorage.setItem(renamed, localStorage.getItem(key));
+          localStorage.removeItem(key);
+        });
+      } catch (e) {
+        /* storage unavailable: nothing to carry over */
+      }
+      try {
+        var savedTheme = JSON.parse(localStorage.getItem("sonarune.theme") || "null");
+        if (savedTheme) {
           var root = document.documentElement;
-          if (jellysicTheme.accent)
-            root.style.setProperty("--color-accent", jellysicTheme.accent);
-          if (jellysicTheme.accentHover)
-            root.style.setProperty("--color-accent-hover", jellysicTheme.accentHover);
+          if (savedTheme.accent)
+            root.style.setProperty("--color-accent", savedTheme.accent);
+          if (savedTheme.accentHover)
+            root.style.setProperty("--color-accent-hover", savedTheme.accentHover);
           // Black or white on the accent, whichever contrasts more -- a dark
           // custom accent with black icons hides the play button. Same rule as
           // onAccentFor() in src/lib/theme.ts; keep the two in sync.
           root.style.setProperty(
             "--color-on-accent",
-            onAccentFor(jellysicTheme.accent)
+            onAccentFor(savedTheme.accent)
           );
           // Accent from the cover: start with the last cover accent rather
           // than flashing the fixed one until the cover is read.
-          if (jellysicTheme.accentMode !== "fixed") {
+          if (savedTheme.accentMode !== "fixed") {
             var coverAccent = JSON.parse(
-              localStorage.getItem("jellysic.coverAccent.v2") || "null"
+              localStorage.getItem("sonarune.coverAccent.v2") || "null"
             );
             if (coverAccent) {
               root.style.setProperty("--color-accent", coverAccent.accent);

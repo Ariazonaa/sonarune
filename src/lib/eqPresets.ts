@@ -14,7 +14,7 @@ const EQ_MAX_DB = 12;
 export const MAX_CUSTOM_PRESETS = 20;
 export const MAX_PRESET_NAME = 40;
 
-const STORAGE_KEY = "jellysic.eq.presets.v1";
+const STORAGE_KEY = "sonarune.eq.presets.v1";
 
 /** Ten finite gains, clamped to the slider range and snapped to its 0.5 dB
  *  steps; null for anything else. */

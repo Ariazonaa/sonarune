@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const APPS = [
-  { key: "jellysic", name: "Sonarune 0.1.0", runtime: "Rust + WebView2" },
+  { key: "sonarune", name: "Sonarune 0.1.0", runtime: "Rust + WebView2" },
   { key: "supersonic", name: "Supersonic 0.22.1", runtime: "Go + Fyne" },
   { key: "feishin", name: "Feishin 1.17.0", runtime: "Electron" },
   { key: "sonixd", name: "Sonixd 0.15.5", runtime: "Electron, archived" },
@@ -34,23 +34,23 @@ const SECTIONS = [
   {
     title: "Footprint",
     rows: [
-      { label: "Installer", unit: "MB", jellysic: 7.2, supersonic: 49.8, feishin: 178, sonixd: 81.7 },
-      { label: "On disk", unit: "MB", jellysic: 28, supersonic: 169, feishin: 644, sonixd: 332 },
+      { label: "Installer", unit: "MB", sonarune: 7.2, supersonic: 49.8, feishin: 178, sonixd: 81.7 },
+      { label: "On disk", unit: "MB", sonarune: 28, supersonic: 169, feishin: 644, sonixd: 332 },
     ],
   },
   {
     title: "Startup",
     rows: [
-      { label: "Launch → window", unit: "ms", jellysic: 177, supersonic: 594, feishin: 722, sonixd: 719 },
+      { label: "Launch → window", unit: "ms", sonarune: 177, supersonic: 594, feishin: 722, sonixd: 719 },
     ],
   },
   {
     title: "At rest, signed in and idle",
     rows: [
-      { label: "Memory, working set", unit: "MB", jellysic: 427, supersonic: 198, feishin: 760, sonixd: 406 },
-      { label: "Memory, private bytes", unit: "MB", jellysic: 273, supersonic: 404, feishin: 464, sonixd: 213 },
-      { label: "CPU", unit: "%", jellysic: 0.65, supersonic: 0.2, feishin: 2.1, sonixd: 4.95 },
-      { label: "Processes", unit: "", jellysic: 7, supersonic: 1, feishin: 6, sonixd: 5 },
+      { label: "Memory, working set", unit: "MB", sonarune: 427, supersonic: 198, feishin: 760, sonixd: 406 },
+      { label: "Memory, private bytes", unit: "MB", sonarune: 273, supersonic: 404, feishin: 464, sonixd: 213 },
+      { label: "CPU", unit: "%", sonarune: 0.65, supersonic: 0.2, feishin: 2.1, sonixd: 4.95 },
+      { label: "Processes", unit: "", sonarune: 7, supersonic: 1, feishin: 6, sonixd: 5 },
     ],
   },
 ];
@@ -61,14 +61,14 @@ const THEME = {
     ink: "#f2f2f4",
     muted: "#8a8a93",
     faint: "#ffffff12",
-    series: { jellysic: "#3987e5", supersonic: "#199e70", feishin: "#d95926", sonixd: "#c98500" },
+    series: { sonarune: "#3987e5", supersonic: "#199e70", feishin: "#d95926", sonixd: "#c98500" },
   },
   light: {
     surface: "#fcfcfb",
     ink: "#14141a",
     muted: "#5c5b63",
     faint: "#14141a12",
-    series: { jellysic: "#2a78d6", supersonic: "#1baf7a", feishin: "#eb6834", sonixd: "#eda100" },
+    series: { sonarune: "#2a78d6", supersonic: "#1baf7a", feishin: "#eb6834", sonixd: "#eda100" },
   },
 };
 

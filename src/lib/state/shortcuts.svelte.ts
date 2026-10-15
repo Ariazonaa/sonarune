@@ -35,7 +35,7 @@ const DEFAULT_SHORTCUTS: ShortcutBindings = {
   jumpToCurrent: ["J"],
 };
 
-const STORAGE_KEY = "jellysic.shortcuts.v1";
+const STORAGE_KEY = "sonarune.shortcuts.v1";
 const PURE_MODIFIERS = new Set(["Control", "Shift", "Alt", "Meta", "AltGraph"]);
 const RESERVED = new Set([
   "F5",

@@ -19,7 +19,7 @@
 
   const MODES = ["ambient", "cover", "visualizer"] as const;
   type BackdropMode = (typeof MODES)[number];
-  const MODE_KEY = "jellysic.nowplaying.backdrop";
+  const MODE_KEY = "sonarune.nowplaying.backdrop";
   const MODE_LABELS: Record<BackdropMode, () => string> = {
     ambient: m.nowplaying_backdrop_ambient,
     cover: m.nowplaying_backdrop_cover,

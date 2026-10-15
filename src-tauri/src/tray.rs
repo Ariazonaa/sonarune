@@ -79,7 +79,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     ];
     let menu = Menu::with_items(app, &items)?;
 
-    let mut builder = TrayIconBuilder::with_id("jellysic-tray")
+    let mut builder = TrayIconBuilder::with_id("sonarune-tray")
         .menu(&menu)
         .tooltip("Sonarune")
         .show_menu_on_left_click(false)

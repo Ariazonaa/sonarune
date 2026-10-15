@@ -21,7 +21,7 @@
   let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
   let edit = $state<{ itemId: string; name: string } | null>(null);
 
-  const HISTORY_KEY = "jellysic:searchHistory";
+  const HISTORY_KEY = "sonarune:searchHistory";
   const HISTORY_MAX = 8;
   const PAGE_SIZE = 100;
   const LOAD_AHEAD_PX = 1_000;

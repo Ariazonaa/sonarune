@@ -2212,40 +2212,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jellysic"
-version = "0.5.0"
-dependencies = [
- "flate2",
- "keyring",
- "ogg",
- "opus",
- "proptest",
- "reqwest",
- "rodio",
- "rusqlite",
- "rustls",
- "rustls-native-certs",
- "serde",
- "serde_json",
- "sha2",
- "souvlaki",
- "stream-download",
- "tauri",
- "tauri-build",
- "tauri-plugin-single-instance",
- "tauri-plugin-updater",
- "tauri-plugin-window-state",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "webview2-com",
- "windows 0.61.3",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4308,6 +4274,41 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "web-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sonarune"
+version = "0.5.0"
+dependencies = [
+ "dirs",
+ "flate2",
+ "keyring",
+ "ogg",
+ "opus",
+ "proptest",
+ "reqwest",
+ "rodio",
+ "rusqlite",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "souvlaki",
+ "stream-download",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-updater",
+ "tauri-plugin-window-state",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "webview2-com",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
 ]
 

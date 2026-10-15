@@ -17,16 +17,16 @@ export type CycleSetting = "auto" | number;
 
 export type VisualizerQuality = "low" | "medium" | "high";
 
-const STORAGE_KEY = "jellysic.vis.cycle";
-const BLEND_KEY = "jellysic.vis.blend";
-const FAVORITES_KEY = "jellysic.vis.favorites";
-const BLOCKED_KEY = "jellysic.vis.blocked";
-const QUARANTINED_KEY = "jellysic.vis.quarantined";
-const FAVORITES_ONLY_KEY = "jellysic.vis.favoritesOnly";
-const SENSITIVITY_KEY = "jellysic.vis.sensitivity";
-const QUALITY_KEY = "jellysic.vis.quality";
+const STORAGE_KEY = "sonarune.vis.cycle";
+const BLEND_KEY = "sonarune.vis.blend";
+const FAVORITES_KEY = "sonarune.vis.favorites";
+const BLOCKED_KEY = "sonarune.vis.blocked";
+const QUARANTINED_KEY = "sonarune.vis.quarantined";
+const FAVORITES_ONLY_KEY = "sonarune.vis.favoritesOnly";
+const SENSITIVITY_KEY = "sonarune.vis.sensitivity";
+const QUALITY_KEY = "sonarune.vis.quality";
 /** Opt-in for the online Butterchurn Weekly presets (see `PresetRotation`). */
-export const REMOTE_PRESETS_KEY = "jellysic.vis.remotePresets";
+export const REMOTE_PRESETS_KEY = "sonarune.vis.remotePresets";
 const DEFAULT_CYCLE: CycleSetting = "auto";
 const DEFAULT_BLEND = 2.7;
 const DEFAULT_SENSITIVITY = 1;
@@ -371,7 +371,7 @@ export class VisualizerController {
   exportPreferences(): string {
     return JSON.stringify(
       {
-        format: "jellysic-visualizer-preferences",
+        format: "sonarune-visualizer-preferences",
         version: 1,
         exportedAt: new Date().toISOString(),
         favorites: [...this.#favorites],
@@ -387,7 +387,9 @@ export class VisualizerController {
     const value: unknown = JSON.parse(raw);
     if (!value || typeof value !== "object") throw new Error(m.visualizer_backup_error_invalid());
     const backup = value as Record<string, unknown>;
-    if (backup.format !== "jellysic-visualizer-preferences" || backup.version !== 1) {
+    // "jellysic-…" is what builds before the rename exported.
+    const formats = ["sonarune-visualizer-preferences", "jellysic-visualizer-preferences"];
+    if (!formats.includes(backup.format as string) || backup.version !== 1) {
       throw new Error(m.visualizer_backup_error_unsupported());
     }
     const readNames = (field: unknown) => {

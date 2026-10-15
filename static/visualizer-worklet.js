@@ -65,4 +65,4 @@ export class SonaruneVisFeed extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor("jellysic-vis-feed", SonaruneVisFeed);
+registerProcessor("sonarune-vis-feed", SonaruneVisFeed);

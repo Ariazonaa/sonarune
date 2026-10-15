@@ -1,15 +1,15 @@
 // WebdriverIO end-to-end harness for the built Tauri app (Windows).
 //
 // Pipeline: wdio -> tauri-driver (spawned below) -> msedgedriver -> WebView2,
-// which launches the real `jellysic.exe` and drives the SvelteKit SPA inside
+// which launches the real `sonarune.exe` and drives the SvelteKit SPA inside
 // it. This is the hand-rolled tauri-driver setup (the most Windows-proven
 // path); see e2e/README.md for prerequisites and how to run it.
 //
 // Env knobs:
 //   E2E_SKIP_BUILD=1        skip the debug build in onPrepare (binary must exist)
-//   E2E_APP_BINARY=<path>   point at a specific jellysic.exe
+//   E2E_APP_BINARY=<path>   point at a specific sonarune.exe
 //   MSEDGEDRIVER=<path>     msedgedriver.exe if it is not already on PATH
-//   JELLYSIC_TEST_URL/USER/PASS   enable the authenticated spec (else it skips)
+//   SONARUNE_TEST_URL/USER/PASS   enable the authenticated spec (else it skips)
 
 import os from "node:os";
 import path from "node:path";
@@ -43,7 +43,7 @@ function resolveTargetDir() {
     }
   }
   // Say why the fallback is being used. Without this the run dies much later
-  // with "no msedge binary at src-tauri/target/debug/jellysic.exe", which
+  // with "no msedge binary at src-tauri/target/debug/sonarune.exe", which
   // points at the wrong thing entirely: the binary is fine, it just is not
   // there. `~/.cargo/bin` is not enough on a machine where cargo lives in the
   // rustup toolchain directory and only cargo-installed tools sit in that bin.
@@ -57,7 +57,7 @@ function resolveTargetDir() {
 
 function resolveAppBinary() {
   if (process.env.E2E_APP_BINARY) return path.resolve(process.env.E2E_APP_BINARY);
-  return path.join(resolveTargetDir(), "debug", `jellysic${exe}`);
+  return path.join(resolveTargetDir(), "debug", `sonarune${exe}`);
 }
 
 const appBinary = resolveAppBinary();

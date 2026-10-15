@@ -1,5 +1,5 @@
 [package]
-name = "jellysic"
+name = "sonarune"
 version = "0.5.0"
 description = "A fast Jellyfin desktop music client"
 authors = ["Ariazonaa"]
@@ -13,7 +13,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "jellysic_lib"
+name = "sonarune_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -32,6 +32,7 @@ stream-download = { version = "0.24.1", features = ["reqwest-rustls"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "http2", "query"] }
+dirs = "6"
 keyring = { version = "4.1.2", features = ["windows-native-keyring-store"] }
 rustls = "0.23"
 rustls-native-certs = "0.8"

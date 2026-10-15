@@ -31,7 +31,7 @@ flowchart LR
         direction TB
         CMD["commands*.rs<br/>(invoke surface)"]
         API["api/ — JellyfinClient<br/>reqwest + rustls pinning"]
-        PLAYER["player/ — jellysic-player thread<br/>rodio · Symphonia · DSP · SMTC"]
+        PLAYER["player/ — sonarune-player thread<br/>rodio · Symphonia · DSP · SMTC"]
         STORE["store.rs — SQLite kv"]
         PROTO["proto.rs — jfimg:// cover art"]
         CMD --> API
@@ -77,7 +77,7 @@ flowchart TB
     APP["AppState (lib.rs)"]
     APP --> ST["store: Arc&lt;Store&gt;<br/>SQLite kv (settings, queue snapshot)"]
     APP --> SES["session: SharedSession<br/>Arc&lt;RwLock&lt;Option&lt;Arc&lt;JellyfinClient&gt;&gt;&gt;&gt;"]
-    APP --> PH["player: PlayerHandle<br/>→ jellysic-player OS thread"]
+    APP --> PH["player: PlayerHandle<br/>→ sonarune-player OS thread"]
     APP --> LW["library_watch: LibraryWatchHandle"]
     APP -.managed.-> DM["DownloadManager"]
     APP -.managed.-> CC["CoverCache"]
@@ -97,7 +97,7 @@ player thread (not inside the async runtime) uses `blocking_read()`.
 
 ## 3. The player thread
 
-A single dedicated OS thread named `jellysic-player` owns the audio output, the
+A single dedicated OS thread named `sonarune-player` owns the audio output, the
 queue, playback reporting and the Windows SMTC for the whole app lifetime. It is
 driven by an mpsc channel with a **400 ms timeout** — commands when they arrive,
 a periodic `tick()` when they don't.
@@ -108,7 +108,7 @@ flowchart TB
         U["UI invoke → commands.rs"]
     end
 
-    subgraph WORKER["jellysic-player OS thread"]
+    subgraph WORKER["sonarune-player OS thread"]
         LOOP{{"recv_timeout(400ms)"}}
         H["handle(cmd)"]
         T["tick()"]
@@ -119,7 +119,7 @@ flowchart TB
         T --> W
     end
 
-    subgraph OPEN["short-lived 'jellysic-open' threads"]
+    subgraph OPEN["short-lived 'sonarune-open' threads"]
         O["open_track_source()<br/>(decode probe, HTTP stream)"]
     end
 
@@ -135,7 +135,7 @@ flowchart TB
     class EV ev;
 ```
 
-**Never block the loop.** Sources are opened on throwaway `jellysic-open`
+**Never block the loop.** Sources are opened on throwaway `sonarune-open`
 threads and delivered back as a `SourceReady` command; a `generation` counter
 lets the worker throw away results that a newer play/seek has already
 invalidated.
@@ -201,7 +201,7 @@ sequence.
 sequenceDiagram
     autonumber
     participant Tick as tick() loop
-    participant Open as jellysic-open
+    participant Open as sonarune-open
     participant Sink as rodio::Player
 
     Note over Tick: ~20s remaining
@@ -236,7 +236,7 @@ sequenceDiagram
     participant API as JellyfinClient
     participant JF as Jellyfin
     participant P as player thread
-    participant O as jellysic-open
+    participant O as sonarune-open
 
     UI->>CMD: invoke("play_album", {albumId})
     CMD->>API: with_retry(album_tracks)
@@ -369,7 +369,7 @@ Windows SMTC artwork reuses the same disk cache via `file://` URLs.
 ```mermaid
 flowchart TB
     subgraph DISK["Per-installation storage"]
-        SQL["SQLite jellysic.db<br/>settings · device_id · trusted certs · queue snapshot"]
+        SQL["SQLite sonarune.db<br/>settings · device_id · trusted certs · queue snapshot"]
         CRED["OS Credential Manager<br/>access token · password · ListenBrainz token"]
         CACHE["Cover cache dir<br/>{itemId}-{tag}-{size}.img (LRU, MB-capped)"]
     end

@@ -1,6 +1,6 @@
 // Visualizer mount/teardown — one of the Phase-13 GUI core flows. Runs whenever
 // the app is signed in: on this dev machine via the restored session, or in CI
-// after signing in with JELLYSIC_TEST_{URL,USER,PASS}. If it can't reach the
+// after signing in with SONARUNE_TEST_{URL,USER,PASS}. If it can't reach the
 // signed-in shell (signed out and no creds), the whole spec skips.
 //
 // The visualizer route's onMount spins up the Butterchurn/WebGL controller and

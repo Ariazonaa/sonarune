@@ -26,7 +26,7 @@ const PORT = portIdx >= 0 ? Number(argv[portIdx + 1]) : 8096;
 /** Log every request. Useful when you want to see what a client actually asks
  *  for, or to watch playback reporting arrive while the window is hidden. */
 const VERBOSE = argv.includes("--verbose");
-const MEDIA = join(homedir(), ".cache", "jellysic", "devserver-media");
+const MEDIA = join(homedir(), ".cache", "sonarune", "devserver-media");
 
 const favorites = new Set();
 const playCounts = new Map();

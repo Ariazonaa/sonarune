@@ -1,6 +1,6 @@
 # End-to-end tests (WebDriver)
 
-These drive the **real built `jellysic.exe`** through WebView2, the way a user
+These drive the **real built `sonarune.exe`** through WebView2, the way a user
 would. They complement the fast Vitest/`cargo test` gates by covering flows that
 only exist in the running desktop app.
 
@@ -13,7 +13,7 @@ path). Config: [`wdio.conf.mjs`](./wdio.conf.mjs).
 | Spec | Needs a signed-in app? | Covers |
 |------|------------------------|--------|
 | `specs/boot.e2e.js` | no | The app launches, WebView2 loads, the SPA mounts and reaches a known-good landing view (setup screen **or** — if a session was restored — the signed-in shell). Proves the whole build→driver→WebView pipeline. |
-| `specs/visualizer.e2e.js` | yes | The **visualizer mounts (canvas) and tears down** cleanly with no error banner — a Phase-13 GUI core flow. Gets to the signed-in shell via a restored session (dev machine) or, on a clean machine/CI, by signing in with `JELLYSIC_TEST_{URL,USER,PASS}`. Skips if it can't reach the shell. |
+| `specs/visualizer.e2e.js` | yes | The **visualizer mounts (canvas) and tears down** cleanly with no error banner — a Phase-13 GUI core flow. Gets to the signed-in shell via a restored session (dev machine) or, on a clean machine/CI, by signing in with `SONARUNE_TEST_{URL,USER,PASS}`. Skips if it can't reach the shell. |
 
 `ensureSignedIn()` in `helpers.js` encapsulates that restored-session-or-login
 logic. The **dialog focus trap** core flow is covered faster and more reliably
@@ -67,9 +67,9 @@ and then runs every spec.
 | Var | Effect |
 |-----|--------|
 | `E2E_SKIP_BUILD=1` | Skip the debug build (the binary must already exist). Use while iterating on specs. **Not with a binary `tauri dev` produced**: that one is compiled to load the frontend from `devUrl` (`localhost:1420`), so without Vite running it opens a blank window and every spec fails with "neither the setup screen nor the app shell mounted". The skip is only safe after a `tauri build --debug`, which embeds the frontend. |
-| `E2E_APP_BINARY=<path>` | Use a specific `jellysic.exe` instead of the resolved debug build. |
+| `E2E_APP_BINARY=<path>` | Use a specific `sonarune.exe` instead of the resolved debug build. |
 | `MSEDGEDRIVER=<path>` | Path to `msedgedriver.exe` if it isn't on PATH. |
-| `JELLYSIC_TEST_URL` / `JELLYSIC_TEST_USER` / `JELLYSIC_TEST_PASS` | Let `visualizer.e2e.js` sign in when no session is restored. Use a throwaway/test library. |
+| `SONARUNE_TEST_URL` / `SONARUNE_TEST_USER` / `SONARUNE_TEST_PASS` | Let `visualizer.e2e.js` sign in when no session is restored. Use a throwaway/test library. |
 
 The binary path is resolved via `cargo metadata`, so the SMB-share target-dir
 redirect in `src-tauri/.cargo/config.toml` is handled automatically.
@@ -79,7 +79,7 @@ redirect in `src-tauri/.cargo/config.toml` is handled automatically.
 - **WebView2 is not headless** — a real interactive desktop session is required
   (fine locally and on the `windows-latest` CI runner; no Xvfb needed).
 - The app **must not already be running** — WebDriver launches its own instance.
-  Kill stray `jellysic.exe` / `tauri-driver` / `msedgedriver` between runs.
+  Kill stray `sonarune.exe` / `tauri-driver` / `msedgedriver` between runs.
 - Selectors use `data-testid` anchors (`setup-screen`, `setup-server`,
   `setup-username`, `setup-password`, `setup-connect`, `app-shell`,
   `visualizer`, `visualizer-toggle`). Keep those stable.

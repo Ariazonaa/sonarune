@@ -13,6 +13,8 @@ pub struct Store {
     trust: Mutex<()>,
 }
 
+const DB_FILE: &str = "sonarune.db";
+
 pub mod keys {
     pub const SERVER_URL: &str = "server_url";
     pub const USERNAME: &str = "username";
@@ -37,7 +39,8 @@ impl Store {
     pub fn open(dir: &Path) -> AppResult<Self> {
         std::fs::create_dir_all(dir)
             .map_err(|e| crate::error::AppError::Other(format!("cannot create data dir: {e}")))?;
-        let conn = Connection::open(dir.join("jellysic.db"))?;
+        crate::legacy::migrate_db_file(dir, DB_FILE);
+        let conn = Connection::open(dir.join(DB_FILE))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS kv (
@@ -374,7 +377,7 @@ mod tests {
 
     fn temp_store() -> TempStore {
         let dir =
-            std::env::temp_dir().join(format!("jellysic-store-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("sonarune-store-test-{}", uuid::Uuid::new_v4()));
         TempStore {
             store: Some(Store::open(&dir).expect("open test store")),
             dir,

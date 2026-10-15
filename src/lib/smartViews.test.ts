@@ -121,7 +121,7 @@ describe("persist + load round-trip", () => {
 
   it("drops structurally invalid entries", () => {
     localStorage.setItem(
-      `jellysic:smart-views:v1:${encodeURIComponent(session.serverUrl)}:${encodeURIComponent(session.userId)}`,
+      `sonarune:smart-views:v1:${encodeURIComponent(session.serverUrl)}:${encodeURIComponent(session.userId)}`,
       JSON.stringify([{ id: "x" }, { nope: true }]),
     );
     expect(loadSmartViews(session)).toEqual([]);

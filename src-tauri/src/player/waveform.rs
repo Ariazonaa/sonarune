@@ -99,7 +99,7 @@ impl WaveformJob {
             ..
         } = self;
         let spawned = std::thread::Builder::new()
-            .name("jellysic-waveform".into())
+            .name("sonarune-waveform".into())
             .spawn({
                 let item_id = item_id.clone();
                 let request = request.clone();
@@ -226,7 +226,7 @@ mod tests {
 
     fn temp_wav() -> std::path::PathBuf {
         let path =
-            std::env::temp_dir().join(format!("jellysic-wave-test-{}.wav", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("sonarune-wave-test-{}.wav", uuid::Uuid::new_v4()));
         half_silent_wav(&path);
         path
     }

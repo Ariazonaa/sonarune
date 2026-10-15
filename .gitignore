@@ -21,11 +21,21 @@ src/lib/paraglide/
 
 # Stray build artifacts that occasionally land in the repo root instead of
 # the redirected target dir (the real outputs live in the local cache).
-/jellysic.exe
-/jellysic.pdb
-/jellysic.d
+/sonarune.exe
+/sonarune.pdb
+/sonarune.d
 /.fingerprint/
 /nsis/
 /.cargo-lock
 /.cargo-build-lock
 /.cargo-artifact-lock
+
+# Files that belong to the private origin only.
+/TODO.md
+/done.md
+/docs/features.de.md
+/CLAUDE.md
+/.gitea/
+/.gitleaks.toml
+/archive/
+/scripts/publish-public.mjs
