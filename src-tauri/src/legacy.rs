@@ -1,6 +1,6 @@
 //! Carrying installs over from the old name.
 //!
-//! Up to 0.5.0 the app was called Jellysic: its identifier was
+//! Up to 0.5.1 the app was called Jellysic: its identifier was
 //! `io.jellysic.app`, its database `jellysic.db` and its keyring service
 //! `jellysic`. Each of those decides where a piece of state lives, so renaming
 //! them without moving the state would sign every user out and reset every

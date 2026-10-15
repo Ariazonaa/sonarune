@@ -12,12 +12,21 @@ caveat that a minor bump may still change behaviour.
 - **Jellysic is now Sonarune.** New name, new mark (an S whose tail is a note
   head), and the name goes all the way down: the program folder, the exe, the
   app identifier (`io.sonarune.app`), the database, the keyring entries and
-  every stored preference. An installed 0.5.0 updates as usual and keeps its
+  every stored preference. An installed 0.5.x updates as usual and keeps its
   sign-in, settings, queue, cover cache and window position: the app moves its
   data over from the old locations on first start, and the installer removes
   the old installation and carries its Start-menu and desktop shortcuts over.
   A taskbar pin has to be set again. Visualizer backups exported under the old
   name still import.
+
+## [0.5.1] — 2026-10-15
+
+### Security
+
+- Three dependencies updated for published advisories: `serialize-javascript`
+  7.1.2 (GHSA-gfhx-hw2g-v5hg), `source-map-js` 1.2.2 (CVE-2026-93749) and
+  `brace-expansion` 2.1.7 / 1.1.21. All three are build- and test-time tools;
+  nothing else changed in the app.
 
 ## [0.5.0] — 2026-09-22
 
@@ -243,6 +252,7 @@ First public release. Windows, Jellyfin 10.11 or newer.
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
 [Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...HEAD
+[0.5.1]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Ariazonaa/sonarune/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Ariazonaa/sonarune/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Ariazonaa/sonarune/compare/v0.2.0...v0.3.0

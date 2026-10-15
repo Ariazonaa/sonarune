@@ -197,7 +197,7 @@ function manifests(version, info) {
   // the install directory and the registry key are the product name — that
   // key's name is the ProductCode winget correlates on for a non-MSI
   // installer. Without `bundle.publisher` Tauri falls back to the second part
-  // of the identifier, which is what 0.5.0 and earlier registered ("jellysic").
+  // of the identifier, which is what 0.5.x and earlier registered ("jellysic").
   const productName = conf.productName;
   const publisher =
     conf.bundle?.publisher ?? conf.identifier.split(".")[1] ?? productName;

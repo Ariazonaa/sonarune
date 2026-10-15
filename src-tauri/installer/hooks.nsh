@@ -1,9 +1,9 @@
 ; Installer hooks, wired in through bundle.windows.nsis.installerHooks in
 ; tauri.conf.json and inserted into Tauri's own installer template.
 
-; Up to 0.5.0 the app installed as "jellysic": its own program folder, its own
+; Up to 0.5.1 the app installed as "jellysic": its own program folder, its own
 ; uninstall entry, Start-menu shortcut and registry key, all named after the old
-; product name. The new name gets a new one of each, so an update from 0.5.0
+; product name. The new name gets a new one of each, so an update from 0.5.x
 ; would otherwise leave the old copy installed next to the new one. This takes
 ; it out with its own uninstaller.
 ;
