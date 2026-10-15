@@ -15,9 +15,11 @@ nowhere else.
 - Ask only when a decision genuinely belongs to the maintainer — scope,
   product behaviour, anything irreversible or public that these rules do not
   already cover. Otherwise pick the sensible default and name it in the report.
-- Commit messages say what was done, accurately; length is free. AI-assisted
-  commits carry the agent's `Co-Authored-By` trailer (see the AI disclosure in
-  the README).
+- Commit messages say what was done, accurately; length is free. **No AI
+  co-author trailer** — no `Co-Authored-By: Claude …` or the like, and no
+  "Generated with …" line in pull requests: GitHub would list the agent as a
+  contributor. The AI disclosure in the README covers how the project is
+  built; commits stay under the maintainer's name.
 
 **Verifying**
 - Run the gates the change touches before committing: Rust → `cargo fmt
