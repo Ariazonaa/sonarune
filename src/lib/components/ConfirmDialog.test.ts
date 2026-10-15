@@ -1,7 +1,7 @@
 import { flushSync, mount, unmount } from "svelte";
 import { afterEach, describe, expect, it } from "vitest";
-import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
-import { confirm } from "$lib/state/confirm.svelte";
+import ConfirmDialog from "#lib/components/ConfirmDialog.svelte";
+import { confirm } from "#lib/state/confirm.svelte.js";
 
 // The ConfirmDialog is the safety net in front of destructive server writes
 // (playlist/track deletion). Its whole reason to exist is that a reflexive

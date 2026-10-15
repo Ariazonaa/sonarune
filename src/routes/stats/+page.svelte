@@ -1,16 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, formatDuration } from "$lib/api";
-  import { apiLibrary } from "$lib/api/library";
-  import { m } from "$lib/paraglide/messages";
-  import { getLocale } from "$lib/paraglide/runtime";
-  import Cover from "$lib/components/Cover.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import BarList, { type BarItem } from "$lib/components/BarList.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
-  import type { AlbumDto, StatsData, TrackDto } from "$lib/types";
+  import { api, formatDuration } from "#lib/api.js";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { getLocale } from "#lib/paraglide/runtime.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import BarList, { type BarItem } from "#lib/components/BarList.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { library } from "#lib/state/library.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
+  import type { AlbumDto, StatsData, TrackDto } from "#lib/types.js";
 
   let stats = $state<StatsData | null>(swrGet<StatsData>("stats") ?? null);
   let error = $state<string | null>(null);

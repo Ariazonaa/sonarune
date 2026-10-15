@@ -3,43 +3,47 @@
   import { onMount } from "svelte";
   import { page } from "$app/state";
   import { goto, onNavigate } from "$app/navigation";
-  import Sidebar from "$lib/components/Sidebar.svelte";
-  import PlayerBar from "$lib/components/PlayerBar.svelte";
-  import QueuePanel from "$lib/components/QueuePanel.svelte";
-  import LyricsPanel from "$lib/components/LyricsPanel.svelte";
-  import SetupScreen from "$lib/components/SetupScreen.svelte";
-  import TitleBar from "$lib/components/TitleBar.svelte";
-  import CommandPalette from "$lib/components/CommandPalette.svelte";
-  import ShortcutHelp from "$lib/components/ShortcutHelp.svelte";
-  import DownloadPanel from "$lib/components/DownloadPanel.svelte";
-  import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
-  import Toaster from "$lib/components/Toaster.svelte";
-  import { session } from "$lib/state/session.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { net } from "$lib/state/net.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { updates } from "$lib/state/updates.svelte";
-  import { palette } from "$lib/state/palette.svelte";
-  import { help } from "$lib/state/help.svelte";
-  import { layoutPreferences } from "$lib/state/layout.svelte";
-  import { installShortcuts } from "$lib/shortcuts";
-  import { syncTrayLabels } from "$lib/tray";
-  import { coverUrl } from "$lib/api";
-  import { ambientColors } from "$lib/ambient";
-  import { setCoverHue } from "$lib/theme";
-  import { m } from "$lib/paraglide/messages";
+  import Sidebar from "#lib/components/Sidebar.svelte";
+  import PlayerBar from "#lib/components/PlayerBar.svelte";
+  import QueuePanel from "#lib/components/QueuePanel.svelte";
+  import LyricsPanel from "#lib/components/LyricsPanel.svelte";
+  import SetupScreen from "#lib/components/SetupScreen.svelte";
+  import TitleBar from "#lib/components/TitleBar.svelte";
+  import CommandPalette from "#lib/components/CommandPalette.svelte";
+  import ShortcutHelp from "#lib/components/ShortcutHelp.svelte";
+  import DownloadPanel from "#lib/components/DownloadPanel.svelte";
+  import ConfirmDialog from "#lib/components/ConfirmDialog.svelte";
+  import Toaster from "#lib/components/Toaster.svelte";
+  import { session } from "#lib/state/session.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { library } from "#lib/state/library.svelte.js";
+  import { net } from "#lib/state/net.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { updates } from "#lib/state/updates.svelte.js";
+  import { palette } from "#lib/state/palette.svelte.js";
+  import { help } from "#lib/state/help.svelte.js";
+  import { layoutPreferences } from "#lib/state/layout.svelte.js";
+  import { installShortcuts } from "#lib/shortcuts.js";
+  import { syncTrayLabels } from "#lib/tray.js";
+  import { coverUrl } from "#lib/api.js";
+  import { ambientColors } from "#lib/ambient.js";
+  import { setCoverHue } from "#lib/theme.js";
+  import { m } from "#lib/paraglide/messages.js";
 
   let { children } = $props();
 
   // Cross-fade route changes via the View Transitions API (Chromium/WebView2).
   onNavigate((navigation) => {
-    const doc = document as Document & {
-      startViewTransition?: (cb: () => Promise<void> | void) => void;
-    };
+    if (navigation.shallow && navigation.type === 'goto') return;
+
+    const doc = document as 
+      Document &
+      { 
+        startViewTransition?: (cb: () => Promise<void> | void) => void
+       };
     if (!doc.startViewTransition) return;
     return new Promise<void>((resolve) => {
-      doc.startViewTransition!(async () => {
+      (doc.startViewTransition!)(async () => {
         resolve();
         await navigation.complete;
       });
@@ -101,7 +105,9 @@
     if (isStandalone || !session.info || didStartupNav) return;
     didStartupNav = true;
     const startup = localStorage.getItem("sonarune.startupView");
-    if (startup && startup !== page.url.pathname) goto(startup);
+    // goto rejects a path that is no route (since SvelteKit 3); a stored view
+    // from an older build then just leaves the app where it is.
+    if (startup && startup !== page.url.pathname) goto(startup).catch(() => {});
   });
 
   // Reflect what's playing in the native window title (also shown on the
@@ -187,7 +193,7 @@
         <button
           class="border-t border-red-900 bg-red-950 px-4 py-1.5 text-left text-xs text-red-300"
           data-testid="player-error"
-          onclick={() => (player.error = null)}
+          onclick={() => player.error = null}
           title={m.dismiss()}
         >
           {player.error}

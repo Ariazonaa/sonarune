@@ -1,14 +1,14 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { apiDiscovery, type CollectionDto } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
-  import type { Page } from "$lib/types";
+  import { apiDiscovery, type CollectionDto } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { library } from "#lib/state/library.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
+  import type { Page } from "#lib/types.js";
 
   const PAGE_SIZE = 100;
   const cached = swrGet<Page<CollectionDto>>("collections");

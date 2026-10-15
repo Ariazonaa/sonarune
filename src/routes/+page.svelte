@@ -2,21 +2,21 @@
   import { onMount, untrack } from "svelte";
   import { page } from "$app/state";
   import { VList } from "virtua/svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import AlphabetRail from "$lib/components/AlphabetRail.svelte";
-  import Cover from "$lib/components/Cover.svelte";
-  import NewContentPill from "$lib/components/NewContentPill.svelte";
-  import AlbumContextMenu from "$lib/components/AlbumContextMenu.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { startDrag } from "$lib/dragToPlaylist";
-  import { library } from "$lib/state/library.svelte";
-  import { createAlbumMenu } from "$lib/state/albumMenu.svelte";
-  import { layoutPreferences } from "$lib/state/layout.svelte";
-  import { contextMenuKey } from "$lib/menu";
-  import type { AlbumDto, GenreDto } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import AlphabetRail from "#lib/components/AlphabetRail.svelte";
+  import Cover from "#lib/components/Cover.svelte";
+  import NewContentPill from "#lib/components/NewContentPill.svelte";
+  import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { startDrag } from "#lib/dragToPlaylist.js";
+  import { library } from "#lib/state/library.svelte.js";
+  import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
+  import { layoutPreferences } from "#lib/state/layout.svelte.js";
+  import { contextMenuKey } from "#lib/menu.js";
+  import type { AlbumDto, GenreDto } from "#lib/types.js";
 
   const am = createAlbumMenu();
 

@@ -1,15 +1,15 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import AlbumContextMenu from "$lib/components/AlbumContextMenu.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { createAlbumMenu } from "$lib/state/albumMenu.svelte";
-  import { contextMenuKey } from "$lib/menu";
-  import type { AlbumDto } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { library } from "#lib/state/library.svelte.js";
+  import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
+  import { contextMenuKey } from "#lib/menu.js";
+  import type { AlbumDto } from "#lib/types.js";
 
   const am = createAlbumMenu();
   const PAGE = 60;

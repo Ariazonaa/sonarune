@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import { portal } from "$lib/portal";
-  import type { TrackInfoDto } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { portal } from "#lib/portal.js";
+  import type { TrackInfoDto } from "#lib/types.js";
 
   let {
     itemId,

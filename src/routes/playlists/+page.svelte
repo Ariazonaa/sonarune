@@ -1,19 +1,19 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
-  import { apiLibrary } from "$lib/api/library";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import ContextMenu, { type ContextMenuItem } from "$lib/components/ContextMenu.svelte";
-  import { contextMenuKey } from "$lib/menu";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { player } from "$lib/state/player.svelte";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
+  import { contextMenuKey } from "#lib/menu.js";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { library } from "#lib/state/library.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
   // Aliased: this file has its own `playlists` — the list it renders.
-  import { playlists as playlistStore } from "$lib/state/playlists.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { confirm } from "$lib/state/confirm.svelte";
-  import type { PlaylistDto } from "$lib/types";
+  import { playlists as playlistStore } from "#lib/state/playlists.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { confirm } from "#lib/state/confirm.svelte.js";
+  import type { PlaylistDto } from "#lib/types.js";
 
   let playlists = $state<PlaylistDto[] | null>(null);
   let error = $state<string | null>(null);

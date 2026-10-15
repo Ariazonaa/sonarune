@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { coverUrl } from "$lib/api";
-  import { blurhashToDataUrl } from "$lib/blurhash";
+  import { coverUrl } from "#lib/api.js";
+  import { blurhashToDataUrl } from "#lib/blurhash.js";
 
   let {
     itemId,

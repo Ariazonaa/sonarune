@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { apiDiscovery } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import DiscoveryTrackCard from "$lib/components/DiscoveryTrackCard.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
-  import type { Page, TrackDto } from "$lib/types";
+  import { apiDiscovery } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import DiscoveryTrackCard from "#lib/components/DiscoveryTrackCard.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
+  import type { Page, TrackDto } from "#lib/types.js";
 
   const PAGE_SIZE = 60;
   let tracks = $state<TrackDto[]>(swrGet<Page<TrackDto>>("discover:all:mixes")?.items ?? []);

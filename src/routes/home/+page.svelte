@@ -1,20 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "$lib/api";
-  import { apiLibrary } from "$lib/api/library";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import AlbumContextMenu from "$lib/components/AlbumContextMenu.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { createAlbumMenu } from "$lib/state/albumMenu.svelte";
-  import { homeRows, type HomeRowId } from "$lib/state/homeRows.svelte";
-  import { startDrag } from "$lib/dragToPlaylist";
-  import { contextMenuKey } from "$lib/menu";
-  import { swrGet, swrSet } from "$lib/swr";
-  import type { AlbumDto, HomeData } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { library } from "#lib/state/library.svelte.js";
+  import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
+  import { homeRows, type HomeRowId } from "#lib/state/homeRows.svelte.js";
+  import { startDrag } from "#lib/dragToPlaylist.js";
+  import { contextMenuKey } from "#lib/menu.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
+  import type { AlbumDto, HomeData } from "#lib/types.js";
 
   const am = createAlbumMenu();
 

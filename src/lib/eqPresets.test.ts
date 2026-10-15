@@ -8,7 +8,7 @@ import {
   sanitizeGains,
   saveCustomPreset,
   type EqPreset,
-} from "$lib/eqPresets";
+} from "#lib/eqPresets.js";
 
 const flat = Array(10).fill(0);
 const warm = [4, 3, 2, 1, 0, 0, -1, -1, 0, 1];

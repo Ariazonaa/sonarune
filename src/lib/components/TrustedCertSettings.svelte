@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import { getLocale } from "$lib/paraglide/runtime";
-  import { confirm } from "$lib/state/confirm.svelte";
-  import { session } from "$lib/state/session.svelte";
-  import type { TrustedCert } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { getLocale } from "#lib/paraglide/runtime.js";
+  import { confirm } from "#lib/state/confirm.svelte.js";
+  import { session } from "#lib/state/session.svelte.js";
+  import type { TrustedCert } from "#lib/types.js";
 
   let certs = $state<TrustedCert[] | null>(null);
   let error = $state<string | null>(null);

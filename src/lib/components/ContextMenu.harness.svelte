@@ -3,7 +3,7 @@
      keyboard. Alpha and Charlie are disabled. -->
 <script lang="ts">
   import ContextMenu, { type ContextMenuItem } from "./ContextMenu.svelte";
-  import { contextMenuKey } from "$lib/menu";
+  import { contextMenuKey } from "#lib/menu.js";
 
   let { onpick = () => {} }: { onpick?: (label: string) => void } = $props();
 

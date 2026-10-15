@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { formatDuration } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import { player } from "$lib/state/player.svelte";
+  import { formatDuration } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { player } from "#lib/state/player.svelte.js";
   import SeekBar from "./SeekBar.svelte";
 
   interface Props {

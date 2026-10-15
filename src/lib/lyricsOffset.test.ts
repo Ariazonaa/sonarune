@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { loadLyricsOffset, lyricsOffsetKey, saveLyricsOffset } from "$lib/lyricsOffset";
+import { loadLyricsOffset, lyricsOffsetKey, saveLyricsOffset } from "#lib/lyricsOffset.js";
 
 beforeEach(() => localStorage.clear());
 

@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import { getLocale, setLocale } from "$lib/paraglide/runtime";
-  import { player } from "$lib/state/player.svelte";
-  import { session } from "$lib/state/session.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { confirm } from "$lib/state/confirm.svelte";
-  import { syncTrayLabels } from "$lib/tray";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { getLocale, setLocale } from "#lib/paraglide/runtime.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { session } from "#lib/state/session.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { confirm } from "#lib/state/confirm.svelte.js";
+  import { syncTrayLabels } from "#lib/tray.js";
   import {
     deleteCustomPreset,
     loadCustomPresets,
@@ -18,11 +18,11 @@
     sameGains,
     saveCustomPreset,
     type EqPreset,
-  } from "$lib/eqPresets";
-  import ShortcutSettings from "$lib/components/ShortcutSettings.svelte";
-  import LayoutSettings from "$lib/components/LayoutSettings.svelte";
-  import TrustedCertSettings from "$lib/components/TrustedCertSettings.svelte";
-  import UpdateSettings from "$lib/components/UpdateSettings.svelte";
+  } from "#lib/eqPresets.js";
+  import ShortcutSettings from "#lib/components/ShortcutSettings.svelte";
+  import LayoutSettings from "#lib/components/LayoutSettings.svelte";
+  import TrustedCertSettings from "#lib/components/TrustedCertSettings.svelte";
+  import UpdateSettings from "#lib/components/UpdateSettings.svelte";
   import {
     ACCENTS,
     applyTheme,
@@ -30,7 +30,7 @@
     loadTheme,
     type AccentOption,
     type ThemeSettings,
-  } from "$lib/theme";
+  } from "#lib/theme.js";
   import type {
     AudioDeviceSnapshot,
     CacheInfo,
@@ -38,7 +38,7 @@
     DspParams,
     ExtrasSettings,
     PlaybackSettings,
-  } from "$lib/types";
+  } from "#lib/types.js";
 
   // Language names are shown in their own language on purpose.
   const LOCALES = [

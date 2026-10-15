@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
-  import type { GenreDto } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { library } from "#lib/state/library.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
+  import type { GenreDto } from "#lib/types.js";
 
   let genres = $state<GenreDto[] | null>(swrGet<GenreDto[]>("genres") ?? null);
   let error = $state<string | null>(null);

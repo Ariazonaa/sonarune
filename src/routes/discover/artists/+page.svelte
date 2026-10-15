@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "$lib/api";
-  import { apiDiscovery, type SimilarArtistsRow } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import DiscoveryArtistCard from "$lib/components/DiscoveryArtistCard.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
+  import { api } from "#lib/api.js";
+  import { apiDiscovery, type SimilarArtistsRow } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import DiscoveryArtistCard from "#lib/components/DiscoveryArtistCard.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
 
   let row = $state<SimilarArtistsRow | null>(
     swrGet<SimilarArtistsRow>("discover:all:artists") ?? null,

@@ -1,19 +1,19 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { VList } from "virtua/svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import AlphabetRail from "$lib/components/AlphabetRail.svelte";
-  import Cover from "$lib/components/Cover.svelte";
-  import NewContentPill from "$lib/components/NewContentPill.svelte";
-  import ContextMenu, { type ContextMenuItem } from "$lib/components/ContextMenu.svelte";
-  import { contextMenuKey } from "$lib/menu";
-  import { apiLibrary } from "$lib/api/library";
-  import { player } from "$lib/state/player.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { layoutPreferences } from "$lib/state/layout.svelte";
-  import type { ArtistDto } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import AlphabetRail from "#lib/components/AlphabetRail.svelte";
+  import Cover from "#lib/components/Cover.svelte";
+  import NewContentPill from "#lib/components/NewContentPill.svelte";
+  import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
+  import { contextMenuKey } from "#lib/menu.js";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { library } from "#lib/state/library.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { layoutPreferences } from "#lib/state/layout.svelte.js";
+  import type { ArtistDto } from "#lib/types.js";
 
   let artistMenu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   function openArtistMenu(e: MouseEvent, artist: ArtistDto) {

@@ -1,17 +1,17 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { page } from "$app/state";
-  import { api } from "$lib/api";
-  import { apiLibrary } from "$lib/api/library";
-  import { m } from "$lib/paraglide/messages";
-  import BrandMark from "$lib/components/BrandMark.svelte";
-  import SyncStatus from "$lib/components/SyncStatus.svelte";
-  import { layoutPreferences } from "$lib/state/layout.svelte";
-  import { playlists } from "$lib/state/playlists.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { isOurDrag, readDrag } from "$lib/dragToPlaylist";
-  import type { PlaylistDto } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import BrandMark from "#lib/components/BrandMark.svelte";
+  import SyncStatus from "#lib/components/SyncStatus.svelte";
+  import { layoutPreferences } from "#lib/state/layout.svelte.js";
+  import { playlists } from "#lib/state/playlists.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { isOurDrag, readDrag } from "#lib/dragToPlaylist.js";
+  import type { PlaylistDto } from "#lib/types.js";
 
   const links = [
     {

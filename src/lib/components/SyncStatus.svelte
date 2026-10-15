@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { m } from "$lib/paraglide/messages";
-  import { library } from "$lib/state/library.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import { library } from "#lib/state/library.svelte.js";
 
   // Re-tick so the "synced X ago" label ages without a new sync event.
   let now = $state(Date.now());

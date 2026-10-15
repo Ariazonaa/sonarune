@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AlbumDto, ArtistDto, GenreDto, Page, TrackDto } from "$lib/types";
+import type { AlbumDto, ArtistDto, GenreDto, Page, TrackDto } from "#lib/types.js";
 
 export interface DiscoverRow<T> {
   items: T[];

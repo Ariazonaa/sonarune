@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeFrame, resampleInterleaved, toMono, toStereo } from "$lib/visualizer/pcm";
+import { decodeFrame, resampleInterleaved, toMono, toStereo } from "#lib/visualizer/pcm.js";
 
 /** A frame exactly as src-tauri/src/player/tap.rs encodes it. */
 function frame(sampleRate: number, channels: number, samples: number[]): ArrayBuffer {

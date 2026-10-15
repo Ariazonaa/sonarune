@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import { apiLibrary } from "$lib/api/library";
-  import { m } from "$lib/paraglide/messages";
-  import { portal } from "$lib/portal";
-  import type { PlaylistDto, PlaylistTrackDto } from "$lib/types";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { portal } from "#lib/portal.js";
+  import type { PlaylistDto, PlaylistTrackDto } from "#lib/types.js";
 
   let {
     sourcePlaylistId,

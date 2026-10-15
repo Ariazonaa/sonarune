@@ -1,5 +1,5 @@
-import { api } from "$lib/api";
-import { m } from "$lib/paraglide/messages";
+import { api } from "#lib/api.js";
+import { m } from "#lib/paraglide/messages.js";
 
 /** Keep the native tray menu localized with the same Paraglide messages as
  * the WebView. Safe to call repeatedly; Rust only updates changed labels. */

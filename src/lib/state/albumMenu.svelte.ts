@@ -1,9 +1,9 @@
-import { api } from "$lib/api";
-import { apiLibrary } from "$lib/api/library";
-import { player } from "$lib/state/player.svelte";
-import { albumMenuItems } from "$lib/albumMenu";
-import type { ContextMenuItem } from "$lib/components/ContextMenu.svelte";
-import type { AlbumDto } from "$lib/types";
+import { api } from "#lib/api.js";
+import { apiLibrary } from "#lib/api/library.js";
+import { player } from "#lib/state/player.svelte.js";
+import { albumMenuItems } from "#lib/albumMenu.js";
+import type { ContextMenuItem } from "#lib/components/ContextMenu.svelte";
+import type { AlbumDto } from "#lib/types.js";
 
 type MenuState = { x: number; y: number; items: ContextMenuItem[] } | null;
 type AddToState = { x: number; y: number; trackIds: string[] } | null;

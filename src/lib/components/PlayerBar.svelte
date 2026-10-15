@@ -2,9 +2,9 @@
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
-  import { player } from "$lib/state/player.svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
+  import { player } from "#lib/state/player.svelte.js";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
   import Cover from "./Cover.svelte";
   import PlaybackProgress from "./PlaybackProgress.svelte";
   import Popover from "./Popover.svelte";

@@ -1,14 +1,14 @@
 import { goto } from "$app/navigation";
-import { api } from "$lib/api";
-import { apiLibrary } from "$lib/api/library";
-import { m } from "$lib/paraglide/messages";
-import { confirm } from "$lib/state/confirm.svelte";
-import { downloads } from "$lib/state/downloads.svelte";
-import { player } from "$lib/state/player.svelte";
-import { session } from "$lib/state/session.svelte";
-import { toast } from "$lib/state/toast.svelte";
-import type { ContextMenuItem } from "$lib/components/ContextMenu.svelte";
-import type { TrackDto } from "$lib/types";
+import { api } from "#lib/api.js";
+import { apiLibrary } from "#lib/api/library.js";
+import { m } from "#lib/paraglide/messages.js";
+import { confirm } from "#lib/state/confirm.svelte.js";
+import { downloads } from "#lib/state/downloads.svelte.js";
+import { player } from "#lib/state/player.svelte.js";
+import { session } from "#lib/state/session.svelte.js";
+import { toast } from "#lib/state/toast.svelte.js";
+import type { ContextMenuItem } from "#lib/components/ContextMenu.svelte";
+import type { TrackDto } from "#lib/types.js";
 
 export const TRACK_ICON = {
   play: "M8 5v14l11-7L8 5z",

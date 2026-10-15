@@ -3,18 +3,18 @@
   import { VList } from "virtua/svelte";
   import { afterNavigate, goto } from "$app/navigation";
   import { page } from "$app/state";
-  import { api, formatDuration } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import ContextMenu, { type ContextMenuItem } from "$lib/components/ContextMenu.svelte";
-  import AddToPlaylistMenu from "$lib/components/AddToPlaylistMenu.svelte";
-  import SongInfo from "$lib/components/SongInfo.svelte";
-  import MetadataEditor from "$lib/components/MetadataEditor.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { contextMenuKey, menuPoint } from "$lib/menu";
-  import { trackMenuItems } from "$lib/trackMenu";
-  import { player } from "$lib/state/player.svelte";
-  import type { AlbumDto, ArtistDto, SearchKind, SearchPage, TrackDto } from "$lib/types";
+  import { api, formatDuration } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
+  import AddToPlaylistMenu from "#lib/components/AddToPlaylistMenu.svelte";
+  import SongInfo from "#lib/components/SongInfo.svelte";
+  import MetadataEditor from "#lib/components/MetadataEditor.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { contextMenuKey, menuPoint } from "#lib/menu.js";
+  import { trackMenuItems } from "#lib/trackMenu.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import type { AlbumDto, ArtistDto, SearchKind, SearchPage, TrackDto } from "#lib/types.js";
 
   let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
@@ -26,10 +26,10 @@
   const PAGE_SIZE = 100;
   const LOAD_AHEAD_PX = 1_000;
 
-  type SearchItem =
-    | { kind: "artists"; value: ArtistDto }
-    | { kind: "albums"; value: AlbumDto }
-    | { kind: "tracks"; value: TrackDto };
+  type SearchItem = 
+    { kind: "artists"; value: ArtistDto } |
+    { kind: "albums"; value: AlbumDto } |
+    { kind: "tracks"; value: TrackDto };
 
   let term = $state("");
   let kind = $state<SearchKind>("tracks");
@@ -71,7 +71,8 @@
     };
   });
 
-  afterNavigate(() => {
+  afterNavigate(({ shallow, type }) => {
+    if (shallow && type === 'goto') return;
     if (mounted) applyUrl();
   });
 
@@ -92,12 +93,14 @@
   }
 
   function syncUrl(query: string, nextKind: SearchKind, replaceState: boolean) {
-    const url = new URL(page.url);
+    // page.url is readonly since SvelteKit 3: mutate a copy.
+    const url = new URL(page.url.href);
     if (query) url.searchParams.set("q", query);
     else url.searchParams.delete("q");
     url.searchParams.set("type", nextKind);
     if (url.href === page.url.href) return;
-    goto(url, { replaceState, noScroll: true, keepFocus: true });
+    // reset: false keeps scroll position and focus (the input being typed in).
+    goto(url, { replace: replaceState, reset: false });
   }
 
   function rememberSearch(query: string) {
@@ -265,9 +268,9 @@
       y,
       items: trackMenuItems([track], {
         play: { run: () => void playTrack(track) },
-        addToPlaylist: (tracks) => (addTo = { x, y, trackIds: tracks.map((t) => t.id) }),
-        info: (t) => (info = { itemId: t.id, name: t.name, playCount: t.playCount }),
-        edit: (t) => (edit = { itemId: t.id, name: t.name }),
+        addToPlaylist: (tracks) => addTo = { x, y, trackIds: tracks.map((t) => t.id) },
+        info: (t) => info = { itemId: t.id, name: t.name, playCount: t.playCount },
+        edit: (t) => edit = { itemId: t.id, name: t.name }
         // No delete: a result list that pages in as you scroll cannot show
         // honestly what is left after one, and the library pages can.
       }),
@@ -341,10 +344,8 @@
   {#if error}
     <button
       class="mt-4 shrink-0 rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-left text-sm text-red-300"
-      onclick={() => (error = null)}
-    >
-      {m.error_generic({ message: error })}
-    </button>
+      onclick={() => error = null}
+    >{m.error_generic({ message: error })}</button>
   {/if}
 
   {#if showHistory}
@@ -390,7 +391,7 @@
               if (item.kind === "tracks") onTrackContextMenu(event, item.value);
             }}
             {@attach contextMenuKey}
-            onmouseenter={() => (selectedIndex = index)}
+            onmouseenter={() => selectedIndex = index}
           >
             <div class="h-14 w-14 shrink-0 overflow-hidden {item.kind === 'artists' ? 'rounded-full' : 'rounded-md'}">
               {#if item.kind === "artists"}
@@ -426,19 +427,33 @@
 </div>
 
 {#if menu}
-  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
+  <ContextMenu
+    x={menu.x}
+    y={menu.y}
+    items={menu.items}
+    onclose={() => menu = null}
+  />
 {/if}
 {#if addTo}
-  <AddToPlaylistMenu x={addTo.x} y={addTo.y} trackIds={addTo.trackIds} onclose={() => (addTo = null)} />
+  <AddToPlaylistMenu
+    x={addTo.x}
+    y={addTo.y}
+    trackIds={addTo.trackIds}
+    onclose={() => addTo = null}
+  />
 {/if}
 {#if info}
   <SongInfo
     itemId={info.itemId}
     name={info.name}
     playCount={info.playCount}
-    onclose={() => (info = null)}
+    onclose={() => info = null}
   />
 {/if}
 {#if edit}
-  <MetadataEditor itemId={edit.itemId} displayName={edit.name} onclose={() => (edit = null)} />
+  <MetadataEditor
+    itemId={edit.itemId}
+    displayName={edit.name}
+    onclose={() => edit = null}
+  />
 {/if}

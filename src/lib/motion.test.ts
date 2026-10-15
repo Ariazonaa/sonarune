@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FLIP_ROW_LIMIT, listFlip, uniqueRowKeys } from "$lib/motion";
+import { FLIP_ROW_LIMIT, listFlip, uniqueRowKeys } from "#lib/motion.js";
 
 const rects = {
   from: { left: 0, top: 0, width: 100, height: 20 } as DOMRect,

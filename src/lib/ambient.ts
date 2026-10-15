@@ -4,7 +4,7 @@
  * untainted.
  */
 
-import type { CoverHue } from "$lib/theme";
+import type { CoverHue } from "#lib/theme.js";
 
 export interface AmbientColors {
   /** Two dark backdrop colors (lightness clamped to 15–35 %). */

@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import type { ArtistDto } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import type { ArtistDto } from "#lib/types.js";
 
   let { artist }: { artist: ArtistDto } = $props();
 </script>

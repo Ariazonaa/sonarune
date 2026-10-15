@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { pickAccent } from "$lib/ambient";
+import { pickAccent } from "#lib/ambient.js";
 import {
   ACCENT_CHANGED,
   applyTheme,
@@ -8,7 +8,7 @@ import {
   DEFAULT_THEME,
   hexLuminance,
   setCoverHue,
-} from "$lib/theme";
+} from "#lib/theme.js";
 
 // --color-base in app.css. Keep in sync: the contrast assertions below are
 // only meaningful against the background the app actually paints.
@@ -101,7 +101,7 @@ describe("setCoverHue", () => {
     localStorage.setItem("sonarune.coverAccent.v2", JSON.stringify(stored));
     // A fresh module: its import-time initTheme() runs before any cover is known.
     vi.resetModules();
-    const fresh = await import("$lib/theme");
+    const fresh = await import("#lib/theme.js");
     expect(accentVar()).toBe("#123456");
     expect(document.documentElement.style.getPropertyValue("--color-on-accent")).toBe("#ffffff");
 

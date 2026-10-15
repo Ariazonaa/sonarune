@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { m } from "$lib/paraglide/messages";
-  import { player } from "$lib/state/player.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import { player } from "#lib/state/player.svelte.js";
 
   interface Props {
     /** "lg" is the now-playing view's larger transport. */

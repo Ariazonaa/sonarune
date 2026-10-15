@@ -1,7 +1,7 @@
 <script lang="ts">
   import ContextMenu from "./ContextMenu.svelte";
   import AddToPlaylistMenu from "./AddToPlaylistMenu.svelte";
-  import type { AlbumMenu } from "$lib/state/albumMenu.svelte";
+  import type { AlbumMenu } from "#lib/state/albumMenu.svelte.js";
 
   let { menu }: { menu: AlbumMenu } = $props();
 </script>

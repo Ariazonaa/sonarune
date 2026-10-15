@@ -1,6 +1,6 @@
 import { flushSync, mount, tick, unmount } from "svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import Harness from "$lib/components/Popover.harness.svelte";
+import Harness from "#lib/components/Popover.harness.svelte";
 
 // The popover renders itself into <body> (see portal.ts) because every glass
 // surface is a containing block for position: fixed. Moving a node out of

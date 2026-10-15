@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
-  import { ACCENT_CHANGED } from "$lib/theme";
-  import { decodeFrame, toMono } from "$lib/visualizer/pcm";
+  import { ACCENT_CHANGED } from "#lib/theme.js";
+  import { decodeFrame, toMono } from "#lib/visualizer/pcm.js";
 
   // A lightweight spectrum analyzer. Subscribes to the same Rust PCM tap the
   // visualizer uses (multi-subscriber, so both can run) and draws a log-spaced

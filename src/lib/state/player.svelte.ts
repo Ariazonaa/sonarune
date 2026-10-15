@@ -1,15 +1,15 @@
 import { listen } from "@tauri-apps/api/event";
-import { api } from "$lib/api";
-import { apiLibrary } from "$lib/api/library";
-import { net } from "$lib/state/net.svelte";
-import { toast } from "$lib/state/toast.svelte";
-import { m } from "$lib/paraglide/messages";
+import { api } from "#lib/api.js";
+import { apiLibrary } from "#lib/api/library.js";
+import { net } from "#lib/state/net.svelte.js";
+import { toast } from "#lib/state/toast.svelte.js";
+import { m } from "#lib/paraglide/messages.js";
 import type {
   AudioOutputFallbackEvent,
   PlayerState,
   QueueSnapshot,
   WaveformEvent,
-} from "$lib/types";
+} from "#lib/types.js";
 
 /** Waveforms kept in the UI: the current track, the prefetched next one, and
  *  a few recent ones for skipping back. */

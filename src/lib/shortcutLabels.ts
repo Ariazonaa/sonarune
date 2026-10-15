@@ -1,5 +1,5 @@
-import { m } from "$lib/paraglide/messages";
-import type { ShortcutAction } from "$lib/state/shortcuts.svelte";
+import { m } from "#lib/paraglide/messages.js";
+import type { ShortcutAction } from "#lib/state/shortcuts.svelte.js";
 
 export function shortcutActionLabel(action: ShortcutAction): string {
   switch (action) {

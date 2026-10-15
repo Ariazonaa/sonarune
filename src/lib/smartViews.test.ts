@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { SmartFilter } from "$lib/api/discovery";
-import type { SessionInfo } from "$lib/types";
+import type { SmartFilter } from "#lib/api/discovery.js";
+import type { SessionInfo } from "#lib/types.js";
 import {
   cloneSmartFilter,
   emptySmartFilter,

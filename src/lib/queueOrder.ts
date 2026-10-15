@@ -1,4 +1,4 @@
-import type { QueueSnapshot, QueueTrack } from "$lib/types";
+import type { QueueSnapshot, QueueTrack } from "#lib/types.js";
 
 /** A queue entry in play order. `index` is its stored queue position — what
  *  jump and remove take; its position in the list is what `queueMove` takes. */

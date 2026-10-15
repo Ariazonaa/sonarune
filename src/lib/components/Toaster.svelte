@@ -1,7 +1,7 @@
 <script lang="ts">
   import { fly } from "svelte/transition";
-  import { m } from "$lib/paraglide/messages";
-  import { toast, type ToastKind } from "$lib/state/toast.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import { toast, type ToastKind } from "#lib/state/toast.svelte.js";
 
   // 24x24 paths: check, info circle, warning triangle.
   const ICONS: Record<ToastKind, string> = {

@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { m } from "$lib/paraglide/messages";
-  import { portal } from "$lib/portal";
-  import type { PlaylistTrackDto } from "$lib/types";
+  import { m } from "#lib/paraglide/messages.js";
+  import { portal } from "#lib/portal.js";
+  import type { PlaylistTrackDto } from "#lib/types.js";
 
   let {
     tracks,

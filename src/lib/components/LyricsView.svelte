@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
   import EmptyState from "./EmptyState.svelte";
-  import { lyrics as lyricsStore } from "$lib/state/lyrics.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import type { LyricLineDto } from "$lib/types";
+  import { lyrics as lyricsStore } from "#lib/state/lyrics.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import type { LyricLineDto } from "#lib/types.js";
 
   let { variant }: { variant: "panel" | "fullscreen" } = $props();
 

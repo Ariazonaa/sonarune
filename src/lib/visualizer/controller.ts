@@ -1,5 +1,5 @@
 import { VisualizerEngine, type EnergyLevel, type EnergyState } from "./engine";
-import { m } from "$lib/paraglide/messages";
+import { m } from "#lib/paraglide/messages.js";
 import {
   blankPreset,
   loadAdditionalPresetPacks,

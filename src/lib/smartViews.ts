@@ -1,5 +1,5 @@
-import type { SmartFilter } from "$lib/api/discovery";
-import type { SessionInfo } from "$lib/types";
+import type { SmartFilter } from "#lib/api/discovery.js";
+import type { SessionInfo } from "#lib/types.js";
 
 export interface SavedSmartView {
   id: string;

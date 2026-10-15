@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { formatDuration } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import { player } from "$lib/state/player.svelte";
+  import { formatDuration } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import { player } from "#lib/state/player.svelte.js";
 
   const s = $derived(player.state);
   const playing = $derived(s.status === "playing" || s.status === "loading");

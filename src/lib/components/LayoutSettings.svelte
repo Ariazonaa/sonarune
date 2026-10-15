@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { m } from "$lib/paraglide/messages";
-  import { layoutPreferences, type CardSize, type ViewDensity } from "$lib/state/layout.svelte";
-  import { homeRows, type HomeRowId } from "$lib/state/homeRows.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import { layoutPreferences, type CardSize, type ViewDensity } from "#lib/state/layout.svelte.js";
+  import { homeRows, type HomeRowId } from "#lib/state/homeRows.svelte.js";
 
   const current = $derived(layoutPreferences.active);
 

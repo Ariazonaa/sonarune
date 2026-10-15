@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { api } from "$lib/api";
+import { api } from "#lib/api.js";
 
 /**
  * Tracks server-side music-library changes and the background sync status.

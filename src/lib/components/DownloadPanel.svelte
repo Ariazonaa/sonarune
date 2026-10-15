@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { m } from "$lib/paraglide/messages";
-  import { downloads } from "$lib/state/downloads.svelte";
-  import type { DownloadTask } from "$lib/types";
+  import { m } from "#lib/paraglide/messages.js";
+  import { downloads } from "#lib/state/downloads.svelte.js";
+  import type { DownloadTask } from "#lib/types.js";
 
   onMount(() => {
     downloads.init();

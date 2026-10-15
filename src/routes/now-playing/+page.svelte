@@ -1,21 +1,21 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import CoverBackdrop from "$lib/components/CoverBackdrop.svelte";
-  import ArtistLinks from "$lib/components/ArtistLinks.svelte";
-  import SpectrumBar from "$lib/components/SpectrumBar.svelte";
-  import LyricsView from "$lib/components/LyricsView.svelte";
-  import PlaybackProgress from "$lib/components/PlaybackProgress.svelte";
-  import TransportControls from "$lib/components/TransportControls.svelte";
-  import { api, coverUrl } from "$lib/api";
-  import { ambientColors, type AmbientColors } from "$lib/ambient";
-  import { isModalOpen } from "$lib/modal";
-  import { nextEntries } from "$lib/queueOrder";
-  import { lyrics } from "$lib/state/lyrics.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { VisualizerController } from "$lib/visualizer/controller";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import CoverBackdrop from "#lib/components/CoverBackdrop.svelte";
+  import ArtistLinks from "#lib/components/ArtistLinks.svelte";
+  import SpectrumBar from "#lib/components/SpectrumBar.svelte";
+  import LyricsView from "#lib/components/LyricsView.svelte";
+  import PlaybackProgress from "#lib/components/PlaybackProgress.svelte";
+  import TransportControls from "#lib/components/TransportControls.svelte";
+  import { api, coverUrl } from "#lib/api.js";
+  import { ambientColors, type AmbientColors } from "#lib/ambient.js";
+  import { isModalOpen } from "#lib/modal.js";
+  import { nextEntries } from "#lib/queueOrder.js";
+  import { lyrics } from "#lib/state/lyrics.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { VisualizerController } from "#lib/visualizer/controller.js";
 
   const MODES = ["ambient", "cover", "visualizer"] as const;
   type BackdropMode = (typeof MODES)[number];

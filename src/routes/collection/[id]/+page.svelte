@@ -1,14 +1,14 @@
 <script lang="ts">
   import { page } from "$app/state";
-  import { apiDiscovery, type CollectionDetail } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import LibraryAlbumCard from "$lib/components/LibraryAlbumCard.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
+  import { apiDiscovery, type CollectionDetail } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import LibraryAlbumCard from "#lib/components/LibraryAlbumCard.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { library } from "#lib/state/library.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
 
   let detail = $state<CollectionDetail | null>(null);
   let error = $state<string | null>(null);

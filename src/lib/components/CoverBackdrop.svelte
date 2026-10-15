@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { coverUrl } from "$lib/api";
+  import { coverUrl } from "#lib/api.js";
 
   /**
    * A blurred copy of a cover behind a hero area. Place it as the first child
