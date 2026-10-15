@@ -200,12 +200,38 @@ export interface PlaybackSettings {
   crossfadeMode: "off" | "smart" | "always";
   crossfadeSeconds: number;
   outputDevice: string | null;
+  /** Land crossfades on the beat (needs both tracks analysed). */
+  beatTransitions: boolean;
+}
+
+export interface MusicalKey {
+  /** Pitch class of the tonic, 0 = C … 11 = B. */
+  tonic: number;
+  minor: boolean;
+}
+
+/** Tempo and key of a track, analysed locally while it played. */
+export interface TrackAnalysisInfo {
+  itemId: string;
+  bpm: number | null;
+  /** Camelot code ("8A"). */
+  camelot: string | null;
+  key: MusicalKey | null;
 }
 
 export interface AudioDeviceSnapshot {
   devices: string[];
   /** Requested output currently routed through the system default. */
   fallbackDevice: string | null;
+  /** The device the output actually plays through right now. */
+  activeDevice: string | null;
+}
+
+/** Sound settings remembered per output device (see audio_profiles.rs). */
+export interface AudioProfilesInfo {
+  enabled: boolean;
+  activeDevice: string | null;
+  devices: string[];
 }
 
 export interface AudioOutputFallbackEvent {

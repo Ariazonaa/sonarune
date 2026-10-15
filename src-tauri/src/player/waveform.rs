@@ -7,7 +7,11 @@
 //! (through its own handle, see `source.rs`) and folds it into [`BUCKETS`]
 //! peak values. Live transcodes without a length get no waveform, just as
 //! they get no buffered range.
+//!
+//! The same pass feeds the tempo/key analysis (`analysis.rs`), so a track is
+//! decoded once for both.
 
+use super::analysis::{AnalysisCache, Analyzer, TrackAnalysis};
 use rodio::Source;
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
@@ -22,6 +26,8 @@ const CACHE_TRACKS: usize = 64;
 
 /// Called from the analysis thread with the item id and its peaks.
 pub type WaveformNotify = Arc<dyn Fn(&str, &[u8]) + Send + Sync>;
+/// Called from the analysis thread with the item id and its analysis.
+pub type AnalysisNotify = Arc<dyn Fn(&str, &TrackAnalysis) + Send + Sync>;
 
 /// Peaks of recently analysed tracks, plus the ones being analysed right now
 /// — the same track is opened more than once (prefetch, replay, seek) and
@@ -42,9 +48,10 @@ impl WaveformCache {
             .map(|(_, peaks)| peaks.clone())
     }
 
-    /// Claim the analysis of `item_id`; false when it is cached or running.
-    fn begin(&self, item_id: &str) -> bool {
-        if self.get(item_id).is_some() {
+    /// Claim the analysis of `item_id`; false when it is running, or cached
+    /// and not `needed` anyway (the tempo analysis may still be missing).
+    fn begin(&self, item_id: &str, needed: bool) -> bool {
+        if !needed && self.get(item_id).is_some() {
             return false;
         }
         self.running.lock().unwrap().insert(item_id.to_string())
@@ -68,6 +75,16 @@ impl WaveformCache {
 pub struct WaveformRequest {
     pub cache: Arc<WaveformCache>,
     pub notify: WaveformNotify,
+    pub analyses: Arc<AnalysisCache>,
+    pub analysis_notify: AnalysisNotify,
+}
+
+impl WaveformRequest {
+    /// Whether opening `item_id` from its start should arm a job.
+    pub fn wanted(&self, item_id: &str, duration_ms: u64) -> bool {
+        self.cache.get(item_id).is_none()
+            || self.analyses.get_matching(item_id, duration_ms).is_none()
+    }
 }
 
 /// One track's pending analysis, armed by the open and fired by the download
@@ -85,7 +102,12 @@ impl WaveformJob {
     /// Start the analysis on its own thread. Never blocks the caller (the
     /// download task) beyond taking the file handle.
     pub fn start(self) {
-        if !self.request.cache.begin(&self.item_id) {
+        let analysis_missing = self
+            .request
+            .analyses
+            .get_matching(&self.item_id, self.duration_ms)
+            .is_none();
+        if !self.request.cache.begin(&self.item_id, analysis_missing) {
             return;
         }
         let Some(file) = self.file.lock().unwrap().take() else {
@@ -106,12 +128,19 @@ impl WaveformJob {
                 move || {
                     // A decoder panicking on a malformed file must still
                     // close the job, or the track stays marked as in progress.
-                    let peaks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        analyse(file, duration_ms)
-                    }))
-                    .ok()
-                    .flatten()
-                    .map(Arc::new);
+                    let (peaks, analysis) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            analyse(file, duration_ms)
+                        }))
+                        .ok()
+                        .flatten()
+                        .map_or((None, None), |(peaks, analysis)| {
+                            (Some(Arc::new(peaks)), Some(analysis))
+                        });
+                    if let Some(analysis) = analysis {
+                        let analysis = request.analyses.put(&item_id, analysis);
+                        (request.analysis_notify)(&item_id, &analysis);
+                    }
                     // Cache first: a UI that asks right after the event
                     // must find it.
                     request.cache.finish(&item_id, peaks.clone());
@@ -127,10 +156,10 @@ impl WaveformJob {
     }
 }
 
-/// Decode a completely downloaded stream and fold it into peaks. Uses the
-/// same decoder choice as playback: libopus for Ogg-Opus, Symphonia for the
-/// rest.
-fn analyse(mut file: File, duration_ms: u64) -> Option<Vec<u8>> {
+/// Decode a completely downloaded stream and fold it into peaks and the
+/// tempo/key analysis. Uses the same decoder choice as playback: libopus for
+/// Ogg-Opus, Symphonia for the rest.
+fn analyse(mut file: File, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)> {
     file.seek(SeekFrom::Start(0)).ok()?;
     let len = file.metadata().ok()?.len();
     let reader = BufReader::new(file);
@@ -148,7 +177,7 @@ fn analyse(mut file: File, duration_ms: u64) -> Option<Vec<u8>> {
     }
 }
 
-fn fold<S: Source>(source: S, duration_ms: u64) -> Option<Vec<u8>> {
+fn fold<S: Source>(source: S, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)> {
     let channels = usize::from(source.channels().get());
     let rate = u64::from(source.sample_rate().get());
     // The seek bar spans the server's duration, so the buckets do too.
@@ -158,7 +187,13 @@ fn fold<S: Source>(source: S, duration_ms: u64) -> Option<Vec<u8>> {
         source.total_duration()?.as_millis() as u64
     };
     let total_frames = duration_ms.saturating_mul(rate) / 1000;
-    Some(peaks(source, channels, total_frames))
+    let mut analyzer = Analyzer::new(rate as u32, channels);
+    let peaks = peaks(
+        source.inspect(|&s| analyzer.push(s)),
+        channels,
+        total_frames,
+    );
+    Some((peaks, analyzer.finish()))
 }
 
 /// Fold interleaved samples into [`BUCKETS`] peaks over `total_frames`
@@ -189,6 +224,7 @@ pub fn peaks(samples: impl Iterator<Item = f32>, channels: usize, total_frames: 
 #[cfg(test)]
 mod tests {
     use super::{analyse, peaks, WaveformCache, WaveformJob, WaveformRequest, BUCKETS};
+    use crate::player::analysis::AnalysisCache;
     use std::fs::File;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
@@ -236,7 +272,11 @@ mod tests {
         let path = temp_wav();
         let result = analyse(File::open(&path).expect("open test wav"), 1000);
         let _ = std::fs::remove_file(&path);
-        let p = result.expect("the wav decodes");
+        let (p, analysis) = result.expect("the wav decodes");
+        assert!(
+            (analysis.audible_start_ms - 500.0).abs() < 30.0,
+            "{analysis:?}"
+        );
         assert_eq!(p.len(), BUCKETS);
         assert!(p[..BUCKETS / 2 - 2].iter().all(|v| *v == 0), "silent half");
         assert!(p[BUCKETS / 2 + 2..].iter().all(|v| *v > 250), "loud half");
@@ -257,6 +297,8 @@ mod tests {
                     let cached = seen_by_notify.get(id).is_some();
                     tx.send((id.to_string(), peaks.len(), cached)).unwrap();
                 }),
+                analyses: Arc::new(AnalysisCache::new(None)),
+                analysis_notify: Arc::new(|_: &str, _: &crate::player::analysis::TrackAnalysis| {}),
             },
             file: Arc::new(Mutex::new(Some(File::open(&path).expect("open test wav")))),
         };
@@ -298,14 +340,17 @@ mod tests {
     #[test]
     fn the_same_track_is_analysed_once_at_a_time_and_then_cached() {
         let cache = WaveformCache::default();
-        assert!(cache.begin("a"));
-        assert!(!cache.begin("a"), "already running");
+        assert!(cache.begin("a", false));
+        assert!(!cache.begin("a", true), "already running");
         cache.finish("a", Some(Arc::new(vec![1, 2, 3])));
-        assert!(!cache.begin("a"), "cached");
+        assert!(!cache.begin("a", false), "cached");
         assert_eq!(cache.get("a").as_deref(), Some(&vec![1, 2, 3]));
+        // Cached peaks, but the tempo analysis is still missing.
+        assert!(cache.begin("a", true));
+        cache.finish("a", None);
         // A failed analysis may be retried.
-        assert!(cache.begin("b"));
+        assert!(cache.begin("b", false));
         cache.finish("b", None);
-        assert!(cache.begin("b"));
+        assert!(cache.begin("b", false));
     }
 }

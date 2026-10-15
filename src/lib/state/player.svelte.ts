@@ -52,6 +52,9 @@ class PlayerStore {
   showLyrics = $state(false);
   /** Last playback error, shown as a dismissible banner. */
   error = $state<string | null>(null);
+  /** Bumped when a device's sound profile replaced the EQ/volume settings,
+   *  so an open Settings page reloads them. */
+  audioProfileRevision = $state(0);
   /** Show the queue and put the playing track in front of the user — from
    *  the palette, the shortcut, or anywhere else that knows where they left
    *  off is not where the music is. */
@@ -114,6 +117,13 @@ class PlayerStore {
       this.error = event.payload;
       // A stream failure may be the server dropping — verify.
       void net.check();
+    });
+    await listen<{ device: string }>("audio:profile-applied", (event) => {
+      this.audioProfileRevision++;
+      toast.show(m.audio_profile_applied_toast({ device: event.payload.device }), {
+        kind: "info",
+        ms: 4000,
+      });
     });
     await listen<AudioOutputFallbackEvent>("audio:output-fallback", (event) => {
       toast.show(m.audio_output_fallback_toast({ device: event.payload.requestedDevice }), {

@@ -1,8 +1,11 @@
 <script lang="ts">
+  import { listen } from "@tauri-apps/api/event";
   import { api } from "#lib/api.js";
+  import { keyName } from "#lib/musicalKey.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { getLocale } from "#lib/paraglide/runtime.js";
   import { portal } from "#lib/portal.js";
-  import type { TrackInfoDto } from "#lib/types.js";
+  import type { TrackAnalysisInfo, TrackInfoDto } from "#lib/types.js";
 
   let {
     itemId,
@@ -12,7 +15,25 @@
   }: { itemId: string; name: string; playCount?: number; onclose: () => void } = $props();
 
   let info = $state<TrackInfoDto | null>(null);
+  let analysis = $state<TrackAnalysisInfo | null>(null);
   let error = $state<string | null>(null);
+
+  // Tempo and key exist once the track was analysed (it played, or is the
+  // next one up); a result that lands while the dialog is open shows up too.
+  $effect(() => {
+    const id = itemId;
+    analysis = null;
+    api
+      .getTrackAnalysis(id)
+      .then((a) => {
+        if (id === itemId && a) analysis = a;
+      })
+      .catch(() => {});
+    const unlisten = listen<TrackAnalysisInfo>("player:analysis", (event) => {
+      if (event.payload.itemId === itemId) analysis = event.payload;
+    });
+    return () => void unlisten.then((stop) => stop());
+  });
 
   $effect(() => {
     const id = itemId;
@@ -49,6 +70,12 @@
       if (i.container) r.push({ label: m.info_container(), value: i.container.toUpperCase() });
       if (i.sizeBytes) r.push({ label: m.info_size(), value: formatSize(i.sizeBytes) });
       if (i.path) r.push({ label: m.info_path(), value: i.path });
+    }
+    const a = analysis;
+    if (a?.bpm) r.push({ label: m.info_tempo(), value: `${Math.round(a.bpm)} BPM` });
+    if (a?.key) {
+      const name = keyName(a.key, getLocale());
+      r.push({ label: m.info_key(), value: a.camelot ? `${name} (${a.camelot})` : name });
     }
     return r;
   });
@@ -98,13 +125,19 @@
       </button>
     </div>
 
+    <!-- Tempo and key are local and still show when the server's info failed. -->
     {#if error}
-      <p class="rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+      <p
+        class="rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300 {rows.length
+          ? 'mb-3'
+          : ''}"
+      >
         {m.error_generic({ message: error })}
       </p>
     {:else if rows.length === 0}
       <p class="text-sm text-ink-muted">…</p>
-    {:else}
+    {/if}
+    {#if rows.length > 0}
       <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm">
         {#each rows as row (row.label)}
           <dt class="font-medium text-ink-muted">{row.label}</dt>

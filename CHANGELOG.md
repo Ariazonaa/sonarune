@@ -7,6 +7,23 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **Sound per output device.** With the new switch in Settings → Playback,
+  equalizer, normalization, preamp and volume are remembered for every output
+  device and come back on their own when audio plays through that device
+  again — plugging in headphones no longer means retuning the speakers'
+  curve. It follows the device that actually plays, including "system
+  default" and a fallback after a device was unplugged.
+- **Crossfade on the beat.** A new switch next to the crossfade settings
+  starts the next track so that its first beat lands on a beat of the
+  current one, with an overlap of whole bars. When the keys clash, the
+  overlap stays at one bar; when the tempos are too far apart (more than 4 %,
+  half and double time count as matching), it is the usual crossfade. Tempo,
+  beat grid and key are worked out on your computer from the same decode the
+  seek-bar waveform already uses, and kept, so a track is analysed once.
+  Tempo and key (with its Camelot code) also show in a track's info.
+
 ### Changed
 
 - **Jellysic is now Sonarune.** New name, new mark (an S whose tail is a note

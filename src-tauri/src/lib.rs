@@ -1,5 +1,6 @@
 mod api;
 mod audio_devices;
+mod audio_profiles;
 mod cache;
 mod commands;
 mod commands_discover;
@@ -250,9 +251,13 @@ pub fn run() {
             commands::queue_undo,
             commands::get_player_state,
             commands::get_waveform,
+            commands::get_track_analysis,
             commands::get_queue,
             commands::get_audio_settings,
             commands::set_audio_settings,
+            commands::get_audio_profiles,
+            commands::set_audio_profiles_enabled,
+            commands::delete_audio_profile,
             commands::get_playback_settings,
             commands::set_playback_settings,
             commands::list_audio_devices,

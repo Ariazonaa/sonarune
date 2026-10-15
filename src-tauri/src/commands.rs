@@ -1386,6 +1386,16 @@ pub fn get_waveform(state: State<'_, AppState>, item_id: String) -> Option<Vec<u
     state.player.waveform(&item_id)
 }
 
+/// Tempo and key of a track analysed earlier (this session or stored). New
+/// ones arrive as the `player:analysis` event.
+#[tauri::command]
+pub fn get_track_analysis(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Option<player::TrackAnalysisInfo> {
+    state.player.track_analysis(&item_id)
+}
+
 #[tauri::command]
 pub fn get_queue(state: State<'_, AppState>) -> player::QueueSnapshot {
     state.player.queue_snapshot()
@@ -1874,7 +1884,37 @@ pub fn set_audio_settings(state: State<'_, AppState>, params: player::DspParams)
     state.player.dsp().update(params.clone());
     let json = serde_json::to_string(&params)
         .map_err(|e| AppError::Other(format!("cannot serialize settings: {e}")))?;
-    state.store.set(crate::store::keys::AUDIO_DSP, &json)
+    state.store.set(crate::store::keys::AUDIO_DSP, &json)?;
+    crate::audio_profiles::remember_dsp(&state.store, &params)
+}
+
+#[tauri::command]
+pub fn get_audio_profiles(state: State<'_, AppState>) -> crate::audio_profiles::AudioProfilesInfo {
+    crate::audio_profiles::info(&state.store)
+}
+
+#[tauri::command]
+pub fn set_audio_profiles_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> AppResult<crate::audio_profiles::AudioProfilesInfo> {
+    let volume = state.player.state().volume;
+    crate::audio_profiles::set_enabled(
+        &state.store,
+        enabled,
+        &state.player.dsp().params(),
+        volume,
+    )?;
+    Ok(crate::audio_profiles::info(&state.store))
+}
+
+#[tauri::command]
+pub fn delete_audio_profile(
+    state: State<'_, AppState>,
+    device: String,
+) -> AppResult<crate::audio_profiles::AudioProfilesInfo> {
+    crate::audio_profiles::delete(&state.store, &device)?;
+    Ok(crate::audio_profiles::info(&state.store))
 }
 
 /// Ask the library watcher to poll the server right now (fired when the

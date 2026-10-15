@@ -33,6 +33,7 @@
   } from "#lib/theme.js";
   import type {
     AudioDeviceSnapshot,
+    AudioProfilesInfo,
     CacheInfo,
     DesktopSettings,
     DspParams,
@@ -96,7 +97,12 @@
     !settings?.normalizationEnabled ? "off" : settings.albumNormalization ? "album" : "track",
   );
   let playback = $state<PlaybackSettings | null>(null);
-  let audioDevices = $state<AudioDeviceSnapshot>({ devices: [], fallbackDevice: null });
+  let audioDevices = $state<AudioDeviceSnapshot>({
+    devices: [],
+    fallbackDevice: null,
+    activeDevice: null,
+  });
+  let audioProfiles = $state<AudioProfilesInfo | null>(null);
   let theme = $state<ThemeSettings>(loadTheme());
   let extras = $state<ExtrasSettings | null>(null);
   let desktop = $state<DesktopSettings | null>(null);
@@ -136,16 +142,18 @@
 
     async function initialize() {
       try {
-        const [nextSettings, nextPlayback, nextExtras, nextDesktop, nextCache] =
+        const [nextSettings, nextPlayback, nextExtras, nextDesktop, nextCache, nextProfiles] =
           await Promise.all([
             api.getAudioSettings(),
             api.getPlaybackSettings(),
             api.getExtrasSettings(),
             api.getDesktopSettings(),
             api.getCacheInfo(),
+            api.getAudioProfiles(),
           ]);
         if (disposed) return;
         settings = nextSettings;
+        audioProfiles = nextProfiles;
         playback = nextPlayback;
         extras = nextExtras;
         rememberAutoDj(nextExtras);
@@ -167,6 +175,39 @@
 
   function save() {
     if (settings) player.run(api.setAudioSettings($state.snapshot(settings)));
+  }
+
+  // A device's profile replaced EQ/normalization while this page was open:
+  // show it, or the next control change would write the old values back.
+  let seenProfileRevision = player.audioProfileRevision;
+  $effect(() => {
+    const revision = player.audioProfileRevision;
+    if (revision === seenProfileRevision) return;
+    seenProfileRevision = revision;
+    void (async () => {
+      try {
+        settings = await api.getAudioSettings();
+        audioProfiles = await api.getAudioProfiles();
+      } catch (e) {
+        player.error = String(e);
+      }
+    })();
+  });
+
+  async function setAudioProfilesEnabled(enabled: boolean) {
+    try {
+      audioProfiles = await api.setAudioProfilesEnabled(enabled);
+    } catch (e) {
+      player.error = String(e);
+    }
+  }
+
+  async function deleteAudioProfile(device: string) {
+    try {
+      audioProfiles = await api.deleteAudioProfile(device);
+    } catch (e) {
+      player.error = String(e);
+    }
   }
 
   function savePlayback() {
@@ -669,6 +710,21 @@
             onchange={savePlayback}
           />
         </label>
+        <label class="mt-4 flex items-start justify-between gap-4">
+          <div>
+            <p class="text-sm font-medium">{m.settings_beat_transitions()}</p>
+            <p class="mt-0.5 max-w-md text-xs text-ink-muted">
+              {m.settings_beat_transitions_hint()}
+            </p>
+          </div>
+          <input
+            type="checkbox"
+            class="mt-0.5 h-4 w-4 shrink-0 accent-(--color-accent)"
+            disabled={playback.crossfadeMode === "off"}
+            bind:checked={playback.beatTransitions}
+            onchange={savePlayback}
+          />
+        </label>
 
         <label class="mt-6 block">
           <span class="mb-1 block text-sm font-medium">{m.settings_output_device()}</span>
@@ -701,6 +757,60 @@
             </span>
           {/if}
         </label>
+      {/if}
+
+      {#if audioProfiles}
+        {@const activeDevice = audioDevices.activeDevice ?? audioProfiles.activeDevice}
+        <label class="mt-6 flex items-start justify-between gap-4">
+          <div>
+            <p class="text-sm font-medium">{m.settings_audio_profiles()}</p>
+            <p class="mt-0.5 max-w-md text-xs text-ink-muted">{m.settings_audio_profiles_hint()}</p>
+            {#if audioProfiles.enabled && activeDevice}
+              <p class="mt-1 max-w-md text-xs text-ink-muted">
+                {m.settings_audio_profiles_active({ device: activeDevice })}
+              </p>
+            {/if}
+          </div>
+          <input
+            type="checkbox"
+            class="mt-0.5 h-4 w-4 shrink-0 accent-(--color-accent)"
+            checked={audioProfiles.enabled}
+            onchange={(e) => void setAudioProfilesEnabled(e.currentTarget.checked)}
+          />
+        </label>
+        {#if audioProfiles.enabled && audioProfiles.devices.length > 0}
+          <div class="mt-3">
+            <p class="mb-1.5 text-xs text-ink-muted">{m.settings_audio_profiles_saved()}</p>
+            <ul class="flex flex-wrap gap-2">
+              {#each audioProfiles.devices as device (device)}
+                <li
+                  class="inline-flex max-w-full items-center rounded-full border text-xs
+                    {device === activeDevice
+                    ? 'border-accent bg-accent/10 text-ink'
+                    : 'border-edge text-ink-muted'}"
+                >
+                  <span class="min-w-0 truncate py-1 pr-1 pl-3" title={device}>
+                    {device}{device === activeDevice
+                      ? ` · ${m.settings_audio_profiles_current()}`
+                      : ""}
+                  </span>
+                  <button
+                    class="shrink-0 rounded-full py-1 pr-2 pl-1 text-ink-muted transition-colors hover:text-red-400"
+                    aria-label={m.settings_audio_profiles_delete({ device })}
+                    title={m.settings_audio_profiles_delete({ device })}
+                    onclick={() => void deleteAudioProfile(device)}
+                  >
+                    <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
+                      <path
+                        d="M6.4 5 12 10.6 17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6 10.6 12 5 6.4z"
+                      />
+                    </svg>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
       {/if}
     </section>
 

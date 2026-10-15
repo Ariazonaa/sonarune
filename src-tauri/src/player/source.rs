@@ -332,7 +332,7 @@ pub fn open_track_source(
     // moment it is created — the download task keeps its own handles private.
     let wave_file = Arc::new(std::sync::Mutex::new(None));
     let mut wave_job = waveform
-        .filter(|request| start_ms.is_none() && request.cache.get(&track.item_id).is_none())
+        .filter(|request| start_ms.is_none() && request.wanted(&track.item_id, track.duration_ms))
         .map(|request| WaveformJob {
             item_id: track.item_id.clone(),
             duration_ms: track.duration_ms,

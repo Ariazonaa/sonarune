@@ -33,6 +33,7 @@ pub mod keys {
     pub const CAN_DELETE: &str = "can_delete";
     pub const CAN_EDIT: &str = "can_edit";
     pub const DESKTOP: &str = "desktop";
+    pub const AUDIO_PROFILES: &str = "audio_profiles";
 }
 
 impl Store {
@@ -46,6 +47,10 @@ impl Store {
              CREATE TABLE IF NOT EXISTS kv (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS track_analysis (
+                 item_id TEXT PRIMARY KEY,
+                 json    TEXT NOT NULL
              );",
         )?;
         Ok(Self {
@@ -72,6 +77,27 @@ impl Store {
         Ok(())
     }
 
+    /// Tempo/key analysis of a track (see player/analysis.rs), as JSON.
+    pub fn get_analysis(&self, item_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT json FROM track_analysis WHERE item_id = ?1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    pub fn put_analysis(&self, item_id: &str, json: &str) -> AppResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO track_analysis (item_id, json) VALUES (?1, ?2)
+             ON CONFLICT(item_id) DO UPDATE SET json = excluded.json",
+            [item_id, json],
+        )?;
+        Ok(())
+    }
+
     pub fn delete(&self, key: &str) -> AppResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
@@ -89,6 +115,7 @@ impl Store {
             keys::PLAYBACK,
             keys::EXTRAS,
             keys::DESKTOP,
+            keys::AUDIO_PROFILES,
         ] {
             if let Some(value) = self.get(key) {
                 let value = if key == keys::EXTRAS {
@@ -113,6 +140,7 @@ impl Store {
             keys::PLAYBACK,
             keys::EXTRAS,
             keys::DESKTOP,
+            keys::AUDIO_PROFILES,
         ] {
             if let Some(serde_json::Value::String(value)) = map.get(key) {
                 let value = match key {
@@ -148,6 +176,12 @@ impl Store {
                     }
                     keys::DESKTOP => {
                         if !parses_as::<crate::desktop::DesktopSettings>(value) {
+                            continue;
+                        }
+                        value.clone()
+                    }
+                    keys::AUDIO_PROFILES => {
+                        if !parses_as::<crate::audio_profiles::AudioProfiles>(value) {
                             continue;
                         }
                         value.clone()

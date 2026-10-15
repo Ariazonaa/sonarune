@@ -18,7 +18,7 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { library, playlists, user, TICKS_PER_MS, idFor } from "./fixtures.mjs";
-import { ensureMedia } from "./media.mjs";
+import { AUDIO_SECONDS, ensureMedia } from "./media.mjs";
 
 const argv = process.argv.slice(2);
 const portIdx = argv.indexOf("--port");
@@ -26,6 +26,11 @@ const PORT = portIdx >= 0 ? Number(argv[portIdx + 1]) : 8096;
 /** Log every request. Useful when you want to see what a client actually asks
  *  for, or to watch playback reporting arrive while the window is hidden. */
 const VERBOSE = argv.includes("--verbose");
+/** Report the audio's real length instead of the invented one. The library
+ *  then looks less real, but a track ends where the server says it does:
+ *  prefetch, gapless hand-off and crossfades only happen with that. */
+const REAL_LENGTHS = argv.includes("--real-lengths");
+const lengthMs = (track) => (REAL_LENGTHS ? AUDIO_SECONDS * 1000 : track.durationMs);
 const MEDIA = join(homedir(), ".cache", "sonarune", "devserver-media");
 
 const favorites = new Set();
@@ -65,7 +70,7 @@ function albumItem(album) {
     ImageBlurHashes: {},
     DateCreated: `20${20 + (album.year % 5)}-03-14T10:00:00.0000000Z`,
     RunTimeTicks:
-      (tracksByAlbum.get(album.id) ?? []).reduce((s, t) => s + t.durationMs, 0) * TICKS_PER_MS,
+      (tracksByAlbum.get(album.id) ?? []).reduce((s, t) => s + lengthMs(t), 0) * TICKS_PER_MS,
     UserData: userData(album.id),
   };
 }
@@ -84,7 +89,7 @@ function trackItem(track) {
     ProductionYear: track.year,
     IndexNumber: track.indexNumber,
     ParentIndexNumber: 1,
-    RunTimeTicks: track.durationMs * TICKS_PER_MS,
+    RunTimeTicks: lengthMs(track) * TICKS_PER_MS,
     Genres: [track.genre],
     GenreItems: [{ Id: idFor("genre", track.genre), Name: track.genre }],
     ImageTags: {},
@@ -121,7 +126,7 @@ function playlistItem(pl) {
     RunTimeTicks:
       pl.trackIds.reduce((s, id) => {
         const t = library.tracks.find((x) => x.id === id);
-        return s + (t ? t.durationMs : 0);
+        return s + (t ? lengthMs(t) : 0);
       }, 0) * TICKS_PER_MS,
     UserData: userData(pl.id),
   };

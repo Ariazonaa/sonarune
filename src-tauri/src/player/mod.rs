@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod dsp;
 pub mod fade;
 pub mod opus;
@@ -34,6 +35,16 @@ const DEFERRED_COMMAND_LIMIT: usize = 256;
 const REPORT_EVERY_TICKS: u32 = 25;
 /// Start opening the next track's stream this long before the current ends.
 const PREFETCH_OPEN_REMAINING_MS: u64 = 20_000;
+/// With beat transitions: earlier, so the next track is downloaded and
+/// analysed before its planned start (up to ~20 s before the end).
+const PREFETCH_OPEN_BEAT_MS: u64 = 50_000;
+/// A planned transition is started on a wake-up this early, and the rest is
+/// made up with silence in front of the next track: thread wake-ups on
+/// Windows are only good to ~16 ms, samples are exact.
+const PLAN_LEAD_MS: u64 = 25;
+/// A plan whose moment passed by more than this (a seek, a stall) is
+/// dropped for a plain crossfade: started any later, the beats would flam.
+const PLAN_LATE_MS: u64 = 30;
 /// Hand the decoded next track to rodio this long before the boundary; rodio
 /// then plays the two sources back to back without a gap.
 const APPEND_REMAINING_MS: u64 = 3_000;
@@ -58,6 +69,10 @@ pub struct PlaybackSettings {
     pub crossfade_seconds: f32,
     /// None = system default output device.
     pub output_device: Option<String>,
+    /// Land crossfades on the beat: the next track starts so that its first
+    /// beat falls on a beat of the current one (see `analysis.rs`). Only
+    /// where a crossfade happens anyway and both tracks have a beat grid.
+    pub beat_transitions: bool,
 }
 
 impl Default for PlaybackSettings {
@@ -66,6 +81,7 @@ impl Default for PlaybackSettings {
             crossfade_mode: CrossfadeMode::Off,
             crossfade_seconds: 6.0,
             output_device: None,
+            beat_transitions: false,
         }
     }
 }
@@ -237,10 +253,9 @@ fn should_start_prefetch(
     next_id: &str,
     duration_ms: u64,
     remaining_ms: u64,
+    window_ms: u64,
 ) -> bool {
-    !busy
-        && appended != Some(next_id)
-        && (duration_ms == 0 || remaining_ms <= PREFETCH_OPEN_REMAINING_MS)
+    !busy && appended != Some(next_id) && (duration_ms == 0 || remaining_ms <= window_ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -872,6 +887,30 @@ pub struct PlayerHandle {
     dsp: Arc<AudioDsp>,
     tap: Arc<tap::VisualizerTap>,
     waveforms: Arc<waveform::WaveformCache>,
+    analyses: Arc<analysis::AnalysisCache>,
+}
+
+/// `player:analysis` — tempo and key of one track, once analysed.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackAnalysisInfo {
+    pub item_id: String,
+    pub bpm: Option<f32>,
+    /// Camelot code ("8A"), the notation DJ software uses.
+    pub camelot: Option<String>,
+    /// Pitch class of the tonic (0 = C) and mode, for a localized name.
+    pub key: Option<analysis::MusicalKey>,
+}
+
+impl TrackAnalysisInfo {
+    fn new(item_id: &str, analysis: &analysis::TrackAnalysis) -> Self {
+        Self {
+            item_id: item_id.to_string(),
+            bpm: analysis.bpm,
+            camelot: analysis.camelot(),
+            key: analysis.key,
+        }
+    }
 }
 
 /// `player:waveform` — the seek bar's peaks for one track, sent once its
@@ -936,6 +975,12 @@ impl PlayerHandle {
     pub fn waveform(&self, item_id: &str) -> Option<Vec<u8>> {
         self.waveforms.get(item_id).map(|peaks| peaks.to_vec())
     }
+
+    pub fn track_analysis(&self, item_id: &str) -> Option<TrackAnalysisInfo> {
+        self.analyses
+            .get(item_id)
+            .map(|analysis| TrackAnalysisInfo::new(item_id, &analysis))
+    }
 }
 
 /// Spawn the player thread. It owns the audio output for the whole app
@@ -964,6 +1009,7 @@ pub fn spawn(
     let dsp = Arc::new(AudioDsp::new(dsp_params));
     let visualizer_tap = Arc::new(tap::VisualizerTap::new());
     let waveforms = Arc::new(waveform::WaveformCache::default());
+    let analyses = Arc::new(analysis::AnalysisCache::new(Some(store.clone())));
     let handle = PlayerHandle {
         tx: tx.clone(),
         state: shared_state.clone(),
@@ -971,6 +1017,7 @@ pub fn spawn(
         dsp: dsp.clone(),
         tap: visualizer_tap.clone(),
         waveforms: waveforms.clone(),
+        analyses: analyses.clone(),
     };
 
     std::thread::Builder::new()
@@ -998,6 +1045,7 @@ pub fn spawn(
                     dsp.clone(),
                     visualizer_tap.clone(),
                     waveforms.clone(),
+                    analyses.clone(),
                     tx.clone(),
                     hwnd,
                     cover_dir.clone(),
@@ -1044,7 +1092,7 @@ pub fn spawn(
                 worker.handle(cmd);
             }
             loop {
-                match rx.recv_timeout(TICK) {
+                match rx.recv_timeout(worker.next_wake()) {
                     Ok(PlayerCommand::Shutdown { ack }) => {
                         worker.shutdown();
                         let _ = ack.send(());
@@ -1167,6 +1215,8 @@ struct Worker {
     /// reopen at a position (`restart_at`; rodio's get_pos is
     /// source-relative).
     position_offset_ms: u64,
+    /// Until when the silence in front of a beat transition plays.
+    lead_until: Option<Instant>,
     /// Jellyfin play session of the playback currently being reported — the
     /// one in the stream URL of the source in `sink`, minted when that source
     /// was opened (`spawn_open`). Taken when the track stops, so the same id
@@ -1189,6 +1239,7 @@ impl Worker {
         dsp: Arc<AudioDsp>,
         tap: Arc<tap::VisualizerTap>,
         waveforms: Arc<waveform::WaveformCache>,
+        analyses: Arc<analysis::AnalysisCache>,
         tx: Sender<PlayerCommand>,
         hwnd: Option<isize>,
         cover_dir: PathBuf,
@@ -1199,6 +1250,13 @@ impl Worker {
                 let app = app.clone();
                 Arc::new(move |item_id: &str, peaks: &[u8]| {
                     let _ = app.emit("player:waveform", WaveformEvent { item_id, peaks });
+                })
+            },
+            analyses,
+            analysis_notify: {
+                let app = app.clone();
+                Arc::new(move |item_id: &str, analysis: &analysis::TrackAnalysis| {
+                    let _ = app.emit("player:analysis", TrackAnalysisInfo::new(item_id, analysis));
                 })
             },
         };
@@ -1218,24 +1276,25 @@ impl Worker {
             .get(keys::PLAY_MODE)
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
-        let (output, output_dead) = match open_output(&playback.output_device, tx.clone()) {
-            Ok(opened) => {
-                crate::audio_devices::clear_fallback();
-                opened
-            }
-            Err(e) => {
-                tracing::warn!("configured output device failed ({e}); using default");
-                let opened = open_output(&None, tx.clone())?;
-                if let Some(requested_device) = playback.output_device.clone() {
-                    crate::audio_devices::mark_fallback(requested_device.clone());
-                    let _ = app.emit(
-                        "audio:output-fallback",
-                        crate::audio_devices::AudioOutputFallbackEvent { requested_device },
-                    );
+        let (output, output_dead, output_device) =
+            match open_output(&playback.output_device, tx.clone()) {
+                Ok(opened) => {
+                    crate::audio_devices::clear_fallback();
+                    opened
                 }
-                opened
-            }
-        };
+                Err(e) => {
+                    tracing::warn!("configured output device failed ({e}); using default");
+                    let opened = open_output(&None, tx.clone())?;
+                    if let Some(requested_device) = playback.output_device.clone() {
+                        crate::audio_devices::mark_fallback(requested_device.clone());
+                        let _ = app.emit(
+                            "audio:output-fallback",
+                            crate::audio_devices::AudioOutputFallbackEvent { requested_device },
+                        );
+                    }
+                    opened
+                }
+            };
         let volume = store
             .get(keys::VOLUME)
             .and_then(|v| v.parse::<f32>().ok())
@@ -1244,7 +1303,7 @@ impl Worker {
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or(1.0);
         let media = init_media_controls(hwnd, tx.clone());
-        Ok(Self {
+        let mut worker = Self {
             app,
             store,
             session,
@@ -1299,11 +1358,56 @@ impl Worker {
             pending_pause: false,
             queue_ended: false,
             position_offset_ms: 0,
+            lead_until: None,
             play_session_id: None,
             ticks_since_report: 0,
             listen: scrobble::ListenClock::default(),
             cover_dir,
-        })
+        };
+        worker.output_opened(output_device);
+        Ok(worker)
+    }
+
+    /// The output now plays through `device`: with per-device profiles on,
+    /// its EQ/normalization and volume take over (see `audio_profiles.rs`).
+    fn output_opened(&mut self, device: Option<String>) {
+        crate::audio_devices::set_active_device(device.clone());
+        let Some(device) = device else {
+            return;
+        };
+        let current = self.dsp.params();
+        match crate::audio_profiles::on_device_opened(&self.store, &device, &current, self.volume) {
+            Ok(Some(profile)) => {
+                self.dsp.update(profile.dsp.clone());
+                if let Ok(json) = serde_json::to_string(&profile.dsp) {
+                    let _ = self.store.set(keys::AUDIO_DSP, &json);
+                }
+                if let Some(volume) = profile.volume {
+                    self.apply_volume(volume);
+                }
+                let _ = self.app.emit(
+                    "audio:profile-applied",
+                    crate::audio_profiles::ProfileAppliedEvent { device },
+                );
+                self.emit();
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("audio profile for '{device}' not applied: {e}"),
+        }
+    }
+
+    fn apply_volume(&mut self, volume: f32) {
+        if !volume.is_finite() {
+            return;
+        }
+        self.volume = volume.clamp(0.0, 1.0);
+        if let Some(sink) = &self.sink {
+            sink.set_volume(self.volume);
+        }
+        if let Some((old, _, _)) = &self.fading_out {
+            old.set_volume(self.volume);
+        }
+        let _ = self.store.set(keys::VOLUME, &self.volume.to_string());
     }
 
     fn handle(&mut self, cmd: PlayerCommand) {
@@ -1458,14 +1562,18 @@ impl Worker {
                 if !volume.is_finite() {
                     return;
                 }
-                self.volume = volume.clamp(0.0, 1.0);
-                if let Some(sink) = &self.sink {
-                    sink.set_volume(self.volume);
+                self.apply_volume(volume);
+                if let Some(device) = crate::audio_devices::active_device() {
+                    let current = self.dsp.params();
+                    if let Err(e) = crate::audio_profiles::remember_volume(
+                        &self.store,
+                        &device,
+                        self.volume,
+                        &current,
+                    ) {
+                        tracing::warn!("cannot save the device volume: {e}");
+                    }
                 }
-                if let Some((old, _, _)) = &self.fading_out {
-                    old.set_volume(self.volume);
-                }
-                let _ = self.store.set(keys::VOLUME, &self.volume.to_string());
                 self.emit();
             }
             PlayerCommand::SetPlaybackSettings(settings) => {
@@ -2019,12 +2127,18 @@ impl Worker {
             return;
         };
 
+        let window_ms = if self.playback.beat_transitions {
+            PREFETCH_OPEN_BEAT_MS
+        } else {
+            PREFETCH_OPEN_REMAINING_MS
+        };
         if should_start_prefetch(
             self.prefetched.is_some() || self.prefetch_inflight.is_some(),
             self.appended.as_deref(),
             &next.item_id,
             duration,
             remaining,
+            window_ms,
         ) {
             self.spawn_open(OpenPurpose::Prefetch, next.clone());
         }
@@ -2041,12 +2155,34 @@ impl Worker {
             0
         };
         if effective_fade_ms >= 500 {
+            // In time: a planned transition replaces the plain fade below
+            // for as long as its moment has not passed.
+            let position = self.position_ms();
+            if let Some(plan) = self
+                .transition_plan(&current, &next, effective_fade_ms)
+                .filter(|plan| position <= plan.start_at_ms + PLAN_LATE_MS)
+            {
+                if position + PLAN_LEAD_MS >= plan.start_at_ms {
+                    if let Some(p) = self.prefetched.take() {
+                        let lead = plan.start_at_ms.saturating_sub(position);
+                        tracing::info!(
+                            "beat transition into {}: at {position} + {lead} ms, fade out/in {}/{} ms",
+                            p.item_id,
+                            plan.fade_out_ms,
+                            plan.fade_in_ms
+                        );
+                        self.begin_crossfade(p, plan.fade_out_ms, plan.fade_in_ms, lead);
+                    }
+                }
+                return;
+            }
             // Crossfade: overlap the tracks on two players instead of the
             // gapless same-sink hand-off.
             if remaining > 0 && remaining <= effective_fade_ms {
                 if let Some(p) = self.prefetched.take() {
                     if p.item_id == next.item_id {
-                        self.begin_crossfade(p, remaining.min(effective_fade_ms));
+                        let fade_ms = remaining.min(effective_fade_ms);
+                        self.begin_crossfade(p, fade_ms, fade_ms, 0);
                     } else {
                         self.prefetched = Some(p);
                     }
@@ -2070,9 +2206,66 @@ impl Worker {
         }
     }
 
+    /// The beat-aligned transition into the prefetched `next`, when the
+    /// setting is on and both tracks have been analysed (see analysis.rs).
+    fn transition_plan(
+        &self,
+        current: &QueueTrack,
+        next: &QueueTrack,
+        fade_ms: u64,
+    ) -> Option<analysis::TransitionPlan> {
+        if !self.playback.beat_transitions
+            || self.prefetched.as_ref().map(|p| p.item_id.as_str()) != Some(next.item_id.as_str())
+        {
+            return None;
+        }
+        let a = self
+            .waveform
+            .analyses
+            .get_matching(&current.item_id, current.duration_ms)?;
+        let b = self
+            .waveform
+            .analyses
+            .get_matching(&next.item_id, next.duration_ms)?;
+        analysis::plan_transition(&a, &b, fade_ms)
+    }
+
+    /// How long the command loop may sleep: a tick, or less when a planned
+    /// transition is due before the next one.
+    fn next_wake(&self) -> Duration {
+        if self.status != PlaybackStatus::Playing || !self.playback.beat_transitions {
+            return TICK;
+        }
+        let Some(current) = self.queue.get(self.index) else {
+            return TICK;
+        };
+        let Some(next) = self.auto_next_index().and_then(|i| self.queue.get(i)) else {
+            return TICK;
+        };
+        let fade_ms = (self.playback.crossfade_seconds.clamp(1.0, 12.0) * 1000.0) as u64;
+        if !should_crossfade(self.playback.crossfade_mode, fade_ms, current, next) {
+            return TICK;
+        }
+        let Some(plan) = self.transition_plan(current, next, fade_ms) else {
+            return TICK;
+        };
+        let until = plan
+            .start_at_ms
+            .saturating_sub(PLAN_LEAD_MS)
+            .saturating_sub(self.position_ms());
+        if until >= TICK.as_millis() as u64 {
+            TICK
+        } else {
+            // Due already (a command kept the loop busy): tick right away.
+            Duration::from_millis(until.max(1))
+        }
+    }
+
     /// Fade the current track out while the next fades in on a fresh player;
     /// the queue pointer moves immediately (the new track is what's "current").
-    fn begin_crossfade(&mut self, p: Prefetched, fade_ms: u64) {
+    /// `lead_ms` of silence go in front of the next track, so a planned
+    /// transition starts on the sample rather than on the thread wake-up.
+    fn begin_crossfade(&mut self, p: Prefetched, fade_out_ms: u64, fade_in_ms: u64, lead_ms: u64) {
         let play_session = p.play_session;
         if let Some(prev) = self.queue.get(self.index).cloned() {
             let position_ms = self.position_ms();
@@ -2084,6 +2277,7 @@ impl Worker {
             tap.store(false, std::sync::atomic::Ordering::Relaxed);
         }
         if let (Some(fade), Some(old)) = (self.current_fade.take(), self.sink.take()) {
+            let fade_ms = fade_out_ms + lead_ms;
             fade.ramp_to(0.0, Duration::from_millis(fade_ms));
             self.fading_out = Some((
                 old,
@@ -2105,7 +2299,17 @@ impl Worker {
 
         let sink = rodio::Player::connect_new(self.output.mixer());
         sink.set_volume(self.volume);
-        p.fade.begin(0.0, 1.0, Duration::from_millis(fade_ms));
+        if lead_ms > 0 {
+            // The player reports positions per source: the track's own
+            // position starts at zero once the silence is through.
+            self.lead_until = Some(Instant::now() + Duration::from_millis(lead_ms));
+            use rodio::Source as _;
+            sink.append(
+                rodio::source::Zero::new(p.source.channels(), p.source.sample_rate())
+                    .take_duration(Duration::from_millis(lead_ms)),
+            );
+        }
+        p.fade.begin(0.0, 1.0, Duration::from_millis(fade_in_ms));
         sink.append(p.source);
         self.sink = Some(sink);
         self.current_fade = Some(p.fade);
@@ -2635,11 +2839,12 @@ impl Worker {
             let reopened = open_output(&requested_device, self.tx.clone())
                 .or_else(|_| open_output(&None, self.tx.clone()));
             match reopened {
-                Ok((output, dead)) => {
+                Ok((output, dead, device)) => {
                     self.output = output;
                     self.output_dead = dead;
                     self.output_alive = true;
                     self.last_output_rebuild = Instant::now();
+                    self.output_opened(device);
                 }
                 Err(e) => {
                     let _ = self
@@ -2827,12 +3032,13 @@ impl Worker {
     fn try_rebuild_output(&mut self, device: Option<String>) -> bool {
         self.last_output_rebuild = Instant::now();
         match open_output(&device, self.tx.clone()) {
-            Ok((output, dead)) => {
+            Ok((output, dead, device)) => {
                 crate::audio_devices::clear_fallback();
                 let position_ms = self.position_ms();
                 self.output = output;
                 self.output_dead = dead;
                 self.output_alive = true;
+                self.output_opened(device);
                 match self.status {
                     PlaybackStatus::Idle => {
                         self.sink = None;
@@ -3285,7 +3491,12 @@ impl Worker {
             .as_ref()
             .is_some_and(|download| download.is_complete());
         let output_dead = self.output_dead.load(std::sync::atomic::Ordering::Relaxed);
-        if downloaded && !output_dead {
+        // During the silence in front of a beat transition, a native seek
+        // would position the silence, not the track.
+        let in_lead = self
+            .lead_until
+            .is_some_and(|until| Instant::now() < until + Duration::from_millis(50));
+        if downloaded && !output_dead && !in_lead {
             match sink.try_seek(Duration::from_millis(position_ms)) {
                 Ok(()) => {
                     // rodio's position now reads the absolute target, also for
@@ -3481,21 +3692,33 @@ fn open_output(
 ) -> AppResult<(
     rodio::stream::MixerDeviceSink,
     Arc<std::sync::atomic::AtomicBool>,
+    Option<String>,
 )> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait};
 
-    let builder = match device_name {
+    // The device is resolved once and opened as such, so the name the
+    // per-device profiles key on is the device that actually plays.
+    #[allow(deprecated)]
+    let (builder, resolved) = match device_name {
         Some(name) => {
             let device = rodio::cpal::default_host()
                 .output_devices()
                 .map_err(|e| AppError::Audio(format!("cannot list output devices: {e}")))?
                 .find(|d| d.name().map(|n| &n == name).unwrap_or(false))
                 .ok_or_else(|| AppError::Audio(format!("output device '{name}' not found")))?;
-            rodio::stream::DeviceSinkBuilder::from_device(device)
-                .map_err(|e| AppError::Audio(format!("cannot use output device: {e}")))?
+            let builder = rodio::stream::DeviceSinkBuilder::from_device(device)
+                .map_err(|e| AppError::Audio(format!("cannot use output device: {e}")))?;
+            (builder, Some(name.clone()))
         }
-        None => rodio::stream::DeviceSinkBuilder::from_default_device()
-            .map_err(|e| AppError::Audio(format!("cannot open default output: {e}")))?,
+        None => {
+            let device = rodio::cpal::default_host()
+                .default_output_device()
+                .ok_or_else(|| AppError::Audio("no default output device".into()))?;
+            let name = device.name().ok();
+            let builder = rodio::stream::DeviceSinkBuilder::from_device(device)
+                .map_err(|e| AppError::Audio(format!("cannot open default output: {e}")))?;
+            (builder, name)
+        }
     };
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = dead.clone();
@@ -3507,7 +3730,7 @@ fn open_output(
         })
         .open_stream()
         .map_err(|e| AppError::Audio(format!("cannot open audio output: {e}")))?;
-    Ok((sink, dead))
+    Ok((sink, dead, resolved))
 }
 
 /// Output device names for the settings UI.
@@ -3995,17 +4218,18 @@ mod tests {
 
     #[test]
     fn prefetch_opens_the_next_track_only_once() {
-        assert!(should_start_prefetch(false, None, "b", 200_000, 15_000));
+        const W: u64 = super::PREFETCH_OPEN_REMAINING_MS;
+        assert!(should_start_prefetch(false, None, "b", 200_000, 15_000, W));
         assert!(
-            !should_start_prefetch(false, None, "b", 200_000, 60_000),
+            !should_start_prefetch(false, None, "b", 200_000, 60_000, W),
             "too early"
         );
         assert!(
-            should_start_prefetch(false, None, "b", 0, 0),
+            should_start_prefetch(false, None, "b", 0, 0, W),
             "unknown length opens at once"
         );
         assert!(
-            !should_start_prefetch(true, None, "b", 200_000, 15_000),
+            !should_start_prefetch(true, None, "b", 200_000, 15_000, W),
             "already open or opening"
         );
         // The gapless hand-off took the prefetched source: both slots are
@@ -4015,10 +4239,27 @@ mod tests {
             Some("b"),
             "b",
             200_000,
-            2_000
+            2_000,
+            W
         ));
         // The queue changed after the hand-off: the new next track is opened.
-        assert!(should_start_prefetch(false, Some("b"), "c", 200_000, 2_000));
+        assert!(should_start_prefetch(
+            false,
+            Some("b"),
+            "c",
+            200_000,
+            2_000,
+            W
+        ));
+        // Beat transitions open earlier, for the analysis.
+        assert!(should_start_prefetch(
+            false,
+            None,
+            "b",
+            200_000,
+            45_000,
+            super::PREFETCH_OPEN_BEAT_MS
+        ));
     }
 
     #[test]

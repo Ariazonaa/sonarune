@@ -7,7 +7,13 @@ README screenshots do not need a real server or anyone's real music.
 ```sh
 node scripts/devserver/server.mjs             # http://127.0.0.1:8096
 node scripts/devserver/server.mjs --verbose   # log every request
+node scripts/devserver/server.mjs --real-lengths  # report the real 45 s per track
 ```
+
+`--real-lengths` reports every track as the 45 s it really is. Without it the
+library shows invented lengths, which look real but mean a track ends long
+before the server says it does — no prefetch, no gapless hand-off, no
+crossfade. Use it to test transitions.
 
 `--verbose` prints one line per request. That is how you watch playback
 reporting arrive: `/Sessions/Playing/Progress` lands every ten seconds from the
