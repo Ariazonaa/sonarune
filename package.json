@@ -55,6 +55,6 @@
   "overrides": {
     "@puppeteer/browsers": "^3.2.2",
     "cookie": "^0.7.2",
-    "serialize-javascript": "^7.1.1"
+    "serialize-javascript": "^7.1.2"
   }
 }

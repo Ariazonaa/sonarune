@@ -399,6 +399,7 @@ messages/{en,de}.json    all user-facing strings (Paraglide)
 | [`docs/usage.md`](docs/usage.md) | A feature walkthrough — sign-in → library → queue → discovery → visualizer. |
 | [`docs/architecture.md`](docs/architecture.md) | How the backend works, told in diagrams: the player thread, the audio source chain, gapless/crossfade, 401-retry, cert-pinning, cover art. |
 | [`docs/testing.md`](docs/testing.md) | Test inventory + the manual live-test acceptance matrix. |
+| [`AGENTS.md`](AGENTS.md) | Instructions for AI coding agents: working rules, commands, ground rules, architecture. |
 
 ## Contributing
 

@@ -86,6 +86,15 @@ touches the audio path, say how you tested it: which formats, gapless or
 crossfade, and whether you watched the session appear on the Jellyfin
 dashboard.
 
+## Working with an AI agent
+
+That is fine, and common here: Sonarune itself was built largely with one (see
+the AI disclosure in the README). [`AGENTS.md`](AGENTS.md) is written for the
+agent — the working rules, the commands, the ground rules above in full, and
+the architecture. Claude Code, Codex, Copilot, Cursor and Gemini CLI pick it up
+on their own. You stay responsible for what the agent produces: review it,
+test it, and say in the pull request what you checked.
+
 ## Provenance
 
 Sonarune is written clean-room: no code or assets are taken from Feishin, only

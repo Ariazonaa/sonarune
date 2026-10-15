@@ -16,5 +16,10 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     include: ["src/**/*.{test,spec}.ts"],
+    // A checkout on a network share imports so slowly that a full pool of
+    // workers times out before it starts ("Timeout waiting for worker to
+    // respond"), and the run fails with no test having run. Two workers get
+    // through; CI on a local disk keeps the default.
+    maxWorkers: process.env.CI ? undefined : 2,
   },
 });
