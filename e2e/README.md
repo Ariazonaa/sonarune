@@ -20,7 +20,10 @@ logic. The **dialog focus trap** core flow is covered faster and more reliably
 as a Vitest component test (`src/lib/components/ConfirmDialog.test.ts`), not
 here.
 
-Verified green end-to-end on Windows (real app, restored session).
+Verified green end-to-end on Windows (real app, wdio 10, signed in to the
+dev server via `SONARUNE_TEST_*`). The suite builds under its own identifier
+`io.sonarune.e2e` (`tauri.e2e.conf.json`), so its session lives in its own
+data directory and never touches the installed app's.
 
 **Still manual** (see `docs/testing.md`), by design:
 - **Mini-player** and **projector** — separate `WebviewWindow`s; a single

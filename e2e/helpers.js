@@ -3,7 +3,8 @@
 
 /**
  * Make sure the app is at the signed-in shell.
- * - Restored session (this dev machine): already there → true.
+ * - Restored session (left by an earlier e2e run in the suite's own data
+ *   directory, io.sonarune.e2e): already there → true.
  * - Setup screen showing AND SONARUNE_TEST_{URL,USER,PASS} set (CI): sign in.
  * - Otherwise (signed out, no creds): returns false so the caller can skip.
  */
