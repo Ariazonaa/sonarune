@@ -4,7 +4,7 @@ version = "0.5.0"
 description = "A fast Jellyfin desktop music client"
 authors = ["Ariazonaa"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/Ariazonaa/jellysic"
+repository = "https://github.com/Ariazonaa/sonarune"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

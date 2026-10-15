@@ -1,4 +1,4 @@
-# Architecture — how Jellysic works
+# Architecture — how Sonarune works
 
 This page shows how the backend works, in diagrams. Every diagram
 below is [Mermaid](https://mermaid.js.org/) and renders directly on Gitea/GitHub.

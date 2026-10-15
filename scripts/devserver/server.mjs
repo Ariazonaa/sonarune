@@ -105,7 +105,7 @@ function artistItem(artist) {
     ChildCount: albums.length,
     ImageTags: albums[0] ? { Primary: albums[0].id } : {},
     ImageBlurHashes: {},
-    Overview: `${artist.name} is part of the Jellysic demo library. Nothing here is a real recording.`,
+    Overview: `${artist.name} is part of the Sonarune demo library. Nothing here is a real recording.`,
     UserData: userData(artist.id),
   };
 }
@@ -308,7 +308,7 @@ const server = createServer(async (req, res) => {
 
   // --- handshake ---
   if (p === "/system/info/public" || p === "/system/info") {
-    return json(res, { Version: "10.11.0", ServerName: "Jellysic dev", Id: idFor("server", "dev") });
+    return json(res, { Version: "10.11.0", ServerName: "Sonarune dev", Id: idFor("server", "dev") });
   }
   if (p === "/users/authenticatebyname") {
     await readBody(req);
@@ -316,7 +316,7 @@ const server = createServer(async (req, res) => {
   }
   if (p === "/users/me") return json(res, user);
 
-  // The older, user-scoped shape of the browse API. Jellysic does not use it;
+  // The older, user-scoped shape of the browse API. Sonarune does not use it;
   // other clients do, and a stand-in server that only answers one client is
   // not much of a stand-in.
   let um = /^\/users\/([0-9a-f-]+)(\/(views|items|items\/([0-9a-f]+)))?$/.exec(p);
@@ -458,7 +458,7 @@ if (made.madeCovers || made.madeAudio) {
 }
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Jellysic dev server on http://127.0.0.1:${PORT}`);
+  console.log(`Sonarune dev server on http://127.0.0.1:${PORT}`);
   console.log(
     `  ${library.artists.length} artists, ${library.albums.length} albums, ` +
       `${library.tracks.length} tracks, ${playlists.length} playlists`,

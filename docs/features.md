@@ -1,6 +1,6 @@
 # Features
 
-Everything Jellysic does, grouped and foldable. The README has the short
+Everything Sonarune does, grouped and foldable. The README has the short
 version, [`usage.md`](usage.md) walks through the app in order, and
 [`architecture.md`](architecture.md) explains how it works underneath; this
 page is the list you search when you want to know whether one specific thing
@@ -119,7 +119,7 @@ UI shows it, it never computes it.
   playlist when you want it to stop moving.
 - **Collections** — Jellyfin BoxSets, read-only.
 - **Auto-DJ**: pick a seed (track, artist, genre, album or playlist) and when
-  the queue is about to run dry, Jellysic appends a fresh instant mix. It
+  the queue is about to run dry, Sonarune appends a fresh instant mix. It
   resumes playback if the queue ran out before the mix arrived, and holds off
   while a sleep timer is about to end the session.
 
@@ -170,7 +170,7 @@ UI shows it, it never computes it.
   server still getting its progress reports.
 - **One instance**: a second launch hands over to the running window instead of
   starting a second player.
-- **In-app updates**: Jellysic can ask the release page whether a newer version
+- **In-app updates**: Sonarune can ask the release page whether a newer version
   exists (once per start, and that can be switched off) and install it from
   Settings. The download is verified against the project's signing key before
   the installer is opened, and an update never runs while a track is playing —
@@ -245,13 +245,13 @@ UI shows it, it never computes it.
 - **Remote visualizer presets are treated as code**: opt-in, downloaded in
   Rust, checked against a pinned hash.
 - **Updates are signed** and verified before they are installed.
-- Jellysic talks to your Jellyfin server, and — only if you configure it —
+- Sonarune talks to your Jellyfin server, and — only if you configure it —
   ListenBrainz and the release page. There is no telemetry.
 
 </details>
 
 <details>
-<summary><b>What Jellysic does not do</b></summary>
+<summary><b>What Sonarune does not do</b></summary>
 
 Deliberate non-goals, not gaps waiting to be filled:
 
@@ -259,6 +259,6 @@ Deliberate non-goals, not gaps waiting to be filled:
 - **Casting** (Chromecast, UPnP) and **SyncPlay**.
 - **Podcasts and audiobooks** — it is a music client.
 - **Multiple servers at once**, and no Subsonic or Navidrome backends.
-- **Video.** Jellysic plays music.
+- **Video.** Sonarune plays music.
 
 </details>

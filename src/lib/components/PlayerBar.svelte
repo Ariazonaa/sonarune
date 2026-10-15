@@ -69,7 +69,7 @@
         resizable: false,
         alwaysOnTop: true,
         decorations: false,
-        title: "Jellysic Mini",
+        title: "Sonarune Mini",
       });
     } catch (e) {
       player.error = String(e);

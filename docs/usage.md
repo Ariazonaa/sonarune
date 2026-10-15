@@ -1,6 +1,6 @@
 # Usage — a walkthrough of the client
 
-A tour of Jellysic from first launch to the visualizer projector. It follows the
+A tour of Sonarune from first launch to the visualizer projector. It follows the
 real routes and features, so it doubles as a "what can this thing do" reference.
 
 The diagrams below (Mermaid) render on Gitea/GitHub as-is.
@@ -16,7 +16,7 @@ On first start you land on the connect screen
    LAN address).
 2. Sign in with **username + password**, or use **Quick Connect** (enter the
    code shown here on any already-signed-in Jellyfin client).
-3. **Self-signed certificate?** Jellysic shows the server's SHA-256 fingerprint
+3. **Self-signed certificate?** Sonarune shows the server's SHA-256 fingerprint
    and asks you to confirm it once. After you accept, the fingerprint is pinned
    for *that* server — you won't be asked again, and other servers are
    unaffected. (Details: [architecture §8](architecture.md#8-certificate-pinning-self-signed-home-servers).)
@@ -133,7 +133,7 @@ The **Discover** hub (`/discover`) is about finding music you'd otherwise miss:
   BoxSets.
 
 **Auto-DJ** keeps the music going. Pick a seed — a track, artist, genre, album
-or playlist — and when the queue is about to run dry Jellysic appends a fresh
+or playlist — and when the queue is about to run dry Sonarune appends a fresh
 instant mix so playback never stops.
 
 ```mermaid
@@ -160,7 +160,7 @@ so duplicates and stale UI state don't cause the wrong row to move.
 
 ## 8. The visualizer
 
-On the **Visualizer** route (`/visualizer`) Jellysic runs
+On the **Visualizer** route (`/visualizer`) Sonarune runs
 **Butterchurn** (MilkDrop-style WebGL presets) driven by the *actual* audio:
 
 - 393 presets across seven bundled packs, with a **preset browser**. The online **Butterchurn
@@ -226,4 +226,4 @@ detection):
 
 - **How the backend works, visually:** [`architecture.md`](architecture.md)
 - **Testing & CI:** [`testing.md`](testing.md)
-- **Roadmap / open work:** [issues](https://github.com/Ariazonaa/jellysic/issues)
+- **Roadmap / open work:** [issues](https://github.com/Ariazonaa/sonarune/issues)

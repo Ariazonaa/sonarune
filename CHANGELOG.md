@@ -64,7 +64,7 @@ caveat that a minor bump may still change behaviour.
 - An update check now says in the log what it found — the version offered and
   the one it was compared against. The panel only ever shows the answer, and a
   diagnostic export should be able to answer the next question by itself.
-- Groundwork for installing Jellysic with `winget`: the three manifests that
+- Groundwork for installing Sonarune with `winget`: the three manifests that
   the Windows package repository wants are generated from a published release —
   download URL, release date and the checksum, the last of these re-computed
   against the installer as it is actually served — instead of being typed out
@@ -230,9 +230,9 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/jellysic/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/Ariazonaa/jellysic/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/Ariazonaa/jellysic/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/Ariazonaa/jellysic/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/Ariazonaa/jellysic/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Ariazonaa/jellysic/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Ariazonaa/sonarune/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Ariazonaa/sonarune/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Ariazonaa/sonarune/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Ariazonaa/sonarune/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Ariazonaa/sonarune/releases/tag/v0.1.0

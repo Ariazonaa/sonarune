@@ -3527,7 +3527,7 @@ fn init_media_controls(
     let hwnd = hwnd?;
     let config = souvlaki::PlatformConfig {
         dbus_name: "jellysic",
-        display_name: "Jellysic",
+        display_name: "Sonarune",
         hwnd: Some(hwnd as *mut std::ffi::c_void),
     };
     let mut controls = match souvlaki::MediaControls::new(config) {

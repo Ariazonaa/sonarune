@@ -110,7 +110,7 @@
   const windowTitle = $derived.by(() => {
     const s = player.state;
     const c = s.current;
-    if (!c || s.status === "idle") return "Jellysic";
+    if (!c || s.status === "idle") return "Sonarune";
     const icon = s.status === "paused" ? "⏸" : "▶";
     return `${icon} ${c.artist} – ${c.name}`;
   });

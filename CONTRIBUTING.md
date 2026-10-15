@@ -88,6 +88,6 @@ dashboard.
 
 ## Provenance
 
-Jellysic is written clean-room: no code or assets are taken from Feishin, only
+Sonarune is written clean-room: no code or assets are taken from Feishin, only
 concepts. The licence now permits more than that, but the provenance stays as
 it is. If you port an idea from another client, say so in the pull request.

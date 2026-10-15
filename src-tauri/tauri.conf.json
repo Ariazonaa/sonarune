@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "jellysic",
+  "productName": "Sonarune",
   "version": "0.5.0",
   "identifier": "io.jellysic.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Jellysic",
+        "title": "Sonarune",
         "width": 1280,
         "height": 800,
         "minWidth": 900,
@@ -29,7 +29,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/Ariazonaa/jellysic/releases/latest/download/latest.json"
+        "https://github.com/Ariazonaa/sonarune/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFEMDg2MEYxQzE3M0E4RTYKUldUbXFIUEI4V0FJSFZEWDN5L21DK09RTEJwSXRaWGUxRmxSSkY3bit3RmtRMHYwdzdKWTVBNk0K",
       "windows": {

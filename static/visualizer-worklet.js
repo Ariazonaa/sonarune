@@ -8,7 +8,7 @@
 //
 // Ring buffer with a bounded latency: if the producer runs ahead (burst after
 // a stall), we skip forward so visuals never lag the audible audio by much.
-export class JellysicVisFeed extends AudioWorkletProcessor {
+export class SonaruneVisFeed extends AudioWorkletProcessor {
   constructor() {
     super();
     // Capacity and latency are in frames (one left + one right sample).
@@ -65,4 +65,4 @@ export class JellysicVisFeed extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor("jellysic-vis-feed", JellysicVisFeed);
+registerProcessor("jellysic-vis-feed", SonaruneVisFeed);

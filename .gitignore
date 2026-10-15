@@ -29,13 +29,3 @@ src/lib/paraglide/
 /.cargo-lock
 /.cargo-build-lock
 /.cargo-artifact-lock
-
-# Files that belong to the private origin only.
-/TODO.md
-/done.md
-/docs/features.de.md
-/CLAUDE.md
-/.gitea/
-/.gitleaks.toml
-/archive/
-/scripts/publish-public.mjs
