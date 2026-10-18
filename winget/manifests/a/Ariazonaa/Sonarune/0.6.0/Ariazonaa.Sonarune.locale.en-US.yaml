@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
+
+PackageIdentifier: Ariazonaa.Sonarune
+PackageVersion: 0.6.0
+PackageLocale: en-US
+Publisher: Ariazonaa
+PublisherUrl: https://github.com/Ariazonaa
+PublisherSupportUrl: https://github.com/Ariazonaa/sonarune/issues
+Author: Ariazonaa
+PackageName: Sonarune
+PackageUrl: https://github.com/Ariazonaa/sonarune
+License: GPL-3.0-or-later
+LicenseUrl: https://github.com/Ariazonaa/sonarune/blob/main/LICENSE
+Copyright: Copyright (C) 2026 Ariazonaa
+CopyrightUrl: https://github.com/Ariazonaa/sonarune/blob/main/LICENSE
+ShortDescription: Third-party music client for Jellyfin
+Description: >-
+  Sonarune is a desktop music client for a Jellyfin server. The interface is Tauri 2 and Svelte
+  5; the audio path -- decoding, DSP, gapless playback, crossfade, output device -- lives in
+  Rust, so there is no Electron and no external mpv binary. It plays your library with a queue,
+  playlists, smart views, lyrics, an equaliser, a visualizer, a mini player and media-key and
+  taskbar integration, and it keeps itself up to date.
+Moniker: sonarune
+Tags:
+  - audio
+  - flac
+  - jellyfin
+  - media
+  - music
+  - music-player
+  - player
+  - rust
+  - streaming
+  - tauri
+ReleaseNotes: |-
+  Upgrading from 0.5.x
+
+  Install 0.6.0 by hand once: download the installer below and run it over your Jellysic. The built-in updater of 0.5.x cannot take this release, because the key that signs updates has changed: 0.5.x may offer the update and then refuse it. Everything else carries over (see "Jellysic is now Sonarune" below), and from 0.6.0 on updates arrive through the app again.
+
+  Added
+
+  - Sound per output device. With the new switch in Settings → Playback, equalizer, normalization, preamp and volume are remembered for every output device and come back on their own when audio plays through that device again — plugging in headphones no longer means retuning the speakers' curve. It follows the device that actually plays, including "system default" and a fallback after a device was unplugged.
+  - Crossfade on the beat. A new switch next to the crossfade settings starts the next track so that its first beat lands on a beat of the current one, with an overlap of whole bars. When the keys clash, the overlap stays at one bar; when the tempos are too far apart (more than 4 %, half and double time count as matching), it is the usual crossfade. Tempo, beat grid and key are worked out on your computer from the same decode the seek-bar waveform already uses, and kept, so a track is analysed once. Tempo and key (with its Camelot code) also show in a track's info.
+  - Playback speed. A new button in the player bar sets the speed from 0.5× to 2×, with presets and a slider. The pitch stays where it is (time-stretching with Signalsmith Stretch), or, with "Keep pitch" off, follows the speed like a record. At 1× the stage is bypassed and the sound is exactly what it was. Seeking, crossfades, crossfades on the beat, the sleep timer and ListenBrainz all keep working at other speeds. The speed is remembered and part of the settings export.
+
+  Changed
+
+  - Jellysic is now Sonarune. New name, new mark (an S whose tail is a note head), and the name goes all the way down: the program folder, the exe, the app identifier (io.sonarune.app), the database, the keyring entries and every stored preference. An installed 0.5.x, upgraded by hand (see above), keeps its sign-in, settings, queue, cover cache and window position: the app moves its data over from the old locations on first start, and the installer removes the old installation and carries its Start-menu and desktop shortcuts over. A taskbar pin has to be set again. Visualizer backups exported under the old name still import.
+
+  Fixed
+
+  - A sleep timer that ran out while playback was paused no longer swallows the next press of Play: the timer switches itself off, and Play plays. Before, the first press only cleared the timer, and the player bar still showed it as waiting for the end of the track.
+ReleaseNotesUrl: https://github.com/Ariazonaa/sonarune/releases/tag/v0.6.0
+ManifestType: defaultLocale
+ManifestVersion: 1.28.0

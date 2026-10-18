@@ -146,7 +146,8 @@ async function release(version) {
     );
   }
 
-  const installerName = `sonarune_${version}_x64-setup.exe`;
+  // Tauri names the installer after productName, case and all (Sonarune_…).
+  const installerName = `${json("src-tauri/tauri.conf.json").productName}_${version}_x64-setup.exe`;
   const asset = (name) => found.assets.find((a) => a.name === name);
   const installer = asset(installerName);
   const sums = asset("SHA256SUMS.txt");
