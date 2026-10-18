@@ -7,6 +7,16 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-18
+
+### Upgrading from 0.5.x
+
+**Install 0.6.0 by hand once**: download the installer below and run it over
+your Jellysic. The built-in updater of 0.5.x cannot take this release,
+because the key that signs updates has changed: 0.5.x may offer the update and
+then refuse it. Everything else carries over (see "Jellysic is now Sonarune"
+below), and from 0.6.0 on updates arrive through the app again.
+
 ### Added
 
 - **Sound per output device.** With the new switch in Settings → Playback,
@@ -36,8 +46,8 @@ caveat that a minor bump may still change behaviour.
 - **Jellysic is now Sonarune.** New name, new mark (an S whose tail is a note
   head), and the name goes all the way down: the program folder, the exe, the
   app identifier (`io.sonarune.app`), the database, the keyring entries and
-  every stored preference. An installed 0.5.x updates as usual and keeps its
-  sign-in, settings, queue, cover cache and window position: the app moves its
+  every stored preference. An installed 0.5.x, upgraded by hand (see above),
+  keeps its sign-in, settings, queue, cover cache and window position: the app moves its
   data over from the old locations on first start, and the installer removes
   the old installation and carries its Start-menu and desktop shortcuts over.
   A taskbar pin has to be set again. Visualizer backups exported under the old
@@ -282,7 +292,8 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Ariazonaa/sonarune/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Ariazonaa/sonarune/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Ariazonaa/sonarune/compare/v0.3.0...v0.4.0

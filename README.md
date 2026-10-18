@@ -63,8 +63,11 @@ Settings when you say so — never while a track is playing, and only after the
 download's signature checks out against the project's key. The portable zip
 cannot do that; it gets its new version by hand.
 
-Up to 0.5.1 the project was called **Jellysic**. An installed 0.5.x picks the
-new version up through the usual update path. Your sign-in, settings and queue
+Up to 0.5.1 the project was called **Jellysic**. An installed 0.5.x is moved
+to 0.6.0 **by hand, once**: run the installer from the release over the old
+version. The 0.5.x updater cannot do it, because the key that signs updates has
+changed; from 0.6.0 on, updates come through the app again. Your sign-in,
+settings and queue
 move along with it, and the new installer removes the old installation and its
 Start-menu entry itself. Only an entry pinned to the taskbar needs pinning
 again.
