@@ -36,6 +36,13 @@ caveat that a minor bump may still change behaviour.
   A taskbar pin has to be set again. Visualizer backups exported under the old
   name still import.
 
+### Fixed
+
+- A sleep timer that ran out while playback was paused no longer swallows the
+  next press of Play: the timer switches itself off, and Play plays. Before,
+  the first press only cleared the timer, and the player bar still showed it
+  as waiting for the end of the track.
+
 ## [0.5.1] — 2026-10-15
 
 ### Security

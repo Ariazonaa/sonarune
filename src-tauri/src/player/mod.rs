@@ -1929,6 +1929,14 @@ impl Worker {
                 self.fading_out = None;
             }
         }
+        // A timer that runs out during a pause has nothing left to do: the
+        // music already stopped. Disarm it, so the next Play plays.
+        if matches!(self.status, PlaybackStatus::Paused | PlaybackStatus::Idle)
+            && self.sleep_timer_due()
+        {
+            self.disarm_sleep_timer();
+            self.emit();
+        }
         if self.maybe_transition() || self.status != PlaybackStatus::Playing {
             return;
         }
@@ -1941,13 +1949,11 @@ impl Worker {
 
         // Sleep timer: pause when the deadline passes (unless the user asked
         // to finish the running track first — handled at the boundary).
-        if let Some(sleep_at) = self.sleep_at {
-            if Instant::now() >= sleep_at && !self.sleep_end_of_track {
-                self.sleep_at = None;
-                self.sleep_fade_item = None;
-                self.pause();
-                return;
-            }
+        if self.sleep_timer_due() {
+            self.sleep_at = None;
+            self.sleep_fade_item = None;
+            self.pause();
+            return;
         }
 
         self.ticks_since_report += 1;
@@ -2006,6 +2012,17 @@ impl Worker {
             .queue
             .get(self.index)
             .map(|track| track.item_id.clone());
+    }
+
+    /// A minutes timer whose deadline has passed (an end-of-track timer
+    /// fires at the boundary instead).
+    fn sleep_timer_due(&self) -> bool {
+        !self.sleep_end_of_track && self.sleep_at.is_some_and(|at| Instant::now() >= at)
+    }
+
+    fn disarm_sleep_timer(&mut self) {
+        self.sleep_at = None;
+        self.cancel_sleep_fade();
     }
 
     fn cancel_sleep_fade(&mut self) {
@@ -2541,12 +2558,10 @@ impl Worker {
     fn resume_or_start(&mut self) {
         match self.status {
             PlaybackStatus::Paused => {
-                if !self.sleep_end_of_track && self.sleep_at.is_some_and(|at| Instant::now() >= at)
-                {
-                    self.sleep_at = None;
-                    self.cancel_sleep_fade();
-                    self.emit();
-                    return;
+                // Ran out during the pause (the tick disarms it, but a Play
+                // can come first): it is done, and Play means play.
+                if self.sleep_timer_due() {
+                    self.disarm_sleep_timer();
                 }
                 if let Some(sink) = &self.sink {
                     sink.play();
