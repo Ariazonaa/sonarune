@@ -7,7 +7,10 @@ Contributing section in the [README](README.md).
 
 You need **Rust** with the MSVC toolchain and the C++ build tools, **Node.js
 22+**, and **cmake** on `PATH` — the `opus` crate builds a bundled libopus, and
-without cmake the build stops there.
+without cmake the build stops there. The `signalsmith-stretch` crate (playback
+speed) runs bindgen, which needs **libclang**: the Visual Studio component "C++
+Clang tools for Windows" or an LLVM install; set `LIBCLANG_PATH` if it is
+somewhere else.
 
 ```powershell
 npm install

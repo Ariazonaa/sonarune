@@ -5,6 +5,7 @@
   import { player } from "#lib/state/player.svelte.js";
   import { api } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { getLocale } from "#lib/paraglide/runtime.js";
   import Cover from "./Cover.svelte";
   import PlaybackProgress from "./PlaybackProgress.svelte";
   import Popover from "./Popover.svelte";
@@ -52,6 +53,20 @@
   function setSleep(minutes: number | null, endOfTrack: boolean) {
     sleepOpen = false;
     player.run(api.setSleepTimer(minutes, endOfTrack, sleepFadeSeconds));
+  }
+
+  // Playback speed: popover with presets, a slider and the pitch switch.
+  let speedOpen = $state(false);
+  let speedButton = $state<HTMLElement | null>(null);
+  const SPEED_PRESETS = [0.75, 0.9, 1, 1.1, 1.25, 1.5];
+  const speedLabel = (speed: number) =>
+    m.speed_value({
+      speed: speed.toLocaleString(getLocale(), { maximumFractionDigits: 2 }),
+    });
+  const speedChanged = $derived(Math.abs(s.speed - 1) >= 0.005);
+
+  function setSpeed(speed: number, preservePitch = s.preservePitch) {
+    player.run(api.playerSetSpeed(speed, preservePitch));
   }
 
   /** Open (or focus) the frameless mini-player window. */
@@ -124,8 +139,88 @@
     <PlaybackProgress class="max-w-xl" />
   </div>
 
-  <!-- Sleep timer + mini player + visualizer + panels + volume -->
-  <div class="flex w-64 items-center justify-end gap-1.5">
+  <!-- Speed + sleep timer + mini player + visualizer + panels + volume -->
+  <div class="flex w-72 items-center justify-end gap-1.5">
+    <div>
+      {#if speedOpen}
+        <Popover
+          anchor={speedButton}
+          placement="above"
+          align="end"
+          role="dialog"
+          label={m.speed_title()}
+          onclose={() => (speedOpen = false)}
+          class="w-60"
+        >
+          <p class="px-3 pt-1.5 pb-1 text-[11px] font-bold tracking-wide text-ink-muted uppercase">
+            {m.speed_title()}
+          </p>
+          <div class="flex items-center gap-2 px-3 py-1">
+            <input
+              type="range"
+              min="0.5"
+              max="2"
+              step="0.05"
+              value={s.speed}
+              oninput={(e) => setSpeed(Number(e.currentTarget.value))}
+              class="h-1 min-w-0 flex-1 accent-(--color-accent)"
+              aria-label={m.speed_title()}
+              data-testid="speed-slider"
+            />
+            <span class="w-12 text-right text-sm tabular-nums">{speedLabel(s.speed)}</span>
+          </div>
+          <div class="grid grid-cols-3 gap-1 px-2 py-1">
+            {#each SPEED_PRESETS as preset (preset)}
+              <button
+                class="rounded-md px-2 py-1 text-sm tabular-nums {Math.abs(s.speed - preset) < 0.005
+                  ? 'bg-accent/20 text-accent'
+                  : 'hover:bg-ink/10'}"
+                onclick={() => setSpeed(preset)}
+              >
+                {speedLabel(preset)}
+              </button>
+            {/each}
+          </div>
+          <label class="mx-2 mt-1 flex items-center gap-2 border-t border-edge px-1 pt-2 pb-1 text-sm">
+            <input
+              type="checkbox"
+              checked={s.preservePitch}
+              onchange={(e) => setSpeed(s.speed, e.currentTarget.checked)}
+              class="h-4 w-4 accent-(--color-accent)"
+            />
+            {m.speed_preserve_pitch()}
+          </label>
+          <button
+            class="w-full rounded-md px-3 py-1.5 text-left text-sm hover:bg-ink/10 disabled:opacity-50"
+            disabled={!speedChanged}
+            onclick={() => {
+              speedOpen = false;
+              setSpeed(1);
+            }}
+          >
+            {m.speed_reset()}
+          </button>
+        </Popover>
+      {/if}
+      <button
+        bind:this={speedButton}
+        class="rounded p-1.5 transition-colors {speedChanged
+          ? 'text-accent'
+          : 'text-ink-muted hover:text-ink'}"
+        onclick={() => (speedOpen = !speedOpen)}
+        aria-label={m.speed_title()}
+        title={`${m.speed_title()} · ${speedLabel(s.speed)}`}
+        data-testid="speed-toggle"
+      >
+        {#if speedChanged}
+          <span class="block h-4.5 min-w-4.5 text-xs leading-4.5 font-semibold tabular-nums">{speedLabel(s.speed)}</span>
+        {:else}
+          <svg viewBox="0 0 24 24" class="h-4.5 w-4.5" fill="currentColor" aria-hidden="true">
+            <path d="M20.38 8.57l-1.23 1.85a8 8 0 0 1-.22 7.58H5.07A8 8 0 0 1 15.58 6.85l1.85-1.23A10 10 0 0 0 3.35 19a2 2 0 0 0 1.72 1h13.85a2 2 0 0 0 1.74-1 10 10 0 0 0-.27-10.44zm-9.79 6.84a2 2 0 0 0 2.83 0l5.66-8.49-8.49 5.66a2 2 0 0 0 0 2.83z"/>
+          </svg>
+        {/if}
+      </button>
+    </div>
     <div>
       {#if sleepOpen}
         <Popover

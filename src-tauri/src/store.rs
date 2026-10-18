@@ -34,6 +34,7 @@ pub mod keys {
     pub const CAN_EDIT: &str = "can_edit";
     pub const DESKTOP: &str = "desktop";
     pub const AUDIO_PROFILES: &str = "audio_profiles";
+    pub const PLAYBACK_SPEED: &str = "playback_speed";
 }
 
 impl Store {
@@ -116,6 +117,7 @@ impl Store {
             keys::EXTRAS,
             keys::DESKTOP,
             keys::AUDIO_PROFILES,
+            keys::PLAYBACK_SPEED,
         ] {
             if let Some(value) = self.get(key) {
                 let value = if key == keys::EXTRAS {
@@ -141,6 +143,7 @@ impl Store {
             keys::EXTRAS,
             keys::DESKTOP,
             keys::AUDIO_PROFILES,
+            keys::PLAYBACK_SPEED,
         ] {
             if let Some(serde_json::Value::String(value)) = map.get(key) {
                 let value = match key {
@@ -185,6 +188,14 @@ impl Store {
                             continue;
                         }
                         value.clone()
+                    }
+                    // Clamped on the way in: a hand-edited 50x stays 2x.
+                    keys::PLAYBACK_SPEED => {
+                        match serde_json::from_str::<crate::player::tempo::SpeedSetting>(value) {
+                            Ok(setting) => serde_json::to_string(&setting.clamped())
+                                .unwrap_or_else(|_| value.clone()),
+                            Err(_) => continue,
+                        }
                     }
                     _ => value.clone(),
                 };

@@ -146,6 +146,8 @@ export const api = {
   checkServer: () => invoke<boolean>("check_server"),
   getLyrics: (itemId: string) => invoke<LyricsDto>("get_lyrics", { itemId }),
   playInstantMix: (itemId: string) => invoke<void>("play_instant_mix", { itemId }),
+  playerSetSpeed: (speed: number, preservePitch: boolean) =>
+    invoke<void>("player_set_speed", { speed, preservePitch }),
   setSleepTimer: (minutes: number | null, endOfTrack: boolean, fadeSeconds = 30) =>
     invoke<void>("set_sleep_timer", { minutes, endOfTrack, fadeSeconds }),
   /** Arm "stop after this track / album" on a queue entry, or on what is

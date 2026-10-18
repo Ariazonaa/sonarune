@@ -23,6 +23,13 @@ caveat that a minor bump may still change behaviour.
   beat grid and key are worked out on your computer from the same decode the
   seek-bar waveform already uses, and kept, so a track is analysed once.
   Tempo and key (with its Camelot code) also show in a track's info.
+- **Playback speed.** A new button in the player bar sets the speed from
+  0.5× to 2×, with presets and a slider. The pitch stays where it is
+  (time-stretching with Signalsmith Stretch), or, with "Keep pitch" off,
+  follows the speed like a record. At 1× the stage is bypassed and the sound
+  is exactly what it was. Seeking, crossfades, crossfades on the beat, the
+  sleep timer and ListenBrainz all keep working at other speeds. The speed is
+  remembered and part of the settings export.
 
 ### Changed
 

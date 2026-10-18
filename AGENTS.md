@@ -78,6 +78,7 @@ The app mark (a bold S whose lower stroke ends in a tilted note head) is **gener
 The NSIS installer is branded (custom header/sidebar art, `installerIcon`, de/en language selector, `currentUser` install) via `bundle.windows.nsis` in `tauri.conf.json`. The header/sidebar bitmaps in `src-tauri/installer/*.bmp` are **generated** (24-bit BMP3, the format NSIS requires) from the app logo by `scripts/make-installer-art.mjs` (`node scripts/make-installer-art.mjs`, needs the `pngjs` devDep). Re-run it if the logo/brand changes; it also drops PNG previews in the temp dir.
 
 **Environment gotchas:**
+- Building needs **libclang** too (`signalsmith-stretch` runs bindgen); clang-sys finds the one in VS Build Tools (`VC\Tools\Llvm\x64\bin`) on its own.
 - Building needs **cmake** on PATH (the `opus` crate compiles bundled libopus). It's in the user PATH already (VS Build Tools CMake); if a build complains, prepend `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`.
 - **CI installs the latest `stable` Rust on every run; a pinned local toolchain does not follow.** A lint introduced in a newer clippy therefore fails CI while the local `cargo clippy --all-targets -- -D warnings` stays green — check the CI log's `rustc` version before assuming a flaky run.
 - If port 1420 is stuck after a killed dev run, kill the owning process (`Get-NetTCPConnection -LocalPort 1420`).

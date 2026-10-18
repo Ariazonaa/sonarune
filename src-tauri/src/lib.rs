@@ -270,6 +270,7 @@ pub fn run() {
             commands::reveal_path,
             commands::play_instant_mix,
             commands::set_sleep_timer,
+            commands::player_set_speed,
             commands::player_set_stop_after,
             commands::get_extras_settings,
             commands::set_extras_settings,

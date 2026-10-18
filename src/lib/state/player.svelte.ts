@@ -30,6 +30,8 @@ const initial: PlayerState = {
   shuffleMode: "off",
   repeat: "off",
   bufferedMs: null,
+  speed: 1,
+  preservePitch: true,
 };
 
 const REPEAT_CYCLE = ["off", "all", "one"] as const;

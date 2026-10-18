@@ -1442,6 +1442,21 @@ pub async fn play_instant_mix(state: State<'_, AppState>, item_id: String) -> Ap
     })
 }
 
+/// Playback speed, 0.5-2 (clamped); `preserve_pitch` keeps the pitch.
+#[tauri::command]
+pub fn player_set_speed(
+    state: State<'_, AppState>,
+    speed: f32,
+    preserve_pitch: bool,
+) -> AppResult<()> {
+    state
+        .player
+        .send(PlayerCommand::SetSpeed(player::tempo::SpeedSetting {
+            speed,
+            preserve_pitch,
+        }))
+}
+
 #[tauri::command]
 pub fn set_sleep_timer(
     state: State<'_, AppState>,
@@ -1575,6 +1590,16 @@ pub fn import_settings(
         if let Ok(params) = serde_json::from_str(&raw) {
             state.player.dsp().update(params);
         }
+    }
+    if imported
+        .iter()
+        .any(|k| k == crate::store::keys::PLAYBACK_SPEED)
+    {
+        let _ = state
+            .player
+            .send(PlayerCommand::SetSpeed(player::tempo::SpeedSetting::load(
+                &state.store,
+            )));
     }
     cache.set_limit_mb(crate::desktop::load(&state.store).cover_cache_limit_mb);
     Ok(imported)

@@ -273,6 +273,10 @@ export interface PlayerState {
   /** Downloaded part of the current track as `[start, end]` in ms (estimated
    *  from bytes); null when the stream length is unknown (live transcode). */
   bufferedMs: [number, number] | null;
+  /** Playback speed, 1 = normal (0.5–2). */
+  speed: number;
+  /** Keep the pitch at other speeds; off, it follows the speed. */
+  preservePitch: boolean;
 }
 
 /** `player:waveform` — peaks (0–255) of a track, once its download finished. */

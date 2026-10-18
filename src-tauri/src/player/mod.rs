@@ -5,6 +5,7 @@ pub mod opus;
 mod scrobble;
 pub mod source;
 pub mod tap;
+pub mod tempo;
 pub mod waveform;
 
 use crate::api::JellyfinClient;
@@ -628,6 +629,9 @@ pub struct PlayerState {
     /// seek bar. Estimated from bytes, so approximate for variable bitrates;
     /// `None` when the stream length is unknown (live transcode).
     pub buffered_ms: Option<(u64, u64)>,
+    /// Playback speed (1 = normal) and whether the pitch is kept.
+    pub speed: f32,
+    pub preserve_pitch: bool,
 }
 
 impl Default for PlayerState {
@@ -647,6 +651,8 @@ impl Default for PlayerState {
             stop_after: StopAfter::Off,
             stop_after_item: None,
             buffered_ms: None,
+            speed: 1.0,
+            preserve_pitch: true,
         }
     }
 }
@@ -742,6 +748,7 @@ pub enum PlayerCommand {
         volume: f32,
     },
     SetPlaybackSettings(PlaybackSettings),
+    SetSpeed(tempo::SpeedSetting),
     SetExtrasSettings(ExtrasSettings),
     /// None clears the timer; `end_of_track` pauses at the next boundary
     /// after the minutes elapsed (or immediately at the boundary when 0).
@@ -1115,7 +1122,10 @@ struct Worker {
     session: SharedSession,
     shared_state: Arc<Mutex<PlayerState>>,
     shared_queue: Arc<Mutex<QueueSnapshot>>,
-    output: rodio::stream::MixerDeviceSink,
+    output: Output,
+    /// Playback speed: the stage in front of the device, and the setting.
+    tempo: tempo::TempoHandle,
+    speed: tempo::SpeedSetting,
     media: Option<souvlaki::MediaControls>,
     dsp: Arc<AudioDsp>,
     tap: Arc<tap::VisualizerTap>,
@@ -1276,15 +1286,17 @@ impl Worker {
             .get(keys::PLAY_MODE)
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
+        let speed = tempo::SpeedSetting::load(&store);
+        let tempo = tempo::TempoHandle::new(speed.speed, speed.preserve_pitch);
         let (output, output_dead, output_device) =
-            match open_output(&playback.output_device, tx.clone()) {
+            match open_output(&playback.output_device, &tempo, tx.clone()) {
                 Ok(opened) => {
                     crate::audio_devices::clear_fallback();
                     opened
                 }
                 Err(e) => {
                     tracing::warn!("configured output device failed ({e}); using default");
-                    let opened = open_output(&None, tx.clone())?;
+                    let opened = open_output(&None, &tempo, tx.clone())?;
                     if let Some(requested_device) = playback.output_device.clone() {
                         crate::audio_devices::mark_fallback(requested_device.clone());
                         let _ = app.emit(
@@ -1310,6 +1322,8 @@ impl Worker {
             shared_state,
             shared_queue,
             output,
+            tempo,
+            speed,
             media,
             dsp,
             tap,
@@ -1586,6 +1600,29 @@ impl Worker {
                     self.playback.output_device = old_device;
                     self.persist_playback();
                 }
+            }
+            PlayerCommand::SetSpeed(setting) => {
+                let old_speed = self.tempo.speed();
+                // What played so far counts at the speed it played at.
+                self.listen
+                    .sample_at(Instant::now(), self.position_ms(), old_speed);
+                self.speed = setting.clamped();
+                self.tempo.set(self.speed.speed, self.speed.preserve_pitch);
+                // Deadlines on the clock that stand for track time (a
+                // crossfade tail, the silence before a beat transition) move
+                // with the speed.
+                let now = Instant::now();
+                let factor = old_speed / self.tempo.speed();
+                let rescale = |at: Instant| now + at.saturating_duration_since(now).mul_f32(factor);
+                if let Some((_, _, drop_at)) = &mut self.fading_out {
+                    *drop_at = rescale(*drop_at);
+                }
+                self.lead_until = self.lead_until.map(rescale);
+                self.speed.save(&self.store);
+                // A sleep fade in progress was timed for the old speed.
+                self.cancel_sleep_fade();
+                self.update_sleep_fade();
+                self.emit();
             }
             PlayerCommand::OutputFailed => self.handle_output_failed(),
             PlayerCommand::AutoDjResult {
@@ -1943,7 +1980,8 @@ impl Worker {
         if self.sink.is_none() {
             return;
         }
-        self.listen.sample(Instant::now(), self.position_ms());
+        self.listen
+            .sample_at(Instant::now(), self.position_ms(), self.tempo.speed());
 
         self.update_sleep_fade();
 
@@ -2007,7 +2045,13 @@ impl Worker {
         } else {
             0.0
         };
-        fade.begin(gain, 0.0, remaining);
+        // The ramp runs in track time; a minutes timer counts on the clock.
+        let ramp = if self.sleep_end_of_track {
+            remaining
+        } else {
+            remaining.mul_f32(self.tempo.speed())
+        };
+        fade.begin(gain, 0.0, ramp);
         self.sleep_fade_item = self
             .queue
             .get(self.index)
@@ -2149,6 +2193,9 @@ impl Worker {
         } else {
             PREFETCH_OPEN_REMAINING_MS
         };
+        // The window is time to get the next track ready, on the clock: at
+        // 2x, 20 s of track pass in 10.
+        let window_ms = (window_ms as f32 * self.tempo.speed().max(1.0)) as u64;
         if should_start_prefetch(
             self.prefetched.is_some() || self.prefetch_inflight.is_some(),
             self.appended.as_deref(),
@@ -2270,11 +2317,13 @@ impl Worker {
             .start_at_ms
             .saturating_sub(PLAN_LEAD_MS)
             .saturating_sub(self.position_ms());
-        if until >= TICK.as_millis() as u64 {
+        // Track time; the clock runs it at the playback speed.
+        let until = self.tempo.wall(Duration::from_millis(until));
+        if until >= TICK {
             TICK
         } else {
             // Due already (a command kept the loop busy): tick right away.
-            Duration::from_millis(until.max(1))
+            until.max(Duration::from_millis(1))
         }
     }
 
@@ -2299,7 +2348,7 @@ impl Worker {
             self.fading_out = Some((
                 old,
                 fade,
-                Instant::now() + Duration::from_millis(fade_ms + 500),
+                Instant::now() + self.tempo.wall(Duration::from_millis(fade_ms + 500)),
             ));
         }
         // A next source already gapless-appended to the old player (the queue
@@ -2319,7 +2368,8 @@ impl Worker {
         if lead_ms > 0 {
             // The player reports positions per source: the track's own
             // position starts at zero once the silence is through.
-            self.lead_until = Some(Instant::now() + Duration::from_millis(lead_ms));
+            self.lead_until =
+                Some(Instant::now() + self.tempo.wall(Duration::from_millis(lead_ms)));
             use rodio::Source as _;
             sink.append(
                 rodio::source::Zero::new(p.source.channels(), p.source.sample_rate())
@@ -2531,7 +2581,7 @@ impl Worker {
             if let Some((_, fade, _)) = &self.fading_out {
                 fade.ramp_to(0.0, Duration::from_millis(PAUSE_FADE_MS));
             }
-            std::thread::sleep(Duration::from_millis(PAUSE_FADE_MS + 20));
+            std::thread::sleep(self.tempo.wall(Duration::from_millis(PAUSE_FADE_MS + 20)));
             // The track boundary may have been crossed while we slept;
             // resolve it so index/position/fade handles are current.
             self.maybe_transition();
@@ -2851,8 +2901,8 @@ impl Worker {
             } else {
                 self.playback.output_device.clone()
             };
-            let reopened = open_output(&requested_device, self.tx.clone())
-                .or_else(|_| open_output(&None, self.tx.clone()));
+            let reopened = open_output(&requested_device, &self.tempo, self.tx.clone())
+                .or_else(|_| open_output(&None, &self.tempo, self.tx.clone()));
             match reopened {
                 Ok((output, dead, device)) => {
                     self.output = output;
@@ -3046,7 +3096,7 @@ impl Worker {
     /// keeps the previous output untouched) when the new device cannot open.
     fn try_rebuild_output(&mut self, device: Option<String>) -> bool {
         self.last_output_rebuild = Instant::now();
-        match open_output(&device, self.tx.clone()) {
+        match open_output(&device, &self.tempo, self.tx.clone()) {
             Ok((output, dead, device)) => {
                 crate::audio_devices::clear_fallback();
                 let position_ms = self.position_ms();
@@ -3134,7 +3184,8 @@ impl Worker {
     fn report_stopped(&mut self, track: &QueueTrack, position_ms: u64) {
         // Measure up to where it stopped (its full length at a natural end);
         // the listen rule then goes by time listened, not by that position.
-        self.listen.sample(Instant::now(), position_ms);
+        self.listen
+            .sample_at(Instant::now(), position_ms, self.tempo.speed());
         let listened_ms = self.listen.take();
         if self.recent_tracks.back() != Some(&track.item_id) {
             self.recent_tracks.push_back(track.item_id.clone());
@@ -3205,7 +3256,8 @@ impl Worker {
         let Some(track) = self.queue.get(self.index).cloned() else {
             return;
         };
-        self.listen.sample(Instant::now(), position_ms);
+        self.listen
+            .sample_at(Instant::now(), position_ms, self.tempo.speed());
         let listened_ms = self.listen.take();
         // Jellyfin first: the caller waits only briefly, and a slow
         // ListenBrainz must not use up the time the session report needs.
@@ -3487,10 +3539,11 @@ impl Worker {
         // out quickly instead of hard-cutting (pop).
         if let Some((_, fade, drop_at)) = &mut self.fading_out {
             fade.ramp_to(0.0, Duration::from_millis(50));
-            *drop_at = Instant::now() + Duration::from_millis(150);
+            *drop_at = Instant::now() + self.tempo.wall(Duration::from_millis(150));
         }
         // What played up to here was listened to; the jump is not.
-        self.listen.sample(Instant::now(), self.position_ms());
+        self.listen
+            .sample_at(Instant::now(), self.position_ms(), self.tempo.speed());
         let Some(sink) = &self.sink else {
             return;
         };
@@ -3549,7 +3602,8 @@ impl Worker {
         };
         let resume_paused = self.status == PlaybackStatus::Paused;
         // Listening continues from the target; the jump there is not counted.
-        self.listen.sample(Instant::now(), self.position_ms());
+        self.listen
+            .sample_at(Instant::now(), self.position_ms(), self.tempo.speed());
         self.listen.rebase(Instant::now(), position_ms);
         self.generation = self.generation.wrapping_add(1);
         self.prefetched = None;
@@ -3689,6 +3743,8 @@ impl Worker {
             stop_after: self.stop_after,
             stop_after_item: self.stop_after_item.clone(),
             buffered_ms,
+            speed: self.speed.speed,
+            preserve_pitch: self.speed.preserve_pitch,
         };
         *self.shared_state.lock().unwrap() = state.clone();
         let _ = self.app.emit("player:state", &state);
@@ -3703,12 +3759,9 @@ impl Worker {
 #[allow(deprecated)]
 fn open_output(
     device_name: &Option<String>,
+    tempo: &tempo::TempoHandle,
     tx: Sender<PlayerCommand>,
-) -> AppResult<(
-    rodio::stream::MixerDeviceSink,
-    Arc<std::sync::atomic::AtomicBool>,
-    Option<String>,
-)> {
+) -> AppResult<(Output, Arc<std::sync::atomic::AtomicBool>, Option<String>)> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait};
 
     // The device is resolved once and opened as such, so the name the
@@ -3745,7 +3798,31 @@ fn open_output(
         })
         .open_stream()
         .map_err(|e| AppError::Audio(format!("cannot open audio output: {e}")))?;
-    Ok((sink, dead, resolved))
+    // The players mix into a mixer of their own, at the device's format,
+    // which reaches the device through the tempo stage.
+    let (mixer, mixed) =
+        rodio::mixer::mixer(sink.config().channel_count(), sink.config().sample_rate());
+    sink.mixer().add(tempo::wrap(mixed, tempo));
+    Ok((
+        Output {
+            mixer,
+            _device: sink,
+        },
+        dead,
+        resolved,
+    ))
+}
+
+/// An open output: the device, and the mixer the players connect to.
+struct Output {
+    mixer: rodio::mixer::Mixer,
+    _device: rodio::stream::MixerDeviceSink,
+}
+
+impl Output {
+    fn mixer(&self) -> &rodio::mixer::Mixer {
+        &self.mixer
+    }
 }
 
 /// Output device names for the settings UI.

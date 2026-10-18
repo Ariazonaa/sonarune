@@ -89,6 +89,7 @@ Folded up by area; the full list, with the reasoning, is in
   server transcode.
 - Output-device selection with automatic fallback on device hotplug; sleep timer
   with fade-out, and **stop after this track or this album** from the queue.
+- Playback speed from 0.5× to 2×, with or without keeping the pitch.
 
 </details>
 
@@ -344,7 +345,9 @@ What Sonarune does differently is where the audio lives.
 ## Getting started
 
 Prerequisites: **Rust** (MSVC toolchain + the C++ build tools), **Node.js 22+**,
-**cmake** on `PATH` (the `opus` crate builds bundled libopus), and a **Jellyfin
+**cmake** on `PATH` (the `opus` crate builds bundled libopus), **libclang**
+(the Visual Studio component "C++ Clang tools for Windows", or LLVM;
+`signalsmith-stretch` generates its bindings with it), and a **Jellyfin
 server 10.11+**.
 
 ```powershell

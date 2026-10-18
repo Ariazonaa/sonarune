@@ -44,11 +44,19 @@ impl ListenClock {
         self.last = Some((now, position_ms));
     }
 
+    #[cfg(test)]
     pub fn sample(&mut self, now: Instant, position_ms: u64) {
+        self.sample_at(now, position_ms, 1.0);
+    }
+
+    /// `rate` is the playback speed: at 1.5x a second on the clock plays
+    /// 1.5 s of the track, and that is listening, not a seek.
+    pub fn sample_at(&mut self, now: Instant, position_ms: u64, rate: f32) {
         if let Some((at, from)) = self.last {
             let elapsed_ms = now.saturating_duration_since(at).as_millis() as u64;
+            let played_ms = (elapsed_ms as f64 * f64::from(rate.max(1.0))) as u64;
             if let Some(step) = position_ms.checked_sub(from) {
-                if step <= elapsed_ms.saturating_add(LISTEN_SLACK_MS) {
+                if step <= played_ms.saturating_add(LISTEN_SLACK_MS) {
                     self.listened_ms = self.listened_ms.saturating_add(step);
                 }
             }
@@ -148,6 +156,20 @@ fn submit(token: String, body: serde_json::Value) {
 mod tests {
     use super::{should_scrobble, ListenClock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn faster_playback_still_counts() {
+        let mut clock = ListenClock::default();
+        let start = Instant::now();
+        clock.restart(start, 0);
+        // Ten seconds on the clock are 15 s of track at 1.5x.
+        clock.sample_at(start + Duration::from_secs(10), 15_000, 1.5);
+        assert_eq!(clock.take(), 15_000);
+        // The same step at 1x is a seek.
+        clock.restart(start, 0);
+        clock.sample(start + Duration::from_secs(10), 15_000);
+        assert_eq!(clock.take(), 0);
+    }
 
     #[test]
     fn scrobble_rules() {
