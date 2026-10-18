@@ -3,8 +3,9 @@ name: Release
 # Cuts a release from a tag, so the installer people download is one CI built
 # from a commit anyone can check out -- not one somebody produced on their own
 # machine. Push a `v*` tag and a DRAFT release appears with the installer, a
-# portable zip, their checksums and the updater manifest; review it, then
-# publish by hand.
+# portable zip and the updater manifest; review it, then publish by hand.
+# GitHub shows a SHA-256 next to every file of a release, so there is no
+# separate checksum file.
 #
 # A manual run builds the same way but creates nothing. That is the way to find
 # out whether the release path still works without cutting a release.
@@ -188,23 +189,6 @@ jobs:
             Get-Content "$out/latest.json"
           }
 
-          # The list is materialized with @() before anything is written: a
-          # PowerShell pipeline streams, so writing the sums file straight out of
-          # a Get-ChildItem over the same directory makes it try to hash the file
-          # it is at that moment creating.
-          $files = @(Get-ChildItem $out -File)
-          $sums = $files | Get-FileHash -Algorithm SHA256 |
-            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) }
-
-          # LF, no BOM. This file exists to be fed to `sha256sum -c`, and there a
-          # CRLF ending becomes part of the file name -- every line fails to open.
-          # Set-Content would write CRLF on Windows, so go through .NET directly.
-          $lf = [string][char]10
-          [System.IO.File]::WriteAllText(
-            (Join-Path (Get-Location) "$out/SHA256SUMS.txt"),
-            (($sums -join $lf) + $lf),
-            (New-Object System.Text.UTF8Encoding $false))
-          Get-Content "$out/SHA256SUMS.txt"
           Get-ChildItem $out | Select-Object Name, Length
 
       - name: Draft the release
@@ -217,7 +201,6 @@ jobs:
           # here-string the backtick is the escape character, and release notes
           # are full of them.
           $bt = [string][char]96
-          $fence = $bt * 3
           $setup = "Sonarune_$($env:VERSION)_x64-setup.exe"
 
           # Only a signed build can be installed as an update, so these two
@@ -259,12 +242,6 @@ jobs:
             "publisher: **More info -> Run anyway**."
             ""
             $signature
-            "Checksums are in ${bt}SHA256SUMS.txt${bt}. To verify a download:"
-            ""
-            ($fence + "powershell")
-            "Get-FileHash .\$setup -Algorithm SHA256"
-            $fence
-            ""
             "What changed is in [CHANGELOG.md](https://github.com/$($env:GITHUB_REPOSITORY)/blob/$($env:GITHUB_REF_NAME)/CHANGELOG.md)."
           ) | Out-File -FilePath notes.md -Encoding utf8
 

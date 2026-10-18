@@ -53,8 +53,7 @@ is self-contained, the interface is embedded in it.
 
 It is not code-signed, so SmartScreen calls the publisher unknown. **More info →
 Run anyway.** That is a reputation problem rather than a technical one, and it
-is on the list. Every release carries a `SHA256SUMS.txt`, and the builds are
-produced by [the release workflow](.github/workflows/release.yml) from the
+is on the list. The builds are produced by [the release workflow](.github/workflows/release.yml) from the
 tagged commit rather than on someone's machine.
 
 From 0.2.0 on, the installed app keeps itself current: it asks once per start

@@ -1,6 +1,6 @@
 // Write the winget manifests for a release that is already published.
 //
-//   node scripts/winget-manifest.mjs [version] [--out DIR] [--trust-sums]
+//   node scripts/winget-manifest.mjs [version] [--out DIR] [--trust-digest]
 //
 // winget installs from a manifest that lives in microsoft/winget-pkgs, not
 // from anything this repository serves: three YAML files per version, carrying
@@ -10,11 +10,11 @@
 //
 // Everything that changes per release is read from the release itself: the
 // GitHub API is asked for the tag, which gives the installer's real download
-// URL and the date it was published, and the checksum comes out of the
-// `SHA256SUMS.txt` that rides along with it. By default the installer is then
-// downloaded and hashed as well, because the sums file only proves what the
-// build thought it wrote, not what the release actually serves today; the
-// download is ~7 MB and `--trust-sums` skips it.
+// URL and the date it was published, and the checksum is the SHA-256 GitHub
+// keeps for every release file (`digest`). By default the installer is then
+// downloaded and hashed as well, so the manifest is checked against what the
+// release serves rather than taken on trust; the download is ~8 MB and
+// `--trust-digest` skips it.
 //
 // Everything that has to agree with the app is read from the app's own
 // manifests rather than repeated here: the ARP entries (what the installer
@@ -130,7 +130,7 @@ async function fetchJson(url) {
 
 /**
  * The published release for a version: its date, the installer's download URL
- * and the checksum the build recorded for it.
+ * and the SHA-256 GitHub records for it.
  *
  * Unauthenticated, which is deliberate — a draft release is invisible without a
  * token, and a draft is exactly what must not be turned into a manifest: its
@@ -150,16 +150,11 @@ async function release(version) {
   const installerName = `${json("src-tauri/tauri.conf.json").productName}_${version}_x64-setup.exe`;
   const asset = (name) => found.assets.find((a) => a.name === name);
   const installer = asset(installerName);
-  const sums = asset("SHA256SUMS.txt");
   if (!installer) throw new Error(`${tag} carries no ${installerName}`);
-  if (!sums) throw new Error(`${tag} carries no SHA256SUMS.txt`);
 
-  const sumsText = await (await fetch(sums.browser_download_url)).text();
-  const line = sumsText.split(/\r?\n/).find((l) => l.trim().endsWith(installerName));
-  if (!line) throw new Error(`SHA256SUMS.txt of ${tag} does not mention ${installerName}`);
-  const sha256 = line.trim().split(/\s+/)[0];
-  if (!/^[a-f0-9]{64}$/i.test(sha256)) {
-    throw new Error(`SHA256SUMS.txt of ${tag} has no usable checksum for ${installerName}`);
+  const sha256 = /^sha256:([a-f0-9]{64})$/i.exec(installer.digest ?? "")?.[1];
+  if (!sha256) {
+    throw new Error(`GitHub reports no SHA-256 for ${installerName} of ${tag} (digest: ${installer.digest})`);
   }
 
   return {
@@ -180,7 +175,7 @@ async function verifyDownload(info) {
   if (actual !== info.sha256) {
     throw new Error(
       `the installer served at ${info.url} hashes to ${actual},\n` +
-        `but SHA256SUMS.txt of the release says ${info.sha256}. Do not submit this.`,
+        `but GitHub's digest for it says ${info.sha256}. Do not submit this.`,
     );
   }
   return bytes.length;
@@ -351,11 +346,11 @@ const version = positional[0] ?? json("package.json").version;
 const out = option("--out", join(root, "winget"));
 
 const info = await release(version);
-if (flag("--trust-sums")) {
-  console.log(`checksum taken from SHA256SUMS.txt, installer not downloaded`);
+if (flag("--trust-digest")) {
+  console.log(`checksum taken from GitHub's digest, installer not downloaded`);
 } else {
   const bytes = await verifyDownload(info);
-  console.log(`downloaded ${(bytes / 1024 / 1024).toFixed(1)} MB, hash matches SHA256SUMS.txt`);
+  console.log(`downloaded ${(bytes / 1024 / 1024).toFixed(1)} MB, hash matches GitHub's digest`);
 }
 
 // manifests/<first letter of the publisher, lowercased>/<Publisher>/<Package>/<version>

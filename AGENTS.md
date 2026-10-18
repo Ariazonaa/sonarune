@@ -88,7 +88,7 @@ The NSIS installer is branded (custom header/sidebar art, `installerIcon`, de/en
 Releases are cut by `.github/workflows/release.yml`, not by hand: push a `v*`
 tag whose version matches all three manifests (package.json, tauri.conf.json,
 Cargo.toml — the workflow refuses the build otherwise) and a **draft** release
-appears with the NSIS installer, a portable zip and `SHA256SUMS.txt`; review it
+appears with the NSIS installer, a portable zip and `latest.json`; review it
 and publish by hand. A manual run builds the same way and creates nothing,
 which is how to check the release path without cutting a release. Keep
 `CHANGELOG.md` current in the same commit that bumps the version.
@@ -103,7 +103,7 @@ re-run only makes another draft.
 
 For **winget**, `node scripts/winget-manifest.mjs` writes the three manifests
 of a *published* release into `winget/manifests/` — download URL and date from
-the GitHub API, checksum from `SHA256SUMS.txt` and re-computed against the
+the GitHub API, checksum from GitHub's per-file `digest` and re-computed against the
 downloaded installer, the ARP entries read out of `tauri.conf.json` so they
 cannot drift from what the installer actually registers. Submitting is by
 hand: fork microsoft/winget-pkgs, copy `winget/manifests/*` over its
