@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { apiLibrary } from "$lib/api/library";
-  import { confirm } from "$lib/state/confirm.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { m } from "$lib/paraglide/messages";
-  import { portal } from "$lib/portal";
-  import type { EditableMetadata, MetadataEdits } from "$lib/types";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { confirm } from "#lib/state/confirm.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { portal } from "#lib/portal.js";
+  import type { EditableMetadata, MetadataEdits } from "#lib/types.js";
 
   let {
     itemId,

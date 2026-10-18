@@ -1,14 +1,14 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { apiDiscovery } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import LibraryAlbumCard from "$lib/components/LibraryAlbumCard.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
-  import type { AlbumDto, Page } from "$lib/types";
+  import { apiDiscovery } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import LibraryAlbumCard from "#lib/components/LibraryAlbumCard.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { library } from "#lib/state/library.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
+  import type { AlbumDto, Page } from "#lib/types.js";
 
   let {
     title,

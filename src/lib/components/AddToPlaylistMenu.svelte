@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { apiLibrary } from "$lib/api/library";
-  import { player } from "$lib/state/player.svelte";
-  import { toast } from "$lib/state/toast.svelte";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
   // Aliased: this file has its own `playlists` — the list it renders.
-  import { playlists as playlistStore } from "$lib/state/playlists.svelte";
-  import { m } from "$lib/paraglide/messages";
-  import type { PlaylistDto } from "$lib/types";
+  import { playlists as playlistStore } from "#lib/state/playlists.svelte.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import type { PlaylistDto } from "#lib/types.js";
   import Popover from "./Popover.svelte";
 
   let {

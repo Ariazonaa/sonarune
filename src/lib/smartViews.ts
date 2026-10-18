@@ -1,5 +1,5 @@
-import type { SmartFilter } from "$lib/api/discovery";
-import type { SessionInfo } from "$lib/types";
+import type { SmartFilter } from "#lib/api/discovery.js";
+import type { SessionInfo } from "#lib/types.js";
 
 export interface SavedSmartView {
   id: string;
@@ -9,7 +9,7 @@ export interface SavedSmartView {
   updatedAt: string;
 }
 
-const STORAGE_PREFIX = "jellysic:smart-views:v1:";
+const STORAGE_PREFIX = "sonarune:smart-views:v1:";
 
 export const emptySmartFilter = (): SmartFilter => ({
   yearFrom: null,

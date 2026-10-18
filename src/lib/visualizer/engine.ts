@@ -1,6 +1,6 @@
 import butterchurn, { type ButterchurnVisualizer } from "butterchurn";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { m } from "$lib/paraglide/messages";
+import { m } from "#lib/paraglide/messages.js";
 import { decodeFrame, resampleInterleaved, toMono, toStereo } from "./pcm";
 
 export type EnergyLevel = "calm" | "medium" | "intense";
@@ -114,7 +114,7 @@ export class VisualizerEngine {
         return null;
       }
 
-      const worklet = new AudioWorkletNode(ctx, "jellysic-vis-feed", {
+      const worklet = new AudioWorkletNode(ctx, "sonarune-vis-feed", {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [2],

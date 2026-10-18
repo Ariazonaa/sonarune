@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { m } from "$lib/paraglide/messages";
-  import { help } from "$lib/state/help.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import { help } from "#lib/state/help.svelte.js";
   import {
     formatShortcutBinding,
     shortcutSettings,
     SHORTCUT_ACTIONS,
-  } from "$lib/state/shortcuts.svelte";
-  import { shortcutActionLabel } from "$lib/shortcutLabels";
+  } from "#lib/state/shortcuts.svelte.js";
+  import { shortcutActionLabel } from "#lib/shortcutLabels.js";
 
   const rows = $derived(
     SHORTCUT_ACTIONS.map((action) => ({

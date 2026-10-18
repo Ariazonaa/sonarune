@@ -1,12 +1,12 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { goto } from "$app/navigation";
-  import { api } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
+  import { api } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
   import Cover from "./Cover.svelte";
-  import { palette } from "$lib/state/palette.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import type { SearchResults, TrackDto } from "$lib/types";
+  import { palette } from "#lib/state/palette.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import type { SearchResults, TrackDto } from "#lib/types.js";
 
   interface Entry {
     id: string;

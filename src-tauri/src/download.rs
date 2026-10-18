@@ -530,7 +530,7 @@ fn part_path(destination: &Path, id: &str, attempt: u64) -> PathBuf {
     // The attempt number keeps a retry's partial file distinct from a just-
     // cancelled run's still-unlinked one (same id), so `create_new` cannot
     // spuriously collide with it.
-    let suffix = format!(".jellysic-{id}-{attempt}.part");
+    let suffix = format!(".sonarune-{id}-{attempt}.part");
     // The partial name must fit one path component as well. The final name is
     // bounded already, but the suffix adds ~70 more: shorten the copy of the
     // name, never the suffix the startup sweep recognizes.
@@ -553,7 +553,8 @@ fn cleanup_stale_parts(dir: &Path) {
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age >= Duration::from_secs(24 * 60 * 60));
         if entry.file_type().is_ok_and(|kind| kind.is_file())
-            && name.contains(".jellysic-")
+            // `.jellysic-` is what builds before the rename left behind.
+            && (name.contains(".sonarune-") || name.contains(".jellysic-"))
             && name.ends_with(".part")
             && stale
         {
@@ -597,10 +598,10 @@ mod tests {
         let part_name = part.file_name().and_then(|n| n.to_str()).unwrap();
         assert!(filename_len(part_name) <= MAX_FILENAME_LEN, "{part_name}");
         assert!(part_name.encode_utf16().count() <= 255);
-        assert!(part_name.ends_with(&format!(".jellysic-{id}-{}.part", u64::MAX)));
+        assert!(part_name.ends_with(&format!(".sonarune-{id}-{}.part", u64::MAX)));
 
         // And the file system agrees (this used to fail with os error 123).
-        let dir = std::env::temp_dir().join(format!("jellysic-part-test-{id}"));
+        let dir = std::env::temp_dir().join(format!("sonarune-part-test-{id}"));
         std::fs::create_dir(&dir).unwrap();
         let created = [collided.as_str(), part_name]
             .map(|file| std::fs::File::create(dir.join(file)).map(drop));
@@ -615,7 +616,7 @@ mod tests {
         let path = part_path(Path::new(r"C:\Downloads\song.flac"), "task-id", 0);
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
-            Some("song.flac.jellysic-task-id-0.part")
+            Some("song.flac.sonarune-task-id-0.part")
         );
     }
 

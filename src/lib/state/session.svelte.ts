@@ -1,6 +1,6 @@
-import { api } from "$lib/api";
-import { swrClear } from "$lib/swr";
-import type { ConnectResult, SessionInfo } from "$lib/types";
+import { api } from "#lib/api.js";
+import { swrClear } from "#lib/swr.js";
+import type { ConnectResult, SessionInfo } from "#lib/types.js";
 
 class SessionStore {
   info = $state<SessionInfo | null>(null);

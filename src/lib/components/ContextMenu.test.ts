@@ -1,6 +1,6 @@
 import { flushSync, mount, tick, unmount } from "svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import Harness from "$lib/components/ContextMenu.harness.svelte";
+import Harness from "#lib/components/ContextMenu.harness.svelte";
 
 // Keyboard access to context menus, end to end through a row with
 // `contextMenuKey`, ContextMenu and Popover: opening from the keyboard or the

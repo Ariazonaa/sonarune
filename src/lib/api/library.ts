@@ -13,7 +13,7 @@ import type {
   PlaylistDto,
   StatsData,
   TrackDto,
-} from "$lib/types";
+} from "#lib/types.js";
 
 /** Library-slice commands (src-tauri/src/commands_library.rs). */
 export const apiLibrary = {

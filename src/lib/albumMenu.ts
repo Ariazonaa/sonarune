@@ -1,8 +1,8 @@
-import { api } from "$lib/api";
-import { m } from "$lib/paraglide/messages";
-import { player } from "$lib/state/player.svelte";
-import type { ContextMenuItem } from "$lib/components/ContextMenu.svelte";
-import type { AlbumDto } from "$lib/types";
+import { api } from "#lib/api.js";
+import { m } from "#lib/paraglide/messages.js";
+import { player } from "#lib/state/player.svelte.js";
+import type { ContextMenuItem } from "#lib/components/ContextMenu.svelte";
+import type { AlbumDto } from "#lib/types.js";
 
 const ICON = {
   play: "M8 5v14l11-7L8 5z",

@@ -17,7 +17,7 @@
 
 <script lang="ts">
   import { tick, type Snippet } from "svelte";
-  import { portal } from "$lib/portal";
+  import { portal } from "#lib/portal.js";
   import {
     MENU_ITEM,
     isEditable,
@@ -25,7 +25,7 @@
     lastInputWasKeyboard,
     menuItemFor,
     typeaheadItem,
-  } from "$lib/menu";
+  } from "#lib/menu.js";
 
   interface Props {
     /** Open at a viewport point — context menus open at the cursor. */

@@ -2,17 +2,17 @@
   import { onMount } from "svelte";
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { m } from "$lib/paraglide/messages";
-  import { formatDuration } from "$lib/api";
-  import Cover from "$lib/components/Cover.svelte";
-  import { lyrics } from "$lib/state/lyrics.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import type { LyricLineDto } from "$lib/types";
+  import { m } from "#lib/paraglide/messages.js";
+  import { formatDuration } from "#lib/api.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import { lyrics } from "#lib/state/lyrics.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import type { LyricLineDto } from "#lib/types.js";
   import {
     REMOTE_PRESETS_KEY,
     VisualizerController,
     loadRemotePresetsSetting,
-  } from "$lib/visualizer/controller";
+  } from "#lib/visualizer/controller.js";
   import {
     PROJECTOR_SETTINGS_EVENT,
     PROJECTOR_SETTINGS_KEY,
@@ -23,7 +23,7 @@
     saveProjectorSettings,
     type VisualizerOverlayKind,
     type VisualizerProjectorSettings,
-  } from "$lib/visualizer/projector";
+  } from "#lib/visualizer/projector.js";
 
   let container = $state<HTMLElement | null>(null);
   let canvas = $state<HTMLCanvasElement | null>(null);

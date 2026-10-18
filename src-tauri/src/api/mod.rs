@@ -9,7 +9,7 @@ use std::{
 };
 use types::*;
 
-pub const CLIENT_NAME: &str = "Jellysic";
+pub const CLIENT_NAME: &str = "Sonarune";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The download name from a Content-Disposition header.
@@ -3749,8 +3749,8 @@ mod token_probe_tests {
 /// end-to-end (the risky server-contract part that unit tests can't cover):
 ///
 /// ```text
-/// JELLYSIC_TEST_URL=https://jellyfin.example.com \
-/// JELLYSIC_TEST_USER=alice JELLYSIC_TEST_PASS=secret \
+/// SONARUNE_TEST_URL=https://jellyfin.example.com \
+/// SONARUNE_TEST_USER=alice SONARUNE_TEST_PASS=secret \
 /// cargo test --lib smoke -- --ignored --nocapture
 /// ```
 ///
@@ -3762,19 +3762,19 @@ mod smoke {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "needs a live server; set JELLYSIC_TEST_{URL,USER,PASS}"]
+    #[ignore = "needs a live server; set SONARUNE_TEST_{URL,USER,PASS}"]
     async fn live_flows() {
         let (Ok(url), Ok(user), Ok(pass)) = (
-            std::env::var("JELLYSIC_TEST_URL"),
-            std::env::var("JELLYSIC_TEST_USER"),
-            std::env::var("JELLYSIC_TEST_PASS"),
+            std::env::var("SONARUNE_TEST_URL"),
+            std::env::var("SONARUNE_TEST_USER"),
+            std::env::var("SONARUNE_TEST_PASS"),
         ) else {
-            eprintln!("skipping: set JELLYSIC_TEST_URL / _USER / _PASS to run");
+            eprintln!("skipping: set SONARUNE_TEST_URL / _USER / _PASS to run");
             return;
         };
 
         let mut client =
-            JellyfinClient::new(url.trim_end_matches('/'), "jellysic-smoke", Vec::new())
+            JellyfinClient::new(url.trim_end_matches('/'), "sonarune-smoke", Vec::new())
                 .expect("client");
         client.authenticate(&user, &pass).await.expect("login");
         eprintln!("✓ authenticated");
@@ -4107,7 +4107,7 @@ mod smoke {
             let seed: Vec<String> = tracks.iter().take(2).map(|t| t.id.clone()).collect();
             if !seed.is_empty() {
                 let pid = client
-                    .create_playlist("Jellysic smoke test — delete me", &seed[..1])
+                    .create_playlist("Sonarune smoke test — delete me", &seed[..1])
                     .await
                     .expect("create_playlist");
                 eprintln!("✓ created playlist {pid}");
@@ -4123,7 +4123,7 @@ mod smoke {
                 // The key contract to verify: a Name-only rename must NOT drop
                 // the tracks (older UpdatePlaylistDto implementations did).
                 client
-                    .rename_playlist(&pid, "Jellysic smoke test — renamed")
+                    .rename_playlist(&pid, "Sonarune smoke test — renamed")
                     .await
                     .expect("rename");
                 let after = client
@@ -4138,7 +4138,7 @@ mod smoke {
                 );
                 let renamed = client.playlist(&pid).await.expect("playlist after rename");
                 assert_eq!(
-                    renamed.name, "Jellysic smoke test — renamed",
+                    renamed.name, "Sonarune smoke test — renamed",
                     "name updated"
                 );
                 eprintln!("✓ rename preserved {n_before} tracks");

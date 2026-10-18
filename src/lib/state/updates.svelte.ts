@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
-import { api } from "$lib/api";
-import type { UpdateInfo } from "$lib/types";
+import { api } from "#lib/api.js";
+import type { UpdateInfo } from "#lib/types.js";
 
 interface Progress {
   downloaded: number;

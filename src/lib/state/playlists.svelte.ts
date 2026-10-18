@@ -1,5 +1,5 @@
-import { apiLibrary } from "$lib/api/library";
-import type { PlaylistDto } from "$lib/types";
+import { apiLibrary } from "#lib/api/library.js";
+import type { PlaylistDto } from "#lib/types.js";
 
 /**
  * The user's playlists, for the sidebar.

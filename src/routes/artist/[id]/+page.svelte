@@ -1,15 +1,15 @@
 <script lang="ts">
   import { page } from "$app/state";
-  import { api, formatDuration } from "$lib/api";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import CoverBackdrop from "$lib/components/CoverBackdrop.svelte";
-  import AlbumContextMenu from "$lib/components/AlbumContextMenu.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { createAlbumMenu } from "$lib/state/albumMenu.svelte";
-  import { contextMenuKey } from "$lib/menu";
-  import { swrGet, swrSet, swrDelete } from "$lib/swr";
-  import type { AlbumDto, ArtistDetail, ArtistDto, TrackDto } from "$lib/types";
+  import { api, formatDuration } from "#lib/api.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import CoverBackdrop from "#lib/components/CoverBackdrop.svelte";
+  import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
+  import { contextMenuKey } from "#lib/menu.js";
+  import { swrGet, swrSet, swrDelete } from "#lib/swr.js";
+  import type { AlbumDto, ArtistDetail, ArtistDto, TrackDto } from "#lib/types.js";
 
   const am = createAlbumMenu();
 

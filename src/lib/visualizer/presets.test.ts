@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { m } from "$lib/paraglide/messages";
+import { m } from "#lib/paraglide/messages.js";
 import {
   blankPreset,
   PresetFetchError,

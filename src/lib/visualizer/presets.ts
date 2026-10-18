@@ -1,6 +1,6 @@
 import type { EnergyLevel } from "./engine";
-import { api } from "$lib/api";
-import { m } from "$lib/paraglide/messages";
+import { api } from "#lib/api.js";
+import { m } from "#lib/paraglide/messages.js";
 
 export type PresetComplexity = "light" | "medium" | "heavy";
 

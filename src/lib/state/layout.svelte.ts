@@ -17,7 +17,7 @@ const CARD_SIZE_PIXELS: Record<CardSize, { min: number; stride: number }> = {
 // v2: a single global layout (v1 was a per-view map, which was confusing —
 // configured from /settings it silently targeted the settings page). Old v1
 // data is ignored; everyone starts from the default.
-const STORAGE_KEY = "jellysic.layout.v2";
+const STORAGE_KEY = "sonarune.layout.v2";
 const DEFAULT_LAYOUT: ViewLayout = {
   density: "comfortable",
   cardSize: "medium",

@@ -171,7 +171,7 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
   c.composite(logo, size, size, Math.round((164 - size) / 2), 64);
   c.eqBars(14, 296, 16, 6, 3, 40, 0.22);
   fs.writeFileSync(path.join(OUT_DIR, "sidebar.bmp"), encodeBMP(c));
-  writePreview(c, "jellysic-sidebar.png");
+  writePreview(c, "sonarune-sidebar.png");
 }
 
 // --- Header (150×57): inner pages ---
@@ -184,7 +184,7 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
   c.composite(logo, size, size, 9, 8);
   c.eqBars(96, 44, 9, 4, 2, 26, 0.25);
   fs.writeFileSync(path.join(OUT_DIR, "header.bmp"), encodeBMP(c));
-  writePreview(c, "jellysic-header.png");
+  writePreview(c, "sonarune-header.png");
 }
 
 console.log("Wrote src-tauri/installer/{sidebar,header}.bmp");

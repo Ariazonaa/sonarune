@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getVersion } from "@tauri-apps/api/app";
-  import { m } from "$lib/paraglide/messages";
-  import { player } from "$lib/state/player.svelte";
-  import { updates } from "$lib/state/updates.svelte";
-  import { updateErrorMessage } from "$lib/updateErrors";
-  import type { DesktopSettings } from "$lib/types";
+  import { m } from "#lib/paraglide/messages.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { updates } from "#lib/state/updates.svelte.js";
+  import { updateErrorMessage } from "#lib/updateErrors.js";
+  import type { DesktopSettings } from "#lib/types.js";
 
   let {
     desktop = $bindable(),

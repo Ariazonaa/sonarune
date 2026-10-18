@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { formatDuration } from "$lib/api";
-  import { percentOf, positionAtPointer, positionForKey, waveformBars } from "$lib/seek";
+  import { formatDuration } from "#lib/api.js";
+  import { percentOf, positionAtPointer, positionForKey, waveformBars } from "#lib/seek.js";
 
   interface Props {
     positionMs: number;

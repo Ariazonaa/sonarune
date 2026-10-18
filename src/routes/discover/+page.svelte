@@ -1,23 +1,23 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api } from "$lib/api";
+  import { api } from "#lib/api.js";
   import {
     apiDiscovery,
     type DecadeDto,
     type DiscoverData,
     type DiscoverRow,
     type SimilarArtistsRow,
-  } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import LibraryAlbumCard from "$lib/components/LibraryAlbumCard.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import DiscoveryArtistCard from "$lib/components/DiscoveryArtistCard.svelte";
-  import DiscoveryTrackCard from "$lib/components/DiscoveryTrackCard.svelte";
-  import CardSkeleton from "$lib/components/CardSkeleton.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
-  import type { AlbumDto, GenreDto, TrackDto } from "$lib/types";
+  } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import LibraryAlbumCard from "#lib/components/LibraryAlbumCard.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import DiscoveryArtistCard from "#lib/components/DiscoveryArtistCard.svelte";
+  import DiscoveryTrackCard from "#lib/components/DiscoveryTrackCard.svelte";
+  import CardSkeleton from "#lib/components/CardSkeleton.svelte";
+  import { library } from "#lib/state/library.svelte.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
+  import type { AlbumDto, GenreDto, TrackDto } from "#lib/types.js";
 
   let randomAlbums = $state<DiscoverRow<AlbumDto> | null>(
     swrGet<DiscoverRow<AlbumDto>>("discover:random") ?? null,

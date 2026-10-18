@@ -1,4 +1,4 @@
-import { confirm } from "$lib/state/confirm.svelte";
+import { confirm } from "#lib/state/confirm.svelte.js";
 
 /**
  * Whether a modal dialog is open: the shared confirmation, or any element

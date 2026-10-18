@@ -7,9 +7,79 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-18
+
+### Upgrading from 0.5.x
+
+**Install 0.6.0 by hand once**: download the installer below and run it over
+your Jellysic. The built-in updater of 0.5.x cannot take this release,
+because the key that signs updates has changed: 0.5.x may offer the update and
+then refuse it. Everything else carries over (see "Jellysic is now Sonarune"
+below), and from 0.6.0 on updates arrive through the app again.
+
+### Added
+
+- **Sound per output device.** With the new switch in Settings → Playback,
+  equalizer, normalization, preamp and volume are remembered for every output
+  device and come back on their own when audio plays through that device
+  again — plugging in headphones no longer means retuning the speakers'
+  curve. It follows the device that actually plays, including "system
+  default" and a fallback after a device was unplugged.
+- **Crossfade on the beat.** A new switch next to the crossfade settings
+  starts the next track so that its first beat lands on a beat of the
+  current one, with an overlap of whole bars. When the keys clash, the
+  overlap stays at one bar; when the tempos are too far apart (more than 4 %,
+  half and double time count as matching), it is the usual crossfade. Tempo,
+  beat grid and key are worked out on your computer from the same decode the
+  seek-bar waveform already uses, and kept, so a track is analysed once.
+  Tempo and key (with its Camelot code) also show in a track's info.
+- **Playback speed.** A new button in the player bar sets the speed from
+  0.5× to 2×, with presets and a slider. The pitch stays where it is
+  (time-stretching with Signalsmith Stretch), or, with "Keep pitch" off,
+  follows the speed like a record. At 1× the stage is bypassed and the sound
+  is exactly what it was. Seeking, crossfades, crossfades on the beat, the
+  sleep timer and ListenBrainz all keep working at other speeds. The speed is
+  remembered and part of the settings export.
+
+### Changed
+
+- **Jellysic is now Sonarune.** New name, new mark (an S whose tail is a note
+  head), and the name goes all the way down: the program folder, the exe, the
+  app identifier (`io.sonarune.app`), the database, the keyring entries and
+  every stored preference. An installed 0.5.x, upgraded by hand (see above),
+  keeps its sign-in, settings, queue, cover cache and window position: the app moves its
+  data over from the old locations on first start, and the installer removes
+  the old installation and carries its Start-menu and desktop shortcuts over.
+  A taskbar pin has to be set again. Visualizer backups exported under the old
+  name still import.
+
+### Fixed
+
+- A sleep timer that ran out while playback was paused no longer swallows the
+  next press of Play: the timer switches itself off, and Play plays. Before,
+  the first press only cleared the timer, and the player bar still showed it
+  as waiting for the end of the track.
+
+## [0.5.1] — 2026-10-15
+
+### Security
+
+- Three dependencies updated for published advisories: `serialize-javascript`
+  7.1.2 (GHSA-gfhx-hw2g-v5hg), `source-map-js` 1.2.2 (CVE-2026-93749) and
+  `brace-expansion` 2.1.7 / 1.1.21. All three are build- and test-time tools;
+  nothing else changed in the app.
+
 ## [0.5.0] — 2026-09-22
 
-### Removed
+### Changed
+
+- **The installer is built by a pipeline that runs no third-party code.** The
+  one action that was not GitHub's own is gone — it put the Microsoft compiler
+  on the PATH, which turned out to be something nothing needed: cargo finds the
+  linker and cmake finds Visual Studio through the registry. Proven before it
+  was removed, uncached, on every runner this project builds on. What signs and
+  publishes your installer is now GitHub's checkout and GitHub's node setup,
+  and nothing else.
 
 ### Fixed
 
@@ -56,6 +126,12 @@ caveat that a minor bump may still change behaviour.
 - An update check now says in the log what it found — the version offered and
   the one it was compared against. The panel only ever shows the answer, and a
   diagnostic export should be able to answer the next question by itself.
+- Groundwork for installing Sonarune with `winget`: the three manifests that
+  the Windows package repository wants are generated from a published release —
+  download URL, release date and the checksum, the last of these re-computed
+  against the installer as it is actually served — instead of being typed out
+  by hand. Nothing is listed there yet; this is the part that had to exist
+  first.
 
 ## [0.3.0] — 2026-09-21
 
@@ -216,9 +292,11 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/jellysic/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/Ariazonaa/jellysic/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/Ariazonaa/jellysic/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/Ariazonaa/jellysic/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/Ariazonaa/jellysic/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Ariazonaa/jellysic/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Ariazonaa/sonarune/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Ariazonaa/sonarune/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/Ariazonaa/sonarune/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Ariazonaa/sonarune/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Ariazonaa/sonarune/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Ariazonaa/sonarune/releases/tag/v0.1.0

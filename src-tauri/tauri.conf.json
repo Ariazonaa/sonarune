@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "jellysic",
-  "version": "0.5.0",
-  "identifier": "io.jellysic.app",
+  "productName": "Sonarune",
+  "version": "0.6.0",
+  "identifier": "io.sonarune.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Jellysic",
+        "title": "Sonarune",
         "width": 1280,
         "height": 800,
         "minWidth": 900,
@@ -29,9 +29,9 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/Ariazonaa/jellysic/releases/latest/download/latest.json"
+        "https://github.com/Ariazonaa/sonarune/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFEMDg2MEYxQzE3M0E4RTYKUldUbXFIUEI4V0FJSFZEWDN5L21DK09RTEJwSXRaWGUxRmxSSkY3bit3RmtRMHYwdzdKWTVBNk0K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIxMzBGNDFDRkQ5RTlGNjAKUldSZ241NzlIUFF3c2E0bUgwUmtTM0dBdVJPNmYyRHRhVEFPNlYxNlFYenBiblMvSnh4bnVvVHcK",
       "windows": {
         "installMode": "passive"
       }
@@ -40,6 +40,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "publisher": "Ariazonaa",
     "shortDescription": "Third-party music client for Jellyfin",
     "category": "Music",
     "icon": [
@@ -54,6 +55,7 @@
         "installerIcon": "icons/icon.ico",
         "headerImage": "installer/header.bmp",
         "sidebarImage": "installer/sidebar.bmp",
+        "installerHooks": "installer/hooks.nsh",
         "installMode": "currentUser",
         "languages": ["English", "German"],
         "displayLanguageSelector": true

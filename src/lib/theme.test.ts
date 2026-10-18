@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { pickAccent } from "$lib/ambient";
+import { pickAccent } from "#lib/ambient.js";
 import {
   ACCENT_CHANGED,
   applyTheme,
@@ -8,7 +8,7 @@ import {
   DEFAULT_THEME,
   hexLuminance,
   setCoverHue,
-} from "$lib/theme";
+} from "#lib/theme.js";
 
 // --color-base in app.css. Keep in sync: the contrast assertions below are
 // only meaningful against the background the app actually paints.
@@ -79,7 +79,7 @@ describe("setCoverHue", () => {
     expect(accentVar()).not.toBe(DEFAULT_THEME.accent);
     expect(listener).toHaveBeenCalled();
     // Remembered for the pre-paint script.
-    expect(JSON.parse(localStorage.getItem("jellysic.coverAccent.v2")!).accent).toBe(accentVar());
+    expect(JSON.parse(localStorage.getItem("sonarune.coverAccent.v2")!).accent).toBe(accentVar());
   });
 
   it("falls back to the fixed accent for a cover without a clear color", () => {
@@ -97,11 +97,11 @@ describe("setCoverHue", () => {
 
   it("keeps the stored cover accent on start until a cover is analysed", async () => {
     const stored = { accent: "#123456", hover: "#234567", onAccent: "#ffffff" };
-    localStorage.setItem("jellysic.theme", JSON.stringify({ ...DEFAULT_THEME, accentMode: "cover" }));
-    localStorage.setItem("jellysic.coverAccent.v2", JSON.stringify(stored));
+    localStorage.setItem("sonarune.theme", JSON.stringify({ ...DEFAULT_THEME, accentMode: "cover" }));
+    localStorage.setItem("sonarune.coverAccent.v2", JSON.stringify(stored));
     // A fresh module: its import-time initTheme() runs before any cover is known.
     vi.resetModules();
-    const fresh = await import("$lib/theme");
+    const fresh = await import("#lib/theme.js");
     expect(accentVar()).toBe("#123456");
     expect(document.documentElement.style.getPropertyValue("--color-on-accent")).toBe("#ffffff");
 
@@ -117,7 +117,7 @@ describe("setCoverHue", () => {
 
   it("ignores a `mode` left over from the light/dark era", () => {
     localStorage.setItem(
-      "jellysic.theme",
+      "sonarune.theme",
       JSON.stringify({ ...DEFAULT_THEME, accentMode: "fixed", mode: "light" }),
     );
     applyTheme({ ...DEFAULT_THEME, accentMode: "fixed" });

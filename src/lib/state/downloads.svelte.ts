@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api } from "$lib/api";
-import type { DownloadRequest, DownloadTask } from "$lib/types";
+import { api } from "#lib/api.js";
+import type { DownloadRequest, DownloadTask } from "#lib/types.js";
 
 class DownloadsState {
   tasks = $state<DownloadTask[]>([]);

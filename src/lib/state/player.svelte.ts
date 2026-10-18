@@ -1,15 +1,15 @@
 import { listen } from "@tauri-apps/api/event";
-import { api } from "$lib/api";
-import { apiLibrary } from "$lib/api/library";
-import { net } from "$lib/state/net.svelte";
-import { toast } from "$lib/state/toast.svelte";
-import { m } from "$lib/paraglide/messages";
+import { api } from "#lib/api.js";
+import { apiLibrary } from "#lib/api/library.js";
+import { net } from "#lib/state/net.svelte.js";
+import { toast } from "#lib/state/toast.svelte.js";
+import { m } from "#lib/paraglide/messages.js";
 import type {
   AudioOutputFallbackEvent,
   PlayerState,
   QueueSnapshot,
   WaveformEvent,
-} from "$lib/types";
+} from "#lib/types.js";
 
 /** Waveforms kept in the UI: the current track, the prefetched next one, and
  *  a few recent ones for skipping back. */
@@ -30,6 +30,8 @@ const initial: PlayerState = {
   shuffleMode: "off",
   repeat: "off",
   bufferedMs: null,
+  speed: 1,
+  preservePitch: true,
 };
 
 const REPEAT_CYCLE = ["off", "all", "one"] as const;
@@ -52,6 +54,9 @@ class PlayerStore {
   showLyrics = $state(false);
   /** Last playback error, shown as a dismissible banner. */
   error = $state<string | null>(null);
+  /** Bumped when a device's sound profile replaced the EQ/volume settings,
+   *  so an open Settings page reloads them. */
+  audioProfileRevision = $state(0);
   /** Show the queue and put the playing track in front of the user — from
    *  the palette, the shortcut, or anywhere else that knows where they left
    *  off is not where the music is. */
@@ -114,6 +119,13 @@ class PlayerStore {
       this.error = event.payload;
       // A stream failure may be the server dropping — verify.
       void net.check();
+    });
+    await listen<{ device: string }>("audio:profile-applied", (event) => {
+      this.audioProfileRevision++;
+      toast.show(m.audio_profile_applied_toast({ device: event.payload.device }), {
+        kind: "info",
+        ms: 4000,
+      });
     });
     await listen<AudioOutputFallbackEvent>("audio:output-fallback", (event) => {
       toast.show(m.audio_output_fallback_toast({ device: event.payload.requestedDevice }), {

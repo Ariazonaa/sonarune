@@ -12,7 +12,7 @@
 </script>
 
 <script lang="ts">
-  import { m } from "$lib/paraglide/messages";
+  import { m } from "#lib/paraglide/messages.js";
   import Popover from "./Popover.svelte";
 
   let {

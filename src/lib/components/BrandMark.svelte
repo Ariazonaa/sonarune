@@ -3,10 +3,11 @@
   let { class: className = "" }: { class?: string } = $props();
 </script>
 
-<svg viewBox="13.4 13.6 73.5 73.5" class={className} aria-hidden="true">
+<svg viewBox="12.25 13.8 74.2 74.2" class={className} aria-hidden="true">
   <g fill="none" stroke="currentColor" stroke-width="13" stroke-linecap="round">
-    <path d="M74 20L74 60" />
-    <path d="M74 60C74 82 52 86 43 74" />
+    <path d="M71.5 27C64.5 17 35.5 17 35.5 34" />
+    <path d="M35.5 34C35.5 48 69.5 45 69.5 63" />
+    <path d="M69.5 63C69.5 80 54.5 86 46.5 78" />
   </g>
-  <ellipse cx="36" cy="71" rx="17" ry="11" transform="rotate(-24 36 71)" fill="currentColor" />
+  <ellipse cx="36" cy="75" rx="16" ry="10.5" transform="rotate(-24 36 75)" fill="currentColor" />
 </svg>

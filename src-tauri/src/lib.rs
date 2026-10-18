@@ -1,5 +1,6 @@
 mod api;
 mod audio_devices;
+mod audio_profiles;
 mod cache;
 mod commands;
 mod commands_discover;
@@ -10,6 +11,7 @@ mod desktop;
 mod diagnostics;
 mod download;
 mod error;
+mod legacy;
 mod library_watch;
 mod player;
 mod proto;
@@ -70,9 +72,16 @@ pub fn run() {
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,jellysic_lib=debug".into()),
+                .unwrap_or_else(|_| "info,sonarune_lib=debug".into()),
         )
         .init();
+
+    let context = tauri::generate_context!();
+    // Release builds only: a dev or demo build must not walk off with the
+    // installed app's data.
+    if !cfg!(debug_assertions) {
+        legacy::migrate_data_dirs(&context.config().identifier);
+    }
 
     tauri::Builder::default()
         // A second launch (e.g. while closed to the tray) must not start a
@@ -136,6 +145,7 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let store = Arc::new(Store::open(&data_dir)?);
+            commands::migrate_legacy_credentials(&store);
             let session: SharedSession = Arc::new(tokio::sync::RwLock::new(None));
             let desktop_settings = desktop::load(&store);
             let downloads_dir = app
@@ -241,9 +251,13 @@ pub fn run() {
             commands::queue_undo,
             commands::get_player_state,
             commands::get_waveform,
+            commands::get_track_analysis,
             commands::get_queue,
             commands::get_audio_settings,
             commands::set_audio_settings,
+            commands::get_audio_profiles,
+            commands::set_audio_profiles_enabled,
+            commands::delete_audio_profile,
             commands::get_playback_settings,
             commands::set_playback_settings,
             commands::list_audio_devices,
@@ -256,6 +270,7 @@ pub fn run() {
             commands::reveal_path,
             commands::play_instant_mix,
             commands::set_sleep_timer,
+            commands::player_set_speed,
             commands::player_set_stop_after,
             commands::get_extras_settings,
             commands::set_extras_settings,
@@ -313,7 +328,7 @@ pub fn run() {
             updater::check_for_update,
             updater::install_update,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 

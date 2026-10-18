@@ -3,7 +3,7 @@
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { availableMonitors, type Monitor } from "@tauri-apps/api/window";
-  import { m } from "$lib/paraglide/messages";
+  import { m } from "#lib/paraglide/messages.js";
   import {
     PROJECTOR_SETTINGS_EVENT,
     PROJECTOR_WINDOW_LABEL,
@@ -14,7 +14,7 @@
     selectedMonitor,
     type VisualizerOverlayKind,
     type VisualizerProjectorSettings,
-  } from "$lib/visualizer/projector";
+  } from "#lib/visualizer/projector.js";
 
   let { onclose }: { onclose: () => void } = $props();
 

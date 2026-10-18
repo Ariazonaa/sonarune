@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { m } from "$lib/paraglide/messages";
+  import { m } from "#lib/paraglide/messages.js";
 
   // Shown at the top of a scrolled list when the server library changed, so a
   // deep scroll position isn't yanked away — the user refreshes when ready.

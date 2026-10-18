@@ -8,7 +8,7 @@ import {
   sanitizeGains,
   saveCustomPreset,
   type EqPreset,
-} from "$lib/eqPresets";
+} from "#lib/eqPresets.js";
 
 const flat = Array(10).fill(0);
 const warm = [4, 3, 2, 1, 0, 0, -1, -1, 0, 1];
@@ -62,7 +62,7 @@ describe("persistence", () => {
 
   it("drops broken entries and duplicates instead of failing", () => {
     localStorage.setItem(
-      "jellysic.eq.presets.v1",
+      "sonarune.eq.presets.v1",
       JSON.stringify([
         { name: "Good", gains: warm },
         { name: "good", gains: flat },
@@ -73,7 +73,7 @@ describe("persistence", () => {
       ]),
     );
     expect(loadCustomPresets()).toEqual([{ name: "Good", gains: warm }]);
-    localStorage.setItem("jellysic.eq.presets.v1", "{not json");
+    localStorage.setItem("sonarune.eq.presets.v1", "{not json");
     expect(loadCustomPresets()).toEqual([]);
   });
 });

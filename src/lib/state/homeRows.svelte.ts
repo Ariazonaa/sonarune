@@ -14,7 +14,7 @@ export const HOME_ROWS = [
 
 export type HomeRowId = (typeof HOME_ROWS)[number];
 
-const STORAGE_KEY = "jellysic.homeRows.v1";
+const STORAGE_KEY = "sonarune.homeRows.v1";
 
 interface HomeRowPrefs {
   /** Every row, in the order they are shown. */

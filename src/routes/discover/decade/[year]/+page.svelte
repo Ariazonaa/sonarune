@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from "$app/state";
-  import { m } from "$lib/paraglide/messages";
-  import PaginatedDiscoveryAlbums from "$lib/components/PaginatedDiscoveryAlbums.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import PaginatedDiscoveryAlbums from "#lib/components/PaginatedDiscoveryAlbums.svelte";
 
   const startYear = $derived(Number.parseInt(page.params.year ?? "0", 10));
 </script>

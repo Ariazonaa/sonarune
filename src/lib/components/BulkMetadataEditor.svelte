@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { apiLibrary } from "$lib/api/library";
-  import { m } from "$lib/paraglide/messages";
-  import { portal } from "$lib/portal";
-  import { toast } from "$lib/state/toast.svelte";
-  import type { BulkMetadataEdits, BulkMetadataResult } from "$lib/types";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { portal } from "#lib/portal.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import type { BulkMetadataEdits, BulkMetadataResult } from "#lib/types.js";
 
   let {
     itemIds,

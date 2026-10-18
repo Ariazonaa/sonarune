@@ -7,7 +7,10 @@ Contributing section in the [README](README.md).
 
 You need **Rust** with the MSVC toolchain and the C++ build tools, **Node.js
 22+**, and **cmake** on `PATH` — the `opus` crate builds a bundled libopus, and
-without cmake the build stops there.
+without cmake the build stops there. The `signalsmith-stretch` crate (playback
+speed) runs bindgen, which needs **libclang**: the Visual Studio component "C++
+Clang tools for Windows" or an LLVM install; set `LIBCLANG_PATH` if it is
+somewhere else.
 
 ```powershell
 npm install
@@ -86,8 +89,17 @@ touches the audio path, say how you tested it: which formats, gapless or
 crossfade, and whether you watched the session appear on the Jellyfin
 dashboard.
 
+## Working with an AI agent
+
+That is fine, and common here: Sonarune itself was built largely with one (see
+the AI disclosure in the README). [`AGENTS.md`](AGENTS.md) is written for the
+agent — the working rules, the commands, the ground rules above in full, and
+the architecture. Claude Code, Codex, Copilot, Cursor and Gemini CLI pick it up
+on their own. You stay responsible for what the agent produces: review it,
+test it, and say in the pull request what you checked.
+
 ## Provenance
 
-Jellysic is written clean-room: no code or assets are taken from Feishin, only
+Sonarune is written clean-room: no code or assets are taken from Feishin, only
 concepts. The licence now permits more than that, but the provenance stays as
 it is. If you port an idea from another client, say so in the pull request.

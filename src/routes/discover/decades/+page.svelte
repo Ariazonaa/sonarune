@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { apiDiscovery, type DecadeDto } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
+  import { apiDiscovery, type DecadeDto } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
 
   let decades = $state<DecadeDto[] | null>(swrGet<DecadeDto[]>("discover:all:decades") ?? null);
   let error = $state<string | null>(null);

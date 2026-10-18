@@ -5,6 +5,7 @@ import type {
   ArtistDetail,
   ArtistDto,
   AudioDeviceSnapshot,
+  AudioProfilesInfo,
   CacheInfo,
   ConnectResult,
   DesktopSettings,
@@ -24,6 +25,7 @@ import type {
   SearchKind,
   SearchPage,
   SessionInfo,
+  TrackAnalysisInfo,
   TrackDto,
   TrackInfoDto,
   TrayLabels,
@@ -105,6 +107,8 @@ export const api = {
   playerSetVolume: (volume: number) => invoke<void>("player_set_volume", { volume }),
   getPlayerState: () => invoke<PlayerState>("get_player_state"),
   getWaveform: (itemId: string) => invoke<number[] | null>("get_waveform", { itemId }),
+  getTrackAnalysis: (itemId: string) =>
+    invoke<TrackAnalysisInfo | null>("get_track_analysis", { itemId }),
   getQueue: () => invoke<QueueSnapshot>("get_queue"),
   getAudioSettings: () => invoke<DspParams>("get_audio_settings"),
   setAudioSettings: (params: DspParams) => invoke<void>("set_audio_settings", { params }),
@@ -112,6 +116,11 @@ export const api = {
   setPlaybackSettings: (settings: PlaybackSettings) =>
     invoke<void>("set_playback_settings", { settings }),
   listAudioDevices: () => invoke<AudioDeviceSnapshot>("list_audio_devices"),
+  getAudioProfiles: () => invoke<AudioProfilesInfo>("get_audio_profiles"),
+  setAudioProfilesEnabled: (enabled: boolean) =>
+    invoke<AudioProfilesInfo>("set_audio_profiles_enabled", { enabled }),
+  deleteAudioProfile: (device: string) =>
+    invoke<AudioProfilesInfo>("delete_audio_profile", { device }),
   getDesktopSettings: () => invoke<DesktopSettings>("get_desktop_settings"),
   setDesktopSettings: (settings: DesktopSettings) =>
     invoke<DesktopSettings>("set_desktop_settings", { settings }),
@@ -137,6 +146,8 @@ export const api = {
   checkServer: () => invoke<boolean>("check_server"),
   getLyrics: (itemId: string) => invoke<LyricsDto>("get_lyrics", { itemId }),
   playInstantMix: (itemId: string) => invoke<void>("play_instant_mix", { itemId }),
+  playerSetSpeed: (speed: number, preservePitch: boolean) =>
+    invoke<void>("player_set_speed", { speed, preservePitch }),
   setSleepTimer: (minutes: number | null, endOfTrack: boolean, fadeSeconds = 30) =>
     invoke<void>("set_sleep_timer", { minutes, endOfTrack, fadeSeconds }),
   /** Arm "stop after this track / album" on a queue entry, or on what is

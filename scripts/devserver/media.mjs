@@ -166,9 +166,12 @@ function renderPcm(seedHex, seconds, rate) {
   return buf;
 }
 
+/** Length of every generated track. */
+export const AUDIO_SECONDS = 45;
+
 function renderAudio(dest, seedHex) {
   const rate = 44100;
-  const pcm = renderPcm(seedHex, 45, rate);
+  const pcm = renderPcm(seedHex, AUDIO_SECONDS, rate);
   const res = spawnSync(
     "ffmpeg",
     [

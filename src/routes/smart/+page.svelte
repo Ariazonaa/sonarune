@@ -1,21 +1,21 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { goto } from "$app/navigation";
-  import { api, formatDuration } from "$lib/api";
+  import { api, formatDuration } from "#lib/api.js";
   import {
     apiDiscovery,
     type SmartFilter,
     type SmartPlayed,
-  } from "$lib/api/discovery";
-  import { m } from "$lib/paraglide/messages";
-  import Cover from "$lib/components/Cover.svelte";
-  import EmptyState from "$lib/components/EmptyState.svelte";
-  import { player } from "$lib/state/player.svelte";
-  import { session } from "$lib/state/session.svelte";
-  import { library } from "$lib/state/library.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { confirm } from "$lib/state/confirm.svelte";
-  import { swrGet, swrSet } from "$lib/swr";
+  } from "#lib/api/discovery.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import Cover from "#lib/components/Cover.svelte";
+  import EmptyState from "#lib/components/EmptyState.svelte";
+  import { player } from "#lib/state/player.svelte.js";
+  import { session } from "#lib/state/session.svelte.js";
+  import { library } from "#lib/state/library.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { confirm } from "#lib/state/confirm.svelte.js";
+  import { swrGet, swrSet } from "#lib/swr.js";
   import {
     cloneSmartFilter,
     emptySmartFilter,
@@ -25,8 +25,8 @@
     smartYearProblem,
     type SavedSmartView,
     type SmartYearProblem,
-  } from "$lib/smartViews";
-  import type { GenreDto, Page, TrackDto } from "$lib/types";
+  } from "#lib/smartViews.js";
+  import type { GenreDto, Page, TrackDto } from "#lib/types.js";
 
   const PAGE_SIZE = 100;
   const QUERY_DELAY_MS = 250;

@@ -3,7 +3,7 @@
  *
  * The app is AMOLED dark only — there is no light mode, so nothing here sets a
  * mode or a `data-theme` attribute. Persisted in localStorage
- * ("jellysic.theme"). An inline script in app.html re-applies the stored
+ * ("sonarune.theme"). An inline script in app.html re-applies the stored
  * accent before first paint, so this module only has to handle changes made
  * from the settings UI; the module-scope init below is a safety net
  * (idempotent) for anything the pre-paint script missed.
@@ -35,7 +35,7 @@ interface AccentColors {
 
 /** Dispatched on `window` whenever the accent variables change, for anything
  *  that caches the color (canvas drawing). */
-export const ACCENT_CHANGED = "jellysic:accent";
+export const ACCENT_CHANGED = "sonarune:accent";
 
 export interface AccentOption {
   id: string;
@@ -75,12 +75,12 @@ export const DEFAULT_THEME: ThemeSettings = {
   accentMode: "cover",
 };
 
-const STORAGE_KEY = "jellysic.theme";
+const STORAGE_KEY = "sonarune.theme";
 /** Last cover accent, so the pre-paint script in app.html can start with it
  *  instead of flashing the fixed accent until the cover is analysed. The
  *  version suffix retires the entries of the light/dark era: those were
  *  measured against a different background. */
-const COVER_ACCENT_KEY = "jellysic.coverAccent.v2";
+const COVER_ACCENT_KEY = "sonarune.coverAccent.v2";
 
 export function loadTheme(): ThemeSettings {
   try {

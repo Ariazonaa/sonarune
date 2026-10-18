@@ -1,4 +1,4 @@
-import { m } from "$lib/paraglide/messages";
+import { m } from "#lib/paraglide/messages.js";
 
 /**
  * Turn a rejection from `check_for_update` / `install_update` into a sentence.

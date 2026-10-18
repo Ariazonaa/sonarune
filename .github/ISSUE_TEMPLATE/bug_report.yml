@@ -21,9 +21,9 @@ body:
       required: true
 
   - type: input
-    id: jellysic-version
+    id: sonarune-version
     attributes:
-      label: Jellysic version
+      label: Sonarune version
       description: Settings → About, or the installer file name.
       placeholder: "0.1.0"
     validations:

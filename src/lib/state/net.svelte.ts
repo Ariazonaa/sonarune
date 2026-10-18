@@ -1,5 +1,5 @@
-import { api } from "$lib/api";
-import { library } from "$lib/state/library.svelte";
+import { api } from "#lib/api.js";
+import { library } from "#lib/state/library.svelte.js";
 
 /**
  * Server reachability, for the offline banner. A cheap `check_server` ping

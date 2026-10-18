@@ -3,7 +3,7 @@
  * positive = lyrics earlier), persisted so a track that's always a beat off
  * stays corrected across sessions. Every window reads the same key.
  */
-const KEY_PREFIX = "jellysic.lyricsOffset.";
+const KEY_PREFIX = "sonarune.lyricsOffset.";
 
 export const lyricsOffsetKey = (itemId: string) => `${KEY_PREFIX}${itemId}`;
 

@@ -1,9 +1,9 @@
-import { confirm } from "$lib/state/confirm.svelte";
-import { palette } from "$lib/state/palette.svelte";
-import { player } from "$lib/state/player.svelte";
-import { help } from "$lib/state/help.svelte";
-import { shortcutSettings, type ShortcutAction } from "$lib/state/shortcuts.svelte";
-import { isModalOpen } from "$lib/modal";
+import { confirm } from "#lib/state/confirm.svelte.js";
+import { palette } from "#lib/state/palette.svelte.js";
+import { player } from "#lib/state/player.svelte.js";
+import { help } from "#lib/state/help.svelte.js";
+import { shortcutSettings, type ShortcutAction } from "#lib/state/shortcuts.svelte.js";
+import { isModalOpen } from "#lib/modal.js";
 
 function isEditing(): boolean {
   const element = document.activeElement;

@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { api } from "$lib/api";
-  import BrandMark from "$lib/components/BrandMark.svelte";
-  import { session } from "$lib/state/session.svelte";
-  import { m } from "$lib/paraglide/messages";
-  import type { QuickConnectSession } from "$lib/types";
+  import { api } from "#lib/api.js";
+  import BrandMark from "#lib/components/BrandMark.svelte";
+  import { session } from "#lib/state/session.svelte.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import type { QuickConnectSession } from "#lib/types.js";
 
   let serverUrl = $state("");
   let username = $state("");

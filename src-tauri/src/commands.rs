@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::{Manager, State};
 
-const KEYRING_SERVICE: &str = "jellysic";
+const KEYRING_SERVICE: &str = "sonarune";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +116,21 @@ fn keyring_entry(server_url: &str, username: &str) -> AppResult<keyring::Entry> 
         KEYRING_SERVICE,
         &format!("{server_url}::{username}"),
     )?)
+}
+
+/// Bring the signed-in account's token and password and the ListenBrainz
+/// token over from the keyring service the app used before its rename.
+pub(crate) fn migrate_legacy_credentials(store: &crate::store::Store) {
+    if let (Some(server_url), Some(username)) =
+        (store.get(keys::SERVER_URL), store.get(keys::USERNAME))
+    {
+        crate::legacy::migrate_credential(KEYRING_SERVICE, &format!("{server_url}::{username}"));
+        crate::legacy::migrate_credential(
+            KEYRING_SERVICE,
+            &format!("{server_url}::{username}::password"),
+        );
+    }
+    crate::legacy::migrate_credential(KEYRING_SERVICE, "listenbrainz");
 }
 
 /// The password is kept (Windows Credential Manager) so an expired token can
@@ -1371,6 +1386,16 @@ pub fn get_waveform(state: State<'_, AppState>, item_id: String) -> Option<Vec<u
     state.player.waveform(&item_id)
 }
 
+/// Tempo and key of a track analysed earlier (this session or stored). New
+/// ones arrive as the `player:analysis` event.
+#[tauri::command]
+pub fn get_track_analysis(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Option<player::TrackAnalysisInfo> {
+    state.player.track_analysis(&item_id)
+}
+
 #[tauri::command]
 pub fn get_queue(state: State<'_, AppState>) -> player::QueueSnapshot {
     state.player.queue_snapshot()
@@ -1415,6 +1440,21 @@ pub async fn play_instant_mix(state: State<'_, AppState>, item_id: String) -> Ap
         tracks: queue,
         start_index: 0,
     })
+}
+
+/// Playback speed, 0.5-2 (clamped); `preserve_pitch` keeps the pitch.
+#[tauri::command]
+pub fn player_set_speed(
+    state: State<'_, AppState>,
+    speed: f32,
+    preserve_pitch: bool,
+) -> AppResult<()> {
+    state
+        .player
+        .send(PlayerCommand::SetSpeed(player::tempo::SpeedSetting {
+            speed,
+            preserve_pitch,
+        }))
 }
 
 #[tauri::command]
@@ -1550,6 +1590,16 @@ pub fn import_settings(
         if let Ok(params) = serde_json::from_str(&raw) {
             state.player.dsp().update(params);
         }
+    }
+    if imported
+        .iter()
+        .any(|k| k == crate::store::keys::PLAYBACK_SPEED)
+    {
+        let _ = state
+            .player
+            .send(PlayerCommand::SetSpeed(player::tempo::SpeedSetting::load(
+                &state.store,
+            )));
     }
     cache.set_limit_mb(crate::desktop::load(&state.store).cover_cache_limit_mb);
     Ok(imported)
@@ -1704,7 +1754,7 @@ pub async fn export_diagnostics(
         .download_dir()
         .map_err(|e| AppError::Other(format!("no downloads folder: {e}")))?;
     let destination = tokio::task::spawn_blocking(move || {
-        write_unique(&dir, "jellysic-diagnostics.json", &bytes)
+        write_unique(&dir, "sonarune-diagnostics.json", &bytes)
     })
     .await
     .map_err(|e| AppError::Other(format!("diagnostic writer task failed: {e}")))?
@@ -1859,7 +1909,37 @@ pub fn set_audio_settings(state: State<'_, AppState>, params: player::DspParams)
     state.player.dsp().update(params.clone());
     let json = serde_json::to_string(&params)
         .map_err(|e| AppError::Other(format!("cannot serialize settings: {e}")))?;
-    state.store.set(crate::store::keys::AUDIO_DSP, &json)
+    state.store.set(crate::store::keys::AUDIO_DSP, &json)?;
+    crate::audio_profiles::remember_dsp(&state.store, &params)
+}
+
+#[tauri::command]
+pub fn get_audio_profiles(state: State<'_, AppState>) -> crate::audio_profiles::AudioProfilesInfo {
+    crate::audio_profiles::info(&state.store)
+}
+
+#[tauri::command]
+pub fn set_audio_profiles_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> AppResult<crate::audio_profiles::AudioProfilesInfo> {
+    let volume = state.player.state().volume;
+    crate::audio_profiles::set_enabled(
+        &state.store,
+        enabled,
+        &state.player.dsp().params(),
+        volume,
+    )?;
+    Ok(crate::audio_profiles::info(&state.store))
+}
+
+#[tauri::command]
+pub fn delete_audio_profile(
+    state: State<'_, AppState>,
+    device: String,
+) -> AppResult<crate::audio_profiles::AudioProfilesInfo> {
+    crate::audio_profiles::delete(&state.store, &device)?;
+    Ok(crate::audio_profiles::info(&state.store))
 }
 
 /// Ask the library watcher to poll the server right now (fired when the
@@ -1953,7 +2033,7 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         let path =
-            std::env::temp_dir().join(format!("jellysic-download-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("sonarune-download-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).expect("create test directory");
         TempDir(path)
     }

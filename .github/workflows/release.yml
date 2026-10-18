@@ -135,15 +135,15 @@ jobs:
         run: |
           $out = "dist"
           New-Item -ItemType Directory -Force $out | Out-Null
-          $setup = "src-tauri/target/release/bundle/nsis/jellysic_${env:VERSION}_x64-setup.exe"
+          $setup = "src-tauri/target/release/bundle/nsis/Sonarune_${env:VERSION}_x64-setup.exe"
           if (-not (Test-Path $setup)) { "::error::installer not found at $setup"; exit 1 }
           Copy-Item $setup $out
 
           # A portable build for people who do not want an installer: the exe is
           # self-contained, the frontend is embedded in it.
-          $exe = "src-tauri/target/release/jellysic.exe"
-          if (-not (Test-Path $exe)) { "::error::jellysic.exe not found at $exe"; exit 1 }
-          Compress-Archive -Path $exe -DestinationPath "$out/jellysic_${env:VERSION}_x64-portable.zip"
+          $exe = "src-tauri/target/release/sonarune.exe"
+          if (-not (Test-Path $exe)) { "::error::sonarune.exe not found at $exe"; exit 1 }
+          Compress-Archive -Path $exe -DestinationPath "$out/Sonarune_${env:VERSION}_x64-portable.zip"
 
           # The signed installer and the manifest the app polls. The signature
           # travels inside latest.json; the .sig file rides along so a release
@@ -218,7 +218,7 @@ jobs:
           # are full of them.
           $bt = [string][char]96
           $fence = $bt * 3
-          $setup = "jellysic_$($env:VERSION)_x64-setup.exe"
+          $setup = "Sonarune_$($env:VERSION)_x64-setup.exe"
 
           # Only a signed build can be installed as an update, so these two
           # paragraphs appear only when there was a key to sign with. Promising
@@ -226,7 +226,7 @@ jobs:
           # lie told to everyone who reads the page.
           $updates = if ($env:SIGNED -eq "1") {
             @(
-              "**Jellysic keeps itself up to date.** The installed app asks this"
+              "**Sonarune keeps itself up to date.** The installed app asks this"
               "page once per start whether a newer version exists -- that can be"
               "switched off in Settings -> Updates, where there is also a button"
               "to check on demand. An update is verified against the project's"
@@ -269,4 +269,4 @@ jobs:
           ) | Out-File -FilePath notes.md -Encoding utf8
 
           $assets = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
-          gh release create $env:GITHUB_REF_NAME --draft --title "Jellysic $($env:VERSION)" --notes-file notes.md $assets
+          gh release create $env:GITHUB_REF_NAME --draft --title "Sonarune $($env:VERSION)" --notes-file notes.md $assets

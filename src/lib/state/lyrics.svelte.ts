@@ -1,8 +1,8 @@
-import { api } from "$lib/api";
-import { loadLyricsOffset, lyricsOffsetKey, saveLyricsOffset } from "$lib/lyricsOffset";
-import { player } from "$lib/state/player.svelte";
-import { session } from "$lib/state/session.svelte";
-import type { LyricsDto } from "$lib/types";
+import { api } from "#lib/api.js";
+import { loadLyricsOffset, lyricsOffsetKey, saveLyricsOffset } from "#lib/lyricsOffset.js";
+import { player } from "#lib/state/player.svelte.js";
+import { session } from "#lib/state/session.svelte.js";
+import type { LyricsDto } from "#lib/types.js";
 
 const CACHE_MAX = 10;
 

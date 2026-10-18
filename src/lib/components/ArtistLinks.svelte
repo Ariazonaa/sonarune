@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ArtistRef } from "$lib/types";
+  import type { ArtistRef } from "#lib/types.js";
 
   // Renders artist names as links to /artist/{id}; falls back to the plain
   // display string when the server didn't supply linkable artist ids.

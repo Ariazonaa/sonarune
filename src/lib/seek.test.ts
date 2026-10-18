@@ -7,7 +7,7 @@ import {
   SEEK_STEP_MS,
   WAVE_MIN_BAR,
   waveformBars,
-} from "$lib/seek";
+} from "#lib/seek.js";
 
 describe("waveformBars", () => {
   it("keeps the loudest peak of each group", () => {

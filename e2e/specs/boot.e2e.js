@@ -1,4 +1,4 @@
-// Boot smoke: proves the whole pipeline works — the real jellysic.exe launches
+// Boot smoke: proves the whole pipeline works — the real sonarune.exe launches
 // under WebDriver, WebView2 loads the embedded SvelteKit build, and the SPA
 // mounts and reaches a known-good landing view.
 //

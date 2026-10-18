@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { toast } from "$lib/state/toast.svelte";
+import { toast } from "#lib/state/toast.svelte.js";
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => {

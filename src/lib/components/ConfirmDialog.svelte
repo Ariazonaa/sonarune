@@ -1,8 +1,8 @@
 <script lang="ts">
   import type { Attachment } from "svelte/attachments";
-  import { m } from "$lib/paraglide/messages";
-  import { portal } from "$lib/portal";
-  import { confirm } from "$lib/state/confirm.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import { portal } from "#lib/portal.js";
+  import { confirm } from "#lib/state/confirm.svelte.js";
 
   /**
    * Initial focus goes to Cancel, never to the destructive button.

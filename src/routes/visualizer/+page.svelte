@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { VList } from "virtua/svelte";
-  import { m } from "$lib/paraglide/messages";
-  import { player } from "$lib/state/player.svelte";
-  import VisualizerProjectorPanel from "$lib/components/VisualizerProjectorPanel.svelte";
+  import { m } from "#lib/paraglide/messages.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import VisualizerProjectorPanel from "#lib/components/VisualizerProjectorPanel.svelte";
   import {
     VisualizerController,
     loadCycleSetting,
@@ -14,14 +14,14 @@
     saveRemotePresetsSetting,
     type CycleSetting,
     type VisualizerQuality,
-  } from "$lib/visualizer/controller";
-  import type { EnergyLevel } from "$lib/visualizer/engine";
+  } from "#lib/visualizer/controller.js";
+  import type { EnergyLevel } from "#lib/visualizer/engine.js";
   import type {
     PresetCatalogProgress,
     PresetComplexity,
     PresetEntry,
-  } from "$lib/visualizer/presets";
-  import { PRESET_PACK_COUNT } from "$lib/visualizer/presets";
+  } from "#lib/visualizer/presets.js";
+  import { PRESET_PACK_COUNT } from "#lib/visualizer/presets.js";
 
   const CYCLE_OPTIONS: CycleSetting[] = ["auto", 10, 15, 30, 60, 0];
   /** Preset transition times in seconds (0 = hard cut). */
@@ -156,7 +156,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "jellysic-visualizer-preferences.json";
+    a.download = "sonarune-visualizer-preferences.json";
     a.click();
     URL.revokeObjectURL(url);
     backupStatus = m.visualizer_backup_exported();
@@ -189,7 +189,7 @@
     if (!url) return;
     const a = document.createElement("a");
     a.href = url;
-    a.download = "jellysic-visualizer.png";
+    a.download = "sonarune-visualizer.png";
     a.click();
   }
 

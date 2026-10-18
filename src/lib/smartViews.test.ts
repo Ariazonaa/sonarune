@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { SmartFilter } from "$lib/api/discovery";
-import type { SessionInfo } from "$lib/types";
+import type { SmartFilter } from "#lib/api/discovery.js";
+import type { SessionInfo } from "#lib/types.js";
 import {
   cloneSmartFilter,
   emptySmartFilter,
@@ -121,7 +121,7 @@ describe("persist + load round-trip", () => {
 
   it("drops structurally invalid entries", () => {
     localStorage.setItem(
-      `jellysic:smart-views:v1:${encodeURIComponent(session.serverUrl)}:${encodeURIComponent(session.userId)}`,
+      `sonarune:smart-views:v1:${encodeURIComponent(session.serverUrl)}:${encodeURIComponent(session.userId)}`,
       JSON.stringify([{ id: "x" }, { nope: true }]),
     );
     expect(loadSmartViews(session)).toEqual([]);

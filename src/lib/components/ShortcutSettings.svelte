@@ -1,13 +1,13 @@
 <script lang="ts">
-  import { m } from "$lib/paraglide/messages";
-  import { shortcutActionLabel } from "$lib/shortcutLabels";
+  import { m } from "#lib/paraglide/messages.js";
+  import { shortcutActionLabel } from "#lib/shortcutLabels.js";
   import {
     formatShortcutBinding,
     shortcutBindingFromEvent,
     shortcutSettings,
     SHORTCUT_ACTIONS,
     type ShortcutAction,
-  } from "$lib/state/shortcuts.svelte";
+  } from "#lib/state/shortcuts.svelte.js";
 
   let capturing = $state<ShortcutAction | null>(null);
   let feedback = $state<string | null>(null);

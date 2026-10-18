@@ -1,22 +1,22 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { goto } from "$app/navigation";
-  import { api, formatDuration } from "$lib/api";
-  import { apiLibrary } from "$lib/api/library";
-  import { m } from "$lib/paraglide/messages";
-  import { player } from "$lib/state/player.svelte";
-  import { toast } from "$lib/state/toast.svelte";
-  import { downloads } from "$lib/state/downloads.svelte";
-  import { playlists } from "$lib/state/playlists.svelte";
-  import { listFlip, uniqueRowKeys } from "$lib/motion";
-  import { currentPosition, playOrder } from "$lib/queueOrder";
-  import { contextMenuKey } from "$lib/menu";
+  import { api, formatDuration } from "#lib/api.js";
+  import { apiLibrary } from "#lib/api/library.js";
+  import { m } from "#lib/paraglide/messages.js";
+  import { player } from "#lib/state/player.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
+  import { downloads } from "#lib/state/downloads.svelte.js";
+  import { playlists } from "#lib/state/playlists.svelte.js";
+  import { listFlip, uniqueRowKeys } from "#lib/motion.js";
+  import { currentPosition, playOrder } from "#lib/queueOrder.js";
+  import { contextMenuKey } from "#lib/menu.js";
   import Cover from "./Cover.svelte";
   import EmptyState from "./EmptyState.svelte";
   import ContextMenu, { type ContextMenuItem } from "./ContextMenu.svelte";
   import AddToPlaylistMenu from "./AddToPlaylistMenu.svelte";
   import SongInfo from "./SongInfo.svelte";
-  import type { QueueTrack } from "$lib/types";
+  import type { QueueTrack } from "#lib/types.js";
 
   const queue = $derived(player.queue);
   const totalDurationMs = $derived(queue.tracks.reduce((sum, track) => sum + track.durationMs, 0));

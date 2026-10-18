@@ -2,7 +2,7 @@ import type { Monitor } from "@tauri-apps/api/window";
 
 export const PROJECTOR_WINDOW_LABEL = "projector";
 export const PROJECTOR_SETTINGS_EVENT = "visualizer:projector-settings";
-export const PROJECTOR_SETTINGS_KEY = "jellysic.vis.projector.v1";
+export const PROJECTOR_SETTINGS_KEY = "sonarune.vis.projector.v1";
 
 export type VisualizerOverlayKind = "cover" | "track" | "progress" | "lyrics";
 

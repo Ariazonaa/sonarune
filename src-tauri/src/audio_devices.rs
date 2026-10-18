@@ -10,11 +10,24 @@ fn fallback_device_slot() -> &'static Mutex<Option<String>> {
     FALLBACK_DEVICE.get_or_init(|| Mutex::new(None))
 }
 
+/// The device the open output actually plays through (resolved from "system
+/// default" too). Keys the per-device sound profiles.
+static ACTIVE_DEVICE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_active_device(device: Option<String>) {
+    *ACTIVE_DEVICE.lock().unwrap() = device;
+}
+
+pub fn active_device() -> Option<String> {
+    ACTIVE_DEVICE.lock().unwrap().clone()
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioDeviceSnapshot {
     pub devices: Vec<String>,
     pub fallback_device: Option<String>,
+    pub active_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,6 +40,7 @@ pub fn snapshot() -> AudioDeviceSnapshot {
     AudioDeviceSnapshot {
         devices: crate::player::output_device_names(),
         fallback_device: fallback_device(),
+        active_device: active_device(),
     }
 }
 

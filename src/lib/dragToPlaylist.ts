@@ -9,7 +9,7 @@
  * have them, and asking the server once at drop time is cheaper than asking
  * for every album someone drags across the window.
  */
-export const DRAG_MIME = "application/x-jellysic-add";
+export const DRAG_MIME = "application/x-sonarune-add";
 
 export interface DragPayload {
   trackIds?: string[];

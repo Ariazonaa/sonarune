@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // The overlay guard never touches playback; keep the Tauri-backed store out.
-vi.mock("$lib/state/player.svelte", () => ({ player: {} }));
+vi.mock("#lib/state/player.svelte.js", () => ({ player: {} }));
 
 import { blockedByOverlay } from "./shortcuts";
 import { isModalOpen } from "./modal";
-import { confirm } from "$lib/state/confirm.svelte";
-import { help } from "$lib/state/help.svelte";
-import { palette } from "$lib/state/palette.svelte";
+import { confirm } from "#lib/state/confirm.svelte.js";
+import { help } from "#lib/state/help.svelte.js";
+import { palette } from "#lib/state/palette.svelte.js";
 
 function addDialog(modal: boolean) {
   const element = document.createElement("div");

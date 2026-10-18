@@ -82,17 +82,17 @@ that a server-paged page is exactly the full scan's slice (members, order,
 total) and that scan pages served from the cached ids continue seamlessly:
 
 ```bash
-JELLYSIC_TEST_URL=… JELLYSIC_TEST_USER=… JELLYSIC_TEST_PASS=… \
+SONARUNE_TEST_URL=… SONARUNE_TEST_USER=… SONARUNE_TEST_PASS=… \
   cargo test --lib smoke -- --ignored --nocapture
 ```
 
 ## End-to-end (WebDriver) — the real app
 
-`npm run test:e2e` drives the built `jellysic.exe` through WebView2
+`npm run test:e2e` drives the built `sonarune.exe` through WebView2
 (`wdio` → `tauri-driver` → `msedgedriver`). Covers the **boot** smoke (no
 server) and the **visualizer mount/teardown** flow; the latter reaches the
 signed-in shell via a restored session or, on a clean machine, by signing in
-with `JELLYSIC_TEST_*`. Prerequisites (tauri-driver, a WebView2-matching
+with `SONARUNE_TEST_*`. Prerequisites (tauri-driver, a WebView2-matching
 msedgedriver), env knobs, and the covered-vs-manual split live in
 [`e2e/README.md`](../e2e/README.md). The **dialog focus trap** flow is covered
 instead as a fast Vitest component test
@@ -116,7 +116,7 @@ against a real server and confirm:
 | Audio device hotplug | Unplug/replug the selected output device → fallback toast, no unsolicited switch-back. |
 | Ambient / visualizer backdrop | Now-playing backdrop renders (cover colors / cover / Butterchurn); controls stay readable in light mode — also for a track without cover. The whole view fits a 600px-high window (art shrinks, "up next" hides), with and without lyrics; the lyrics sync row stays visible. |
 | Menus & dialogs | In a long, scrolled list: the context menu opens at the pointer; song info, metadata editor and playlist dialogs sit centered over the whole window. |
-| Seek bar | Buffered range grows while loading (none for a live transcode); the waveform replaces the line once the track is fully downloaded (not for a live transcode, not after seeking past the downloaded part); hover time, drag, keyboard seek once per key. No `jellysic-*` files left in the temp folder afterwards. |
+| Seek bar | Buffered range grows while loading (none for a live transcode); the waveform replaces the line once the track is fully downloaded (not for a live transcode, not after seeking past the downloaded part); hover time, drag, keyboard seek once per key. No `sonarune-*` files left in the temp folder afterwards. |
 | Accent from cover | Light + dark with a bright, a dark and a grey cover; spectrum bars recolor. Window corners stay transparent after opening settings. |
 | Stop after / normalization | Arm "stop after this track" and "stop after this album" from a queue row: the marked row is where the music ends, without a fade, and with the next track already appended (queue edited after the hand-off) it pauses at the start of the next one instead. Album mode for normalization: an album with a quiet and a loud track keeps that difference, per-track mode levels it out. |
 | Play sessions | With repeat-one, and after jumping back to a track that already played: the Jellyfin dashboard shows one live session per attempt and no stale one, and a seek inside a transcode does not start a second. |
