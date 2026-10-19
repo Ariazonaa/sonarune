@@ -28,6 +28,12 @@ caveat that a minor bump may still change behaviour.
   many different tracks and artists, the most played artists, albums and
   tracks, and plays per month. A year the history only started in says so.
 
+### Fixed
+
+- **The visualizer did not start in 0.6.0** ("createVisualizer is not a
+  function"). Since the move to Vite 8 the built app wraps the butterchurn
+  module once more than the dev server does; it is now found either way.
+
 ## [0.6.0] — 2026-10-18
 
 ### Upgrading from 0.5.x

@@ -1,4 +1,6 @@
-import butterchurn, { type ButterchurnVisualizer } from "butterchurn";
+import * as butterchurnModule from "butterchurn";
+import type { ButterchurnVisualizer } from "butterchurn";
+import { unwrapButterchurn } from "./butterchurnInterop";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { m } from "#lib/paraglide/messages.js";
 import { decodeFrame, resampleInterleaved, toMono, toStereo } from "./pcm";
@@ -136,7 +138,7 @@ export class VisualizerEngine {
       const height = Math.max(1, Math.round((canvas.clientHeight || 600) * dpr));
       canvas.width = width;
       canvas.height = height;
-      const visualizer = butterchurn.createVisualizer(ctx, canvas, {
+      const visualizer = unwrapButterchurn(butterchurnModule).createVisualizer(ctx, canvas, {
         width,
         height,
         pixelRatio: 1,
