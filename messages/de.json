@@ -703,5 +703,18 @@
   "settings_history": "Wiedergabeverlauf",
   "settings_history_record": "Verlauf aufzeichnen",
   "settings_history_record_hint": "Ein Eintrag pro gehörtem Titel, gespeichert nur auf diesem Rechner. Daraus entstehen der Verlauf und der Jahresrückblick.",
-  "settings_history_open": "Verlauf öffnen"
+  "settings_history_open": "Verlauf öffnen",
+  "ctx_sonic_radio": "Klang-Radio",
+  "ctx_sonic_path_from": "Klang-Weg von hier …",
+  "ctx_sonic_path_to": "Klang-Weg hierher von „{name}“",
+  "sonic_not_analysed": "Dieser Titel ist noch nicht analysiert. Spiel ihn einmal ab oder lass Sonarune die Bibliothek analysieren (Einstellungen → Klangähnlichkeit).",
+  "sonic_path_pick_target": "Der Weg beginnt bei „{name}“. Jetzt den Zieltitel rechtsklicken.",
+  "settings_autodj_seed_sonic": "Klang (eigene Analyse)",
+  "settings_sonic": "Klangähnlichkeit",
+  "settings_sonic_scan": "Bibliothek im Hintergrund analysieren",
+  "settings_sonic_scan_hint": "Sonarune hört jeden Titel einmal an, auf diesem Rechner, und lernt, wie er klingt: Klangfarbe, Helligkeit, Anschlag, Dynamik, Tempo und Tonart. Dafür lädt es jeden Titel als kleine Datei, zwei gleichzeitig; kein Server-Plugin nötig.",
+  "settings_sonic_progress": "{analysed} von {total} Titeln analysiert",
+  "settings_sonic_not_listed": "Noch nicht gestartet",
+  "settings_sonic_current": "gerade: {name}",
+  "settings_sonic_usage": "Rechtsklick auf einen Titel für ein Klang-Radio oder einen Klang-Weg zu einem anderen Titel; der Auto-DJ kann nach Klang weitermachen. Gespielte Titel werden ohnehin analysiert, auch wenn das hier aus ist."
 }

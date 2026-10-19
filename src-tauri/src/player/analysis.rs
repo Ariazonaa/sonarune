@@ -14,6 +14,8 @@
 //!   ends matter for a transition.
 //! - Key: a chromagram summed over the track, matched against the
 //!   Krumhansl–Kessler major/minor profiles.
+//! - Sound: timbre, brightness, attack and dynamics (`timbre.rs`), for sonic
+//!   similarity.
 
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
@@ -116,6 +118,10 @@ pub struct TrackAnalysis {
     pub audible_start_ms: f64,
     pub audible_end_ms: f64,
     pub duration_ms: f64,
+    /// How the track sounds (`timbre.rs`). Absent in analyses stored before it
+    /// existed; the library scan fills those in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sonic: Option<super::timbre::SonicFeatures>,
 }
 
 impl TrackAnalysis {
@@ -306,7 +312,14 @@ pub struct Analyzer {
     chroma: [f64; 12],
     /// Pitch class per chroma bin, or 12 for bins outside the used range.
     chroma_bins: Vec<u8>,
+    timbre: super::timbre::Timbre,
+    /// Power spectrum of the current onset frame, for [`Self::timbre`].
+    power: Vec<f32>,
 }
+
+/// Timbre frames every this many onset hops (~21 frames/s): plenty for
+/// means and spreads, a quarter of the cost of every hop.
+const TIMBRE_EVERY: usize = 4;
 
 fn hann(n: usize) -> Vec<f32> {
     (0..n)
@@ -355,6 +368,8 @@ impl Analyzer {
             level_db: Vec::new(),
             chroma: [0.0; 12],
             chroma_bins,
+            timbre: super::timbre::Timbre::new(ONSET_FFT / 2, rate / ONSET_FFT as f32),
+            power: vec![0.0; ONSET_FFT / 2],
         }
     }
 
@@ -420,6 +435,12 @@ impl Analyzer {
             self.primed = true;
             self.flux.push(if first { 0.0 } else { flux });
             self.low_flux.push(if first { 0.0 } else { low });
+            if self.hops.is_multiple_of(TIMBRE_EVERY) {
+                for (slot, value) in self.power.iter_mut().zip(&self.scratch) {
+                    *slot = value.norm_sqr();
+                }
+                self.timbre.push(self.hops, &self.power);
+            }
         } else {
             self.flux.push(0.0);
             self.low_flux.push(0.0);
@@ -504,6 +525,19 @@ impl Analyzer {
             None => (None, None),
         };
 
+        let sonic = Some(
+            self.timbre
+                .finish(
+                    start_hop,
+                    end_hop,
+                    &self.level_db,
+                    &self.flux,
+                    &envelope,
+                    &low_envelope,
+                )
+                .unwrap_or_else(super::timbre::SonicFeatures::none),
+        );
+
         let (key, key_correlation) = match estimate_key(&self.chroma) {
             Some((key, r)) if r >= MIN_KEY_CORRELATION => (Some(key), r),
             Some((_, r)) => (None, r),
@@ -521,6 +555,7 @@ impl Analyzer {
             audible_start_ms,
             audible_end_ms,
             duration_ms,
+            sonic,
         }
     }
 }
@@ -846,6 +881,7 @@ pub(crate) mod tests {
             audible_start_ms: 0.0,
             audible_end_ms: end_ms,
             duration_ms: end_ms + 1_000.0,
+            sonic: None,
         }
     }
 

@@ -703,5 +703,18 @@
   "settings_history": "Play history",
   "settings_history_record": "Record history",
   "settings_history_record_hint": "One entry per track you listened to, stored only on this computer. Feeds the history and the year in review.",
-  "settings_history_open": "Open history"
+  "settings_history_open": "Open history",
+  "ctx_sonic_radio": "Sonic radio",
+  "ctx_sonic_path_from": "Sonic path from here…",
+  "ctx_sonic_path_to": "Sonic path here from “{name}”",
+  "sonic_not_analysed": "This track has not been analysed yet. Play it once, or let Sonarune analyse the library (Settings → Sonic similarity).",
+  "sonic_path_pick_target": "The path starts at “{name}”. Now right-click the track it should lead to.",
+  "settings_autodj_seed_sonic": "Sound (Sonarune's own analysis)",
+  "settings_sonic": "Sonic similarity",
+  "settings_sonic_scan": "Analyse the library in the background",
+  "settings_sonic_scan_hint": "Sonarune listens to every track once, on this computer, and learns how it sounds: timbre, brightness, attack, dynamics, tempo and key. It downloads each track as a small file, two at a time; no server plugin needed.",
+  "settings_sonic_progress": "{analysed} of {total} tracks analysed",
+  "settings_sonic_not_listed": "Not started yet",
+  "settings_sonic_current": "now: {name}",
+  "settings_sonic_usage": "Right-click a track for a sonic radio or a sonic path to another track; Auto-DJ can continue by sound. Tracks you play are analysed anyway, even with this switched off."
 }

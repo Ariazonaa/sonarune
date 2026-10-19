@@ -4,6 +4,7 @@
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale, setLocale } from "#lib/paraglide/runtime.js";
   import { player } from "#lib/state/player.svelte.js";
+  import { sonic } from "#lib/state/sonic.svelte.js";
   import { session } from "#lib/state/session.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
@@ -973,6 +974,41 @@
 
     <section class="mb-8 rounded-lg bg-card p-5">
       <h2 class="mb-4 text-sm font-semibold uppercase tracking-wider text-ink-muted">
+        {m.settings_sonic()}
+      </h2>
+      <label class="flex items-center justify-between gap-4">
+        <div>
+          <p class="text-sm font-medium">{m.settings_sonic_scan()}</p>
+          <p class="mt-0.5 max-w-md text-xs text-ink-muted">{m.settings_sonic_scan_hint()}</p>
+        </div>
+        <input
+          type="checkbox"
+          class="h-4 w-4 accent-(--color-accent)"
+          checked={sonic.status?.enabled ?? false}
+          onchange={(e) => player.run(sonic.setScan(e.currentTarget.checked))}
+        />
+      </label>
+      {#if sonic.status}
+        {@const status = sonic.status}
+        <p class="mt-3 text-xs text-ink-muted tabular-nums">
+          {#if status.total !== null}
+            {m.settings_sonic_progress({ analysed: status.analysed, total: status.total })}
+          {:else}
+            {m.settings_sonic_not_listed()}
+          {/if}
+          {#if status.running && status.current}
+            · {m.settings_sonic_current({ name: status.current })}
+          {/if}
+        </p>
+        {#if status.lastError}
+          <p class="mt-1 text-xs text-red-300">{m.error_generic({ message: status.lastError })}</p>
+        {/if}
+      {/if}
+      <p class="mt-3 max-w-md text-xs text-ink-muted">{m.settings_sonic_usage()}</p>
+    </section>
+
+    <section class="mb-8 rounded-lg bg-card p-5">
+      <h2 class="mb-4 text-sm font-semibold uppercase tracking-wider text-ink-muted">
         {m.settings_history()}
       </h2>
       <label class="flex items-center justify-between gap-4">
@@ -1022,6 +1058,7 @@
               <option value="genre">{m.settings_autodj_seed_genre()}</option>
               <option value="album">{m.settings_autodj_seed_album()}</option>
               <option value="playlist">{m.settings_autodj_seed_playlist()}</option>
+              <option value="sonic">{m.settings_autodj_seed_sonic()}</option>
             </select>
           </label>
           <label class="block">

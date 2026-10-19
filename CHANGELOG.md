@@ -15,6 +15,15 @@ caveat that a minor bump may still change behaviour.
   day, folds a track played several times in a row into one row, pages back
   in time and plays a track again on click. Single entries or the whole
   history can be removed, and recording can be switched off in the settings.
+- **Sonic similarity, without a server plugin.** Sonarune's own audio analysis
+  now also measures how a track sounds (timbre, brightness, attack, dynamics)
+  next to its tempo and key, and can analyse the whole library in the
+  background (Settings → Sonic similarity; off by default, two tracks at a
+  time, each fetched as a small transcode). On top of it: a **sonic radio**
+  from any track, a **sonic path** that walks from one track to another in
+  ten steps (right-click "Sonic path from here…", then "… here" on the
+  destination), and an Auto-DJ mode that continues **by sound**, following
+  where the last few tracks have gone. Tracks you play are analysed anyway.
 - **Year in review**, built from that history: plays, listening time, how
   many different tracks and artists, the most played artists, albums and
   tracks, and plays per month. A year the history only started in says so.

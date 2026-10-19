@@ -6,6 +6,7 @@ mod commands;
 mod commands_discover;
 mod commands_library;
 mod commands_metadata;
+mod commands_sonic;
 mod commands_visualizer;
 mod desktop;
 mod diagnostics;
@@ -16,6 +17,8 @@ mod legacy;
 mod library_watch;
 mod player;
 mod proto;
+mod sonic;
+mod sonic_scan;
 mod store;
 mod tls;
 mod tray;
@@ -33,6 +36,8 @@ pub struct AppState {
     pub session: SharedSession,
     pub player: PlayerHandle,
     pub library_watch: LibraryWatchHandle,
+    /// Background analysis of the library for sonic similarity.
+    pub sonic_scan: sonic_scan::ScanHandle,
     /// Serializes automatic re-login. The app fires many commands at once
     /// (home rows, search, images), so an expired token produces a burst of
     /// 401s; without this every one of them would start its own login.
@@ -182,12 +187,15 @@ pub fn run() {
 
             // Poll the server for library changes (new music) and tell the UI.
             let library_watch = library_watch::spawn(app.handle().clone(), session.clone());
+            let sonic_scan =
+                sonic_scan::spawn(app.handle().clone(), session.clone(), store.clone());
 
             app.manage(AppState {
                 store,
                 session,
                 player,
                 library_watch,
+                sonic_scan,
                 relogin_gate: Arc::new(tokio::sync::Mutex::new(())),
                 relogin_blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
@@ -325,6 +333,10 @@ pub fn run() {
             commands_library::history_year,
             commands_library::history_delete,
             commands_library::history_clear,
+            commands_sonic::sonic_status,
+            commands_sonic::sonic_set_scan,
+            commands_sonic::sonic_radio,
+            commands_sonic::sonic_path,
             commands_library::get_favorites,
             commands_library::get_favorite_tracks,
             commands_library::get_favorite_albums,

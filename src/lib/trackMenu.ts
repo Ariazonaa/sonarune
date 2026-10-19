@@ -6,6 +6,7 @@ import { confirm } from "#lib/state/confirm.svelte.js";
 import { downloads } from "#lib/state/downloads.svelte.js";
 import { player } from "#lib/state/player.svelte.js";
 import { session } from "#lib/state/session.svelte.js";
+import { sonic } from "#lib/state/sonic.svelte.js";
 import { toast } from "#lib/state/toast.svelte.js";
 import type { ContextMenuItem } from "#lib/components/ContextMenu.svelte";
 import type { TrackDto } from "#lib/types.js";
@@ -15,6 +16,8 @@ export const TRACK_ICON = {
   playNext: "M3 10h11v2H3v-2zm0-4h11v2H3V6zm0 8h7v2H3v-2zm13-1v8l6-4-6-4z",
   addQueue: "M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z",
   addPlaylist: "M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z",
+  sonic: "M3 10h2v4H3v-4zm4-3h2v10H7V7zm4-4h2v18h-2V3zm4 6h2v6h-2V9zm4-2h2v10h-2V7z",
+  path: "M6 3a3 3 0 0 0-1 5.83V15a5 5 0 0 0 5 5h4.17A3 3 0 1 0 15 18h-1H10a3 3 0 0 1-3-3V8.83A3 3 0 0 0 6 3zm12 0-4 4h3v4h2V7h3l-4-4z",
   mix: "M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.03 3.03L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z",
   album:
     "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z",
@@ -150,6 +153,25 @@ export function trackMenuItems(tracks: TrackDto[], hooks: TrackMenuHooks): Conte
       icon: TRACK_ICON.mix,
       action: () => player.run(api.playInstantMix(track.id)),
     });
+    items.push({
+      label: m.ctx_sonic_radio(),
+      icon: TRACK_ICON.sonic,
+      action: () => void sonic.radio(track.id),
+    });
+    const start = sonic.pathStart;
+    if (start && start.id !== track.id) {
+      items.push({
+        label: m.ctx_sonic_path_to({ name: start.name }),
+        icon: TRACK_ICON.path,
+        action: () => void sonic.finishPath(track.id),
+      });
+    } else {
+      items.push({
+        label: m.ctx_sonic_path_from(),
+        icon: TRACK_ICON.path,
+        action: () => sonic.startPath(track.id, track.name),
+      });
+    }
     items.push({
       label: m.ctx_go_to_album(),
       icon: TRACK_ICON.album,

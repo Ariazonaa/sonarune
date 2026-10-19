@@ -1709,6 +1709,36 @@ impl JellyfinClient {
         ))
     }
 
+    /// The whole track as a small file, for the library's sonic analysis
+    /// (`sonic_scan.rs`): lossy originals up to 320 kbit/s come as they are,
+    /// everything else is transcoded to 96 kbit/s Opus. The analysis works
+    /// below ~5.5 kHz, so nothing it looks at is lost, and a library of FLAC
+    /// does not have to cross the network at full size.
+    pub async fn analysis_audio(&self, item_id: &str) -> AppResult<Vec<u8>> {
+        /// A 96 kbit/s hour is ~43 MB; longer is a mix, not a track to compare.
+        const MAX_ANALYSIS_BYTES: u64 = 64 * 1024 * 1024;
+        let user_id = self.user_id()?;
+        let url = format!(
+            "{}/Audio/{item_id}/universal?userId={user_id}&deviceId={}&container=opus,ogg%7Copus,mp3,ogg%7Cvorbis&transcodingContainer=opus&transcodingProtocol=http&audioCodec=opus&audioBitRate=96000&maxStreamingBitrate=320000",
+            self.base_url, self.device_id
+        );
+        let response = self
+            .http
+            .get(url)
+            .header("Authorization", self.auth_header())
+            .timeout(Duration::from_secs(10 * 60))
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::Server {
+                status: status.as_u16(),
+                message: error_message(response).await,
+            });
+        }
+        read_capped(response, MAX_ANALYSIS_BYTES, "track for analysis").await
+    }
+
     pub fn image_url(&self, item_id: &str, tag: &str, size: u32) -> String {
         format!(
             "{}/Items/{item_id}/Images/Primary?fillWidth={size}&fillHeight={size}&quality=90&tag={tag}",

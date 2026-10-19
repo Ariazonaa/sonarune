@@ -17,6 +17,7 @@
   import { session } from "#lib/state/session.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
   import { library } from "#lib/state/library.svelte.js";
+  import { sonic } from "#lib/state/sonic.svelte.js";
   import { net } from "#lib/state/net.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { updates } from "#lib/state/updates.svelte.js";
@@ -80,6 +81,7 @@
     session.restore();
     player.init();
     library.init();
+    void sonic.init();
     net.init();
     updates.init();
   });

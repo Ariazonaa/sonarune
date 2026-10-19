@@ -150,6 +150,7 @@ async fn install_session(state: &AppState, client: JellyfinClient) -> Arc<Jellyf
         .relogin_blocked
         .store(false, std::sync::atomic::Ordering::Relaxed);
     *state.session.write().await = Some(client.clone());
+    state.sonic_scan.poke();
     client
 }
 

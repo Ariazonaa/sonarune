@@ -121,7 +121,22 @@ UI shows it, it never computes it.
 - **Auto-DJ**: pick a seed (track, artist, genre, album or playlist) and when
   the queue is about to run dry, Sonarune appends a fresh instant mix. It
   resumes playback if the queue ran out before the mix arrived, and holds off
-  while a sleep timer is about to end the session.
+  while a sleep timer is about to end the session. The **sound** seed uses
+  Sonarune's own sonic similarity instead of the server's mix: what sounds like
+  the last few tracks, ordered so each follows on from the one before.
+- **Sonic similarity** (`src-tauri/src/sonic.rs`): the analysis that already
+  finds tempo, beats and key also measures timbre (12 mel-cepstral
+  coefficients and their spread), brightness, noisiness, attack, bass share,
+  level and dynamic range (`player/timbre.rs`). Every track you play gets it;
+  Settings → Sonic similarity analyses the rest of the library in the
+  background, two tracks at a time, each fetched as a 96 kbit/s transcode
+  (lossy originals as they are). Distances weigh sound, tempo (half and double
+  time count as the same groove; how much depends on how sure the tempo is)
+  and key (Camelot). A **sonic radio** picks the 39 tracks closest to the seed
+  and orders them to flow; a **sonic path** aims each of its ten steps at the
+  point that far between start and destination, in sound and tempo, and keeps
+  each step close to the one before. No server plugin, nothing leaves the
+  machine.
 
 </details>
 

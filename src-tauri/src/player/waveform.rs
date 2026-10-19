@@ -177,6 +177,40 @@ fn analyse(mut file: File, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)>
     }
 }
 
+/// Only the tempo/key/sound analysis of a track held in memory (the library
+/// scan), without peaks.
+pub fn analyse_bytes(bytes: Vec<u8>, duration_ms: u64) -> Option<TrackAnalysis> {
+    let len = bytes.len() as u64;
+    let reader = std::io::Cursor::new(bytes);
+    match super::opus::probe(reader, true) {
+        Ok(opus) => analysis_only(opus),
+        Err((reader, _)) => {
+            let decoder = rodio::Decoder::builder()
+                .with_data(reader)
+                .with_byte_len(len)
+                .with_gapless(true)
+                .build()
+                .ok()?;
+            analysis_only(decoder)
+        }
+    }
+    .filter(|analysis| {
+        // A transcode that came back much shorter than the track is a
+        // broken download, not the track.
+        duration_ms == 0 || analysis.duration_ms + 5_000.0 >= duration_ms as f64
+    })
+}
+
+fn analysis_only<S: Source>(source: S) -> Option<TrackAnalysis> {
+    let channels = usize::from(source.channels().get());
+    let rate = source.sample_rate().get();
+    let mut analyzer = Analyzer::new(rate, channels);
+    for sample in source {
+        analyzer.push(sample);
+    }
+    Some(analyzer.finish())
+}
+
 fn fold<S: Source>(source: S, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)> {
     let channels = usize::from(source.channels().get());
     let rate = u64::from(source.sample_rate().get());

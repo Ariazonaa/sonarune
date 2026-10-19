@@ -245,7 +245,7 @@ export interface ExtrasSettings {
    */
   listenbrainzToken: string | null;
   autoDjEnabled: boolean;
-  autoDjSeedMode: "track" | "artist" | "genre" | "album" | "playlist";
+  autoDjSeedMode: "track" | "artist" | "genre" | "album" | "playlist" | "sonic";
   autoDjMaxTracks: number;
   autoDjRecentTracks: number;
   /** Keep the local play history (one row per listen, on this machine). */
@@ -437,6 +437,17 @@ export interface ArtistPlays {
   id: string | null;
   name: string;
   plays: number;
+}
+
+/** The background library analysis for sonic similarity. */
+export interface SonicScanStatus {
+  enabled: boolean;
+  running: boolean;
+  /** Tracks with a sound vector, out of `total` (null until listed). */
+  analysed: number;
+  total: number | null;
+  current: string | null;
+  lastError: string | null;
 }
 
 /** What the play history remembers of a track. */

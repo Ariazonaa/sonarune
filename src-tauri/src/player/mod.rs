@@ -6,6 +6,7 @@ mod scrobble;
 pub mod source;
 pub mod tap;
 pub mod tempo;
+pub mod timbre;
 pub mod waveform;
 
 use crate::api::JellyfinClient;
@@ -97,6 +98,10 @@ pub enum AutoDjSeedMode {
     Genre,
     Album,
     Playlist,
+    /// The client's own sonic similarity (`crate::sonic`): what sounds like
+    /// the last few tracks, ordered to flow. Falls back to a track mix from
+    /// the server while too little of the library is analysed.
+    Sonic,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -596,7 +601,9 @@ fn choose_auto_dj_seed(track: &QueueTrack, requested: AutoDjSeedMode) -> (String
             .as_ref()
             .filter(|id| !id.is_empty())
             .map(|id| (id.clone(), String::new())),
-        AutoDjSeedMode::Track => Some((track.item_id.clone(), track.name.clone())),
+        AutoDjSeedMode::Track | AutoDjSeedMode::Sonic => {
+            Some((track.item_id.clone(), track.name.clone()))
+        }
     };
     let (kind, id, label) = candidate
         .map(|(id, label)| (requested, id, label))
@@ -3429,12 +3436,49 @@ impl Worker {
         let mut existing: std::collections::HashSet<String> =
             self.queue.iter().map(|t| t.item_id.clone()).collect();
         existing.extend(self.recent_tracks.iter().cloned());
+        // What was just heard, oldest first, ending with the current track:
+        // the sonic continuation follows where the set has gone.
+        let mut heard: Vec<String> = self.recent_tracks.iter().cloned().collect();
+        heard.retain(|id| id != &request_track);
+        heard.push(request_track.clone());
+        let sonic = (reason.kind == AutoDjSeedMode::Sonic).then(|| self.store.clone());
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
-            let tracks = match client
-                .instant_mix(&seed, (max_tracks as u32).saturating_mul(3))
-                .await
-            {
+            let (reason, sonic_ids) = match sonic {
+                Some(store) => {
+                    let exclude = existing.clone();
+                    let ids = tokio::task::spawn_blocking(move || {
+                        crate::sonic::index(&store).continuation(&heard, max_tracks, &exclude)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    // A handful is not a set; let the server mix it instead.
+                    if ids.len() >= 3 {
+                        (reason, Some(ids))
+                    } else {
+                        let fallback = AutoDjReason {
+                            kind: AutoDjSeedMode::Track,
+                            label: reason.label,
+                        };
+                        (fallback, None)
+                    }
+                }
+                None => (reason, None),
+            };
+            let fetched = match sonic_ids {
+                Some(ids) => client.tracks_by_ids(&ids).await.map(|mut tracks| {
+                    let position =
+                        |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
+                    tracks.sort_by_key(|t| position(&t.id));
+                    tracks
+                }),
+                None => {
+                    client
+                        .instant_mix(&seed, (max_tracks as u32).saturating_mul(3))
+                        .await
+                }
+            };
+            let tracks = match fetched {
                 Ok(tracks) => {
                     let fresh: Vec<_> = tracks
                         .into_iter()
@@ -3464,6 +3508,12 @@ impl Worker {
         });
     }
 
+    fn release_auto_dj_latch(&mut self, request_track: &str) {
+        if self.last_auto_dj_seed.as_deref() == Some(request_track) {
+            self.last_auto_dj_seed = None;
+        }
+    }
+
     /// The Auto-DJ fetch came back. Append the mix — and if the seeding track
     /// already finished (queue ran out while the server was thinking), resume
     /// playback into the first appended track instead of staying Idle.
@@ -3490,6 +3540,9 @@ impl Worker {
             self.queue.last()
         };
         if last_in_order.map(|t| t.item_id.as_str()) != Some(request_track.as_str()) {
+            // The queue moved on while the mix was fetched; the seed may come
+            // up last again later and must be able to ask once more.
+            self.release_auto_dj_latch(&request_track);
             return;
         }
         let existing: std::collections::HashSet<&str> =
@@ -3499,6 +3552,7 @@ impl Worker {
             .filter(|t| !existing.contains(t.item_id.as_str()))
             .collect();
         if fresh.is_empty() {
+            self.release_auto_dj_latch(&request_track);
             return;
         }
         // Only a queue that ran out on its own resumes into the mix — not a

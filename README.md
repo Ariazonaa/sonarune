@@ -122,6 +122,10 @@ Folded up by area; the full list, with the reasoning, is in
 
 - A Discover hub, **dynamic smart views** (server-side filters you can save and
   materialize to a static playlist), decade rows, read-only Collections/BoxSets.
+- **Sonic similarity without a server plugin**: Sonarune analyses how a track
+  sounds (timbre, brightness, attack, dynamics, tempo, key) itself, the whole
+  library in the background if you like. From that, a **sonic radio** from any
+  track and a **sonic path** that walks from one track to another in ten steps.
 - **Auto-DJ** that keeps the music going from a track / artist / genre / album /
   playlist seed.
 

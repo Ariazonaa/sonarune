@@ -11,6 +11,9 @@ pub struct Store {
     /// `set` take `conn` separately, so two writers could lose an update (a
     /// forgotten pin coming back).
     trust: Mutex<()>,
+    /// Bumped on every analysis write, so the sonic index knows when to
+    /// rebuild (`sonic::index`).
+    analysis_generation: std::sync::atomic::AtomicU64,
 }
 
 const DB_FILE: &str = "sonarune.db";
@@ -35,6 +38,8 @@ pub mod keys {
     pub const DESKTOP: &str = "desktop";
     pub const AUDIO_PROFILES: &str = "audio_profiles";
     pub const PLAYBACK_SPEED: &str = "playback_speed";
+    /// Analyse the whole library in the background (`sonic_scan.rs`).
+    pub const SONIC_SCAN: &str = "sonic_scan";
 }
 
 impl Store {
@@ -55,9 +60,20 @@ impl Store {
              );",
         )?;
         conn.execute_batch(crate::history::SCHEMA)?;
+        // Which server an analysis was made on: the sonic index must only
+        // offer tracks of the library signed in now. Rows from before the
+        // column existed stay NULL and count for every server (they are a
+        // few played tracks; a stale id only drops out when queued).
+        let has_server: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('track_analysis') WHERE name = 'server_url'")?
+            .exists([])?;
+        if !has_server {
+            conn.execute_batch("ALTER TABLE track_analysis ADD COLUMN server_url TEXT")?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             trust: Mutex::new(()),
+            analysis_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -92,12 +108,42 @@ impl Store {
 
     pub fn put_analysis(&self, item_id: &str, json: &str) -> AppResult<()> {
         let conn = self.conn.lock().unwrap();
+        let server: Option<String> = conn
+            .query_row(
+                "SELECT value FROM kv WHERE key = ?1",
+                [keys::SERVER_URL],
+                |row| row.get(0),
+            )
+            .ok();
         conn.execute(
-            "INSERT INTO track_analysis (item_id, json) VALUES (?1, ?2)
-             ON CONFLICT(item_id) DO UPDATE SET json = excluded.json",
-            [item_id, json],
+            "INSERT INTO track_analysis (item_id, json, server_url) VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_id) DO UPDATE SET json = excluded.json,
+                                                server_url = excluded.server_url",
+            rusqlite::params![item_id, json, server],
         )?;
+        self.analysis_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Every stored analysis made on `server` (or before analyses recorded
+    /// their server), as (item id, JSON).
+    pub fn analyses_for(&self, server: &str) -> AppResult<Vec<(String, String)>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT item_id, json FROM track_analysis
+                 WHERE server_url = ?1 OR server_url IS NULL",
+            )?;
+            let rows = statement
+                .query_map([server], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn analysis_generation(&self) -> u64 {
+        self.analysis_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Run `f` on the connection, for modules with tables of their own
@@ -426,6 +472,30 @@ mod tests {
             self.store.take();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn analyses_are_listed_for_the_server_they_were_made_on() {
+        let store = temp_store();
+        store.set(keys::SERVER_URL, "https://a.home").unwrap();
+        store.put_analysis("a1", "{}").unwrap();
+        store.set(keys::SERVER_URL, "https://b.home").unwrap();
+        store.put_analysis("b1", "{}").unwrap();
+        let ids = |server: &str| {
+            let mut ids: Vec<String> = store
+                .analyses_for(server)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids("https://a.home"), ["a1"]);
+        assert_eq!(ids("https://b.home"), ["b1"]);
+        // Re-analysed on b: it moves there.
+        store.put_analysis("a1", "{}").unwrap();
+        assert!(ids("https://a.home").is_empty());
     }
 
     fn temp_store() -> TempStore {
