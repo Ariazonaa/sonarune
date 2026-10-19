@@ -3470,7 +3470,7 @@ impl Worker {
                     let position =
                         |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
                     tracks.sort_by_key(|t| position(&t.id));
-                    tracks
+                    crate::commands_sonic::without_copies(tracks)
                 }),
                 None => {
                     client

@@ -30,40 +30,45 @@ use std::collections::HashSet;
 const TEMPO_WEIGHT: f32 = 0.35;
 const KEY_WEIGHT: f32 = 0.25;
 const TEMPO_CAP: f32 = 1.5;
+/// What an unknown tempo costs: half of "cannot be mixed".
+const UNKNOWN_TEMPO: f32 = TEMPO_CAP / 2.0;
 /// A tempo or key that is not known costs this much: neither a match nor a
 /// clash.
 const UNKNOWN_TERM: f32 = 0.5;
 /// How strongly a path step must also fit after the previous step.
 const PATH_SMOOTHING: f32 = 0.5;
 
-/// Per-dimension weights: the cepstral means are the colour of the sound,
-/// their spreads say how much it changes — worth half as much.
-fn dimension_weight(dimension: usize) -> f32 {
-    if (12..24).contains(&dimension) {
-        0.5
-    } else {
-        1.0
-    }
-}
-
 /// One analysed track.
 #[derive(Debug, Clone)]
 struct Point {
     item_id: String,
-    /// Standardized and weighted sound vector.
+    /// Standardized sound vector. Every dimension counts the same: on a real
+    /// library, weighting the cepstral spreads or the level down made the
+    /// neighbours no better (`evaluate`).
     sound: Vec<f32>,
     bpm: Option<f32>,
     /// How sure the tempo is, 0..1: a pad without a beat still gets a BPM
     /// from the analysis, and it must not count like a drummer's.
     tempo_trust: f32,
     key: Option<MusicalKey>,
+    /// How far this track's own neighbours are (mean sound distance to its
+    /// closest few): the local density the distances are measured against.
+    reach: f32,
 }
 
 /// Every analysed track with a sound vector, ready to compare.
 #[derive(Debug, Default)]
 pub struct SonicIndex {
     points: Vec<Point>,
+    /// Mean [`Point::reach`], so scaled distances keep their usual size.
+    mean_reach: f32,
 }
+
+/// Neighbours [`Point::reach`] averages over.
+const REACH_NEIGHBOURS: usize = 7;
+/// Points the reach is estimated against: all of a small library, an even
+/// spread of a large one (n × 1000 distances instead of n²).
+const REACH_SAMPLE: usize = 1000;
 
 /// Raw input for [`SonicIndex::build`].
 pub struct Analysed {
@@ -113,15 +118,57 @@ impl SonicIndex {
                 sound: vector
                     .iter()
                     .enumerate()
-                    .map(|(d, v)| (v - mean[d]) / spread[d] * dimension_weight(d) * scale)
+                    .map(|(d, v)| (v - mean[d]) / spread[d] * scale)
                     .collect(),
                 item_id: row.item_id,
                 bpm: row.analysis.bpm,
                 tempo_trust: tempo_trust(row.analysis.tempo_confidence),
                 key: row.analysis.key,
+                reach: 1.0,
+            })
+            .collect::<Vec<Point>>();
+        let mut index = Self {
+            points,
+            mean_reach: 1.0,
+        };
+        index.measure_reach();
+        index
+    }
+
+    /// Local scaling against hubs. In a space of a few dozen dimensions some
+    /// tracks sit near the middle of everything and come out as "closest"
+    /// to half the library — a rap track in the radio of a yodel. Measuring
+    /// each distance against how far both tracks' own neighbours are (d /
+    /// sqrt(reach_a · reach_b)) takes that advantage away: a hub has close
+    /// neighbours everywhere, so its distances grow.
+    fn measure_reach(&mut self) {
+        let n = self.points.len();
+        if n < 2 {
+            return;
+        }
+        let step = n.div_ceil(REACH_SAMPLE).max(1);
+        let sample: Vec<usize> = (0..n).step_by(step).collect();
+        let reaches: Vec<f32> = (0..n)
+            .map(|i| {
+                let mut distances: Vec<f32> = sample
+                    .iter()
+                    .filter(|&&j| j != i)
+                    .map(|&j| sound_distance(&self.points[i].sound, &self.points[j].sound))
+                    .collect();
+                distances.sort_by(f32::total_cmp);
+                let k = distances.len().clamp(1, REACH_NEIGHBOURS);
+                (distances.iter().take(k).sum::<f32>() / k as f32).max(1e-3)
             })
             .collect();
-        Self { points }
+        self.mean_reach = reaches.iter().sum::<f32>() / n as f32;
+        for (point, reach) in self.points.iter_mut().zip(reaches) {
+            point.reach = reach;
+        }
+    }
+
+    /// Sound distance between two vectors whose reaches are given.
+    fn scaled_sound(&self, a: &[f32], reach_a: f32, b: &[f32], reach_b: f32) -> f32 {
+        sound_distance(a, b) * self.mean_reach / (reach_a * reach_b).sqrt()
     }
 
     #[cfg(test)]
@@ -179,6 +226,7 @@ impl SonicIndex {
                 .zip(&end.sound)
                 .map(|(x, y)| x + (y - x) * t)
                 .collect();
+            let target_reach = start.reach + (end.reach - start.reach) * t;
             // Geometric: halfway from 90 to 160 BPM is 120, not 125.
             let target_bpm = match (start.bpm, end.bpm) {
                 (Some(x), Some(y)) => Some(x * (y / x).powf(t)),
@@ -186,8 +234,8 @@ impl SonicIndex {
             };
             let Some(next) = self.best(&used, |c| {
                 let point = &self.points[c];
-                sound_distance(&target, &point.sound)
-                    + TEMPO_WEIGHT * point.tempo_trust * tempo_distance(target_bpm, point.bpm)
+                self.scaled_sound(&target, target_reach, &point.sound, point.reach)
+                    + TEMPO_WEIGHT * tempo_term(target_bpm, 1.0, point.bpm, point.tempo_trust)
                     + PATH_SMOOTHING * self.distance(previous, c)
             }) else {
                 break;
@@ -223,17 +271,25 @@ impl SonicIndex {
                 *c += v / known.len() as f32;
             }
         }
+        let centre_reach =
+            known.iter().map(|&i| self.points[i].reach).sum::<f32>() / known.len() as f32;
         let mut used = self.excluded(exclude);
         for &i in &known {
             used[i] = true;
         }
         let chosen = self.nearest(&used, count, |c| {
-            sound_distance(&centre, &self.points[c].sound)
-                + TEMPO_WEIGHT
-                    * self.points[last]
-                        .tempo_trust
-                        .min(self.points[c].tempo_trust)
-                    * tempo_distance(self.points[last].bpm, self.points[c].bpm)
+            self.scaled_sound(
+                &centre,
+                centre_reach,
+                &self.points[c].sound,
+                self.points[c].reach,
+            ) + TEMPO_WEIGHT
+                * tempo_term(
+                    self.points[last].bpm,
+                    self.points[last].tempo_trust,
+                    self.points[c].bpm,
+                    self.points[c].tempo_trust,
+                )
         });
         self.flow(last, chosen)
     }
@@ -285,8 +341,8 @@ impl SonicIndex {
 
     fn distance(&self, a: usize, b: usize) -> f32 {
         let (a, b) = (&self.points[a], &self.points[b]);
-        sound_distance(&a.sound, &b.sound)
-            + TEMPO_WEIGHT * a.tempo_trust.min(b.tempo_trust) * tempo_distance(a.bpm, b.bpm)
+        self.scaled_sound(&a.sound, a.reach, &b.sound, b.reach)
+            + TEMPO_WEIGHT * tempo_term(a.bpm, a.tempo_trust, b.bpm, b.tempo_trust)
             + KEY_WEIGHT * key_distance(a.key, b.key)
     }
 }
@@ -359,6 +415,17 @@ pub fn sound_attempted(analysis: &TrackAnalysis) -> bool {
         .sonic
         .as_ref()
         .is_some_and(|f| f.version == SONIC_VERSION)
+}
+
+/// The tempo part of a distance. An unknown or doubtful tempo costs what a
+/// so-so match costs, never nothing: a track without a detected beat must
+/// not win every comparison just because it has no tempo to disagree with.
+fn tempo_term(a: Option<f32>, trust_a: f32, b: Option<f32>, trust_b: f32) -> f32 {
+    if a.is_none() || b.is_none() {
+        return UNKNOWN_TEMPO;
+    }
+    let trust = trust_a.min(trust_b);
+    trust * tempo_distance(a, b) + (1.0 - trust) * UNKNOWN_TEMPO
 }
 
 /// Tempo confidence (autocorrelation peak, `analysis.rs`) mapped to how much
@@ -629,6 +696,56 @@ mod tests {
             right, total,
             "{right} of {total} nearest neighbours of the same kind"
         );
+    }
+
+    /// Neighbours over a real database, for judging by hand:
+    /// `SONARUNE_EVAL_DIR=<data dir> cargo test --release --lib sonic::tests::evaluate -- --ignored --nocapture`.
+    /// Prints one JSON line per analysed track: its five nearest, a radio of
+    /// ten, and for a few pairs a path. Reads only; plays nothing.
+    #[test]
+    #[ignore]
+    fn evaluate() {
+        let Ok(dir) = std::env::var("SONARUNE_EVAL_DIR") else {
+            return;
+        };
+        let store = crate::store::Store::open(std::path::Path::new(&dir)).unwrap();
+        let index = index(&store);
+        let none = HashSet::new();
+        for point in &index.points {
+            let me = index.find(&point.item_id).unwrap();
+            let nearest = index.nearest(
+                &[false; 0]
+                    .iter()
+                    .copied()
+                    .chain((0..index.points.len()).map(|i| i == me))
+                    .collect::<Vec<_>>(),
+                5,
+                |c| index.distance(me, c),
+            );
+            let nearest: Vec<String> = nearest
+                .into_iter()
+                .map(|i| index.points[i].item_id.clone())
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "seed": point.item_id,
+                    "bpm": point.bpm,
+                    "key": point.key.map(|k| k.camelot()),
+                    "nearest": nearest,
+                    "radio": index.radio(&point.item_id, 10, &none),
+                })
+            );
+        }
+        let ids: Vec<&str> = index.points.iter().map(|p| p.item_id.as_str()).collect();
+        for pair in ids.chunks(2).step_by(7).take(6) {
+            if let [a, b] = pair {
+                println!(
+                    "{}",
+                    serde_json::json!({"from": a, "to": b, "path": index.path(a, b, 8, &none)})
+                );
+            }
+        }
     }
 
     #[test]
