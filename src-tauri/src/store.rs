@@ -54,6 +54,7 @@ impl Store {
                  json    TEXT NOT NULL
              );",
         )?;
+        conn.execute_batch(crate::history::SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
             trust: Mutex::new(()),
@@ -97,6 +98,13 @@ impl Store {
             [item_id, json],
         )?;
         Ok(())
+    }
+
+    /// Run `f` on the connection, for modules with tables of their own
+    /// (`history`).
+    pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> AppResult<T> {
+        let conn = self.conn.lock().unwrap();
+        Ok(f(&conn)?)
     }
 
     pub fn delete(&self, key: &str) -> AppResult<()> {

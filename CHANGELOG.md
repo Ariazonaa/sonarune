@@ -7,6 +7,18 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **Play history.** Sonarune now records every track you listen to (by the
+  ListenBrainz rule: half the track or four minutes), on this computer only,
+  per server and account. The new *History* page shows it as a timeline by
+  day, folds a track played several times in a row into one row, pages back
+  in time and plays a track again on click. Single entries or the whole
+  history can be removed, and recording can be switched off in the settings.
+- **Year in review**, built from that history: plays, listening time, how
+  many different tracks and artists, the most played artists, albums and
+  tracks, and plays per month. A year the history only started in says so.
+
 ## [0.6.0] — 2026-10-18
 
 ### Upgrading from 0.5.x

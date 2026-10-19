@@ -11,6 +11,7 @@ mod desktop;
 mod diagnostics;
 mod download;
 mod error;
+mod history;
 mod legacy;
 mod library_watch;
 mod player;
@@ -319,6 +320,11 @@ pub fn run() {
             commands_library::delete_items,
             commands_library::get_home,
             commands_library::get_stats,
+            commands_library::history_page,
+            commands_library::history_years,
+            commands_library::history_year,
+            commands_library::history_delete,
+            commands_library::history_clear,
             commands_library::get_favorites,
             commands_library::get_favorite_tracks,
             commands_library::get_favorite_albums,

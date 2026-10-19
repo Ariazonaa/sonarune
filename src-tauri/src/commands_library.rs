@@ -612,6 +612,41 @@ pub async fn get_stats(state: State<'_, AppState>) -> AppResult<StatsData> {
     .await
 }
 
+// --- Play history (history.rs) ---
+// Local reads and writes only; no server round trip, so no retry either.
+
+#[tauri::command]
+pub fn history_page(
+    state: State<'_, AppState>,
+    before: Option<i64>,
+    limit: u32,
+) -> AppResult<Vec<crate::history::HistoryEntry>> {
+    crate::history::page(&state.store, before, limit)
+}
+
+#[tauri::command]
+pub fn history_years(state: State<'_, AppState>) -> AppResult<crate::history::HistoryYears> {
+    crate::history::years(&state.store)
+}
+
+#[tauri::command]
+pub fn history_year(
+    state: State<'_, AppState>,
+    year: i32,
+) -> AppResult<crate::history::YearReview> {
+    crate::history::year(&state.store, year)
+}
+
+#[tauri::command]
+pub fn history_delete(state: State<'_, AppState>, id: i64) -> AppResult<bool> {
+    crate::history::delete(&state.store, id)
+}
+
+#[tauri::command]
+pub fn history_clear(state: State<'_, AppState>) -> AppResult<usize> {
+    crate::history::clear(&state.store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{top_artists, ArtistPlays};

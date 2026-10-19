@@ -112,6 +112,9 @@ pub struct ExtrasSettings {
     pub auto_dj_seed_mode: AutoDjSeedMode,
     pub auto_dj_max_tracks: u32,
     pub auto_dj_recent_tracks: u32,
+    /// Keep the client's own play history (`history.rs`): one row per listen,
+    /// on this machine only.
+    pub record_history: bool,
     /// UI-only, recomputed on read: a token is stored (the token itself is
     /// never sent to the WebView).
     pub listenbrainz_configured: bool,
@@ -125,6 +128,7 @@ impl Default for ExtrasSettings {
             auto_dj_seed_mode: AutoDjSeedMode::Track,
             auto_dj_max_tracks: 25,
             auto_dj_recent_tracks: 50,
+            record_history: true,
             listenbrainz_configured: false,
         }
     }
@@ -3194,9 +3198,12 @@ impl Worker {
         while self.recent_tracks.len() > keep {
             self.recent_tracks.pop_front();
         }
-        if let Some(token) = self.extras.listenbrainz_token.clone() {
-            if scrobble::should_scrobble(listened_ms, track.duration_ms) {
+        if scrobble::should_scrobble(listened_ms, track.duration_ms) {
+            if let Some(token) = self.extras.listenbrainz_token.clone() {
                 scrobble::submit_listen(token, track.clone());
+            }
+            if self.record_history(track, listened_ms) {
+                let _ = self.app.emit("history:changed", ());
             }
         }
         let Some(session_id) = self.play_session_id.take() else {
@@ -3274,9 +3281,28 @@ impl Worker {
                 }
             });
         }
-        if let Some(token) = self.extras.listenbrainz_token.clone() {
-            if scrobble::should_scrobble(listened_ms, track.duration_ms) {
+        if scrobble::should_scrobble(listened_ms, track.duration_ms) {
+            // Before ListenBrainz, which may take its time; no event, nobody
+            // is looking at the timeline while the app goes away.
+            self.record_history(&track, listened_ms);
+            if let Some(token) = self.extras.listenbrainz_token.clone() {
                 scrobble::submit_listen_blocking(token, track);
+            }
+        }
+    }
+
+    /// One row in the play history for a listen that counts. A failed write
+    /// costs that row and nothing else; playback does not wait on it beyond
+    /// one local insert.
+    fn record_history(&self, track: &QueueTrack, listened_ms: u64) -> bool {
+        if !self.extras.record_history {
+            return false;
+        }
+        match crate::history::record(&self.store, track, listened_ms) {
+            Ok(written) => written,
+            Err(e) => {
+                tracing::warn!("play history not written: {e}");
+                false
             }
         }
     }

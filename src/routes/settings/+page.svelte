@@ -973,6 +973,27 @@
 
     <section class="mb-8 rounded-lg bg-card p-5">
       <h2 class="mb-4 text-sm font-semibold uppercase tracking-wider text-ink-muted">
+        {m.settings_history()}
+      </h2>
+      <label class="flex items-center justify-between gap-4">
+        <div>
+          <p class="text-sm font-medium">{m.settings_history_record()}</p>
+          <p class="mt-0.5 max-w-md text-xs text-ink-muted">{m.settings_history_record_hint()}</p>
+        </div>
+        <input
+          type="checkbox"
+          class="h-4 w-4 accent-(--color-accent)"
+          bind:checked={extras.recordHistory}
+          onchange={saveExtras}
+        />
+      </label>
+      <a href="/history" class="mt-3 inline-block text-xs font-semibold text-ink-muted underline hover:text-ink">
+        {m.settings_history_open()}
+      </a>
+    </section>
+
+    <section class="mb-8 rounded-lg bg-card p-5">
+      <h2 class="mb-4 text-sm font-semibold uppercase tracking-wider text-ink-muted">
         {m.settings_integrations()}
       </h2>
       <label class="flex items-center justify-between gap-4">

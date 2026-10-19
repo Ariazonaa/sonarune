@@ -6,6 +6,8 @@ import type {
   BulkMetadataResult,
   EditableMetadata,
   FavoritesData,
+  HistoryEntry,
+  HistoryYears,
   HomeData,
   MetadataEdits,
   Page,
@@ -13,6 +15,7 @@ import type {
   PlaylistDto,
   StatsData,
   TrackDto,
+  YearReview,
 } from "#lib/types.js";
 
 /** Library-slice commands (src-tauri/src/commands_library.rs). */
@@ -63,6 +66,15 @@ export const apiLibrary = {
     invoke<BulkMetadataResult>("update_items_metadata", { itemIds, edits }),
   getHome: () => invoke<HomeData>("get_home"),
   getStats: () => invoke<StatsData>("get_stats"),
+  /** The local play history, newest first: `limit` listens older than the
+   *  row `before` (from the top when null). */
+  historyPage: (before: number | null, limit: number) =>
+    invoke<HistoryEntry[]>("history_page", { before, limit }),
+  historyYears: () => invoke<HistoryYears>("history_years"),
+  historyYear: (year: number) => invoke<YearReview>("history_year", { year }),
+  historyDelete: (id: number) => invoke<boolean>("history_delete", { id }),
+  /** Forget the history of the signed-in account; resolves with the rows gone. */
+  historyClear: () => invoke<number>("history_clear"),
   /** First page of every favorites section, each with its total. */
   getFavorites: () => invoke<FavoritesData>("get_favorites"),
   /** Later pages of one favorites section (by name; limit 1–200). */

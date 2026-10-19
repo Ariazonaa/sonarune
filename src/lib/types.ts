@@ -248,6 +248,8 @@ export interface ExtrasSettings {
   autoDjSeedMode: "track" | "artist" | "genre" | "album" | "playlist";
   autoDjMaxTracks: number;
   autoDjRecentTracks: number;
+  /** Keep the local play history (one row per listen, on this machine). */
+  recordHistory: boolean;
   /** Read-only: a token is stored. */
   listenbrainzConfigured: boolean;
 }
@@ -435,6 +437,67 @@ export interface ArtistPlays {
   id: string | null;
   name: string;
   plays: number;
+}
+
+/** What the play history remembers of a track. */
+export interface HistoryTrack {
+  itemId: string;
+  name: string;
+  artist: string;
+  album: string;
+  albumId: string | null;
+  artists: ArtistRef[];
+  durationMs: number;
+  imageItemId: string | null;
+  imageTag: string | null;
+  imageBlurHash: string | null;
+}
+
+/** One listen, by the ListenBrainz rule. */
+export interface HistoryEntry {
+  /** Cursor for the next page (older rows have smaller ids). */
+  id: number;
+  /** When the listen ended, epoch ms. */
+  playedAt: number;
+  listenedMs: number;
+  track: HistoryTrack;
+}
+
+export interface HistoryYears {
+  /** Years with plays, newest first (local time). */
+  years: number[];
+  /** First recorded play, epoch ms; null before the first one. */
+  recordedSince: number | null;
+}
+
+export interface TrackPlays {
+  track: HistoryTrack;
+  plays: number;
+}
+
+export interface AlbumPlays {
+  albumId: string | null;
+  name: string;
+  artist: string;
+  imageItemId: string | null;
+  imageTag: string | null;
+  imageBlurHash: string | null;
+  plays: number;
+}
+
+export interface YearReview {
+  year: number;
+  plays: number;
+  listenedMs: number;
+  tracks: number;
+  artists: number;
+  topTracks: TrackPlays[];
+  topArtists: ArtistPlays[];
+  topAlbums: AlbumPlays[];
+  /** Plays per month, January first. */
+  months: number[];
+  firstPlayedAt: number | null;
+  lastPlayedAt: number | null;
 }
 
 export interface DecadeAlbums {

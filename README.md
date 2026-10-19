@@ -103,6 +103,9 @@ Folded up by area; the full list, with the reasoning, is in
 - Search 2.0 with history; instant mix and similar-artists; a **statistics
   dashboard** with the library's numbers, the most played artists and the
   albums per decade.
+- **Its own play history** as a timeline, and a **year in review** built from
+  it. Jellyfin only knows each track's last play; Sonarune records every one
+  itself, on your computer only, and you can switch it off.
 - **Tag editing for a whole selection** — album artist, genres or year across
   many tracks at once.
 - The **queue is a single source of truth in Rust** — shuffle / repeat /
