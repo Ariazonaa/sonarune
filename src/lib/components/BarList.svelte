@@ -35,11 +35,12 @@
           <span class="shrink-0 text-xs text-ink-muted tabular-nums">{item.valueLabel}</span>
         </div>
         <!-- The track is the full scale; the fill starts at the baseline on
-             the left and is rounded only at its data end. -->
+             the left and is rounded only at its data end. A small value
+             still shows a sliver, nothing shows none. -->
         <div class="h-1.5 w-full overflow-hidden rounded-[4px] bg-panel-2">
           <div
             class="h-full rounded-r-[4px] bg-accent"
-            style:width="{Math.max(2, Math.round((item.value / max) * 100))}%"
+            style:width="{item.value > 0 ? Math.max(2, Math.round((item.value / max) * 100)) : 0}%"
           ></div>
         </div>
       </svelte:element>

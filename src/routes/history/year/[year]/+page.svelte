@@ -53,13 +53,26 @@
     return new Date(since).getFullYear() === year ? new Date(since) : null;
   });
 
-  const monthBars = $derived<BarItem[]>(
-    (review?.months ?? []).map((plays, month) => ({
-      label: new Intl.DateTimeFormat(locale, { month: "long" }).format(new Date(year, month, 1)),
-      value: plays,
-      valueLabel: m.stats_plays({ count: plays }),
-    })),
-  );
+  /** The months the history can speak for: from the start of recording (or
+   *  January) to now (or December). A month before recording began is not a
+   *  month without music. */
+  const monthBars = $derived.by<BarItem[]>(() => {
+    const now = new Date();
+    const first = partialSince ? partialSince.getMonth() : 0;
+    const last = year === now.getFullYear() ? now.getMonth() : 11;
+    const name = new Intl.DateTimeFormat(locale, { month: "long" });
+    return (review?.months ?? []).flatMap((plays, month) =>
+      month < first || month > last
+        ? []
+        : [
+            {
+              label: name.format(new Date(year, month, 1)),
+              value: plays,
+              valueLabel: m.stats_plays({ count: plays }),
+            },
+          ],
+    );
+  });
 
   const artistBars = $derived<BarItem[]>(
     (review?.topArtists ?? []).map((artist) => ({

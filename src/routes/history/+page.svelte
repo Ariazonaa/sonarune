@@ -183,7 +183,7 @@
               class="group cursor-pointer transition-colors hover:bg-ink/10"
               onclick={() => playTrack(row.entry.track)}
             >
-              <td class="w-14 rounded-l-md px-2 py-1.5 text-xs text-ink-muted tabular-nums">
+              <td class="w-20 whitespace-nowrap rounded-l-md px-2 py-1.5 text-xs text-ink-muted tabular-nums">
                 {time.format(new Date(row.entry.playedAt))}
               </td>
               <td class="w-11 py-1">
@@ -200,8 +200,9 @@
               <td class="px-3 py-1.5">
                 <p class="truncate font-medium">{row.entry.track.name}</p>
                 <p class="truncate text-xs text-ink-muted">
-                  {row.entry.track.artist}{#if row.entry.track.album}
-                    · {row.entry.track.album}{/if}
+                  {row.entry.track.album
+                    ? `${row.entry.track.artist} · ${row.entry.track.album}`
+                    : row.entry.track.artist}
                 </p>
               </td>
               <td class="w-14 px-2 py-1.5 text-right text-xs text-ink-muted tabular-nums">
