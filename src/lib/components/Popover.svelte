@@ -16,7 +16,8 @@
 </script>
 
 <script lang="ts">
-  import { tick, type Snippet } from "svelte";
+  import { tick, untrack, type Snippet } from "svelte";
+  import { focusableIn } from "#lib/modal.js";
   import { portal } from "#lib/portal.js";
   import {
     MENU_ITEM,
@@ -33,13 +34,20 @@
     /** Or next to an element (toolbar popovers). Presses on it never count as
      *  "outside", so its own toggle keeps working. */
     anchor?: HTMLElement | null;
+    /** The button that opened a popover placed `at` a point (a menu button):
+     *  like `anchor`, presses on it never count as "outside", so its click can
+     *  close what it opened instead of the press closing it and the click
+     *  opening it again. */
+    trigger?: HTMLElement | null;
     /** Side of `anchor` to open on; flips when that side has no room. */
     placement?: "above" | "below";
     /** Which edge of `anchor` the popover lines up with. */
     align?: "start" | "end";
     /** `menu` gets the menu keyboard pattern (focus on open, arrow keys, …;
      *  see `onMenuKeydown`) and needs menuitem-role children. Popovers with
-     *  richer content (form controls) are a `dialog`: focus stays put. */
+     *  richer content (form controls) are a `dialog`: opened with the pointer,
+     *  focus stays put; opened from the keyboard, it moves to the first
+     *  control (see `onDialogTab`). */
     role?: "menu" | "dialog";
     label?: string;
     class?: string;
@@ -50,6 +58,7 @@
   let {
     at = null,
     anchor = null,
+    trigger = null,
     placement = "below",
     align = "start",
     role = "menu",
@@ -68,6 +77,17 @@
 
   /** Where focus goes back to when the popover closes. */
   const opener = focusedOpener();
+  /** What a popover opened at a point with the pointer belongs to: the
+   *  element under that point (the right-clicked row), taken before the
+   *  popover covers it. Not when opened from the keyboard: that menu opens
+   *  just below the focused row (`pointBelow`), over whatever lies there —
+   *  below the last visible row of a list, the player bar. It belongs to its
+   *  opener, the row. */
+  const pointOwner = untrack(() =>
+    at && !anchor && !trigger && !lastInputWasKeyboard()
+      ? (document.elementFromPoint?.(at.x, at.y) ?? null)
+      : null,
+  );
   /** A press elsewhere closed the popover: that press decides where focus goes. */
   let closedByPress = false;
 
@@ -85,15 +105,21 @@
   // `visibility: hidden` until measured and a hidden element can't be
   // focused. Opened from the keyboard, the first enabled item gets focus;
   // opened with the pointer, the menu itself does, so no item looks picked
-  // but the arrow keys work at once. On close, a popover that still holds
-  // focus hands it back to its opener.
+  // but the arrow keys work at once. A dialog opened from the keyboard hands
+  // focus to its first control: portaled to the end of <body>, it would
+  // otherwise sit behind the rest of the page in the tab order. On close, a
+  // popover that still holds focus hands it back to its opener.
   function manageFocus(node: HTMLElement) {
     openers.set(node, opener);
     let open = true;
     void tick().then(() => {
-      if (!open || role !== "menu" || node.contains(document.activeElement)) return;
-      const first = lastInputWasKeyboard() ? menuItemFor(node, "Home", null) : null;
-      (first ?? node).focus({ preventScroll: true });
+      if (!open || node.contains(document.activeElement)) return;
+      if (role === "menu") {
+        const first = lastInputWasKeyboard() ? menuItemFor(node, "Home", null) : null;
+        (first ?? node).focus({ preventScroll: true });
+      } else if (lastInputWasKeyboard()) {
+        (focusableIn(node)[0] ?? node).focus({ preventScroll: true });
+      }
     });
     return () => {
       open = false;
@@ -109,8 +135,8 @@
     let left = at?.x ?? 0;
     let top = at?.y ?? 0;
     if (anchor) {
-      // Read once per layout pass; the popover closes on scroll and resize,
-      // so the anchor cannot move underneath it.
+      // Read once per layout pass; the popover closes on resize and on any
+      // scroll that could move the anchor, so it cannot move underneath it.
       const r = anchor.getBoundingClientRect();
       left = align === "end" ? r.right - w : r.left;
       const above = r.top - GAP - h;
@@ -127,12 +153,31 @@
 
   function inside(target: EventTarget | null, withAnchor: boolean): boolean {
     if (!(target instanceof Node)) return false;
-    return !!el?.contains(target) || (withAnchor && !!anchor?.contains(target));
+    if (el?.contains(target)) return true;
+    return withAnchor && (!!anchor?.contains(target) || !!trigger?.contains(target));
   }
 
   function pressed(target: EventTarget | null) {
     if (inside(target, true)) return;
     closedByPress = true;
+    onclose();
+  }
+
+  /**
+   * A scroll elsewhere closes the popover only when it can move what the
+   * popover belongs to — its anchor, its trigger, the content under its
+   * point, or failing those its opener — and so leave it floating next to
+   * nothing. The app scrolls panels by itself all the time (the lyrics follow
+   * the song, the queue reveals the playing row): a menu or a half-typed
+   * playlist name must not vanish under the pointer because a panel that
+   * holds neither moved. An owner that has left the page (its row was
+   * rendered anew) no longer tells which scroll moves it, so then any scroll
+   * closes the popover, as one with no owner at all.
+   */
+  function scrolled(target: EventTarget | null) {
+    if (inside(target, false)) return;
+    const owner = anchor ?? trigger ?? pointOwner ?? opener;
+    if (owner?.isConnected && target instanceof Node && !target.contains(owner)) return;
     onclose();
   }
 
@@ -190,24 +235,50 @@
     event.preventDefault();
     next?.focus();
   }
+
+  /**
+   * Tab inside a dialog popover moves between its controls as usual. Past the
+   * last one it closes and puts focus back on the opener, and Tab carries on
+   * from there; Shift+Tab before the first one closes and stays on the
+   * opener. The popover belongs right after its opener in the tab order, even
+   * though it is portaled to the end of <body> — Tab must neither run off
+   * into the rest of the page with the popover still open, nor leave the
+   * user at the end of the document.
+   */
+  function onDialogTab(event: KeyboardEvent, dialog: HTMLElement) {
+    const controls = focusableIn(dialog);
+    const target = event.target;
+    const leaving = event.shiftKey
+      ? target === dialog || target === controls[0]
+      : controls.length === 0 || target === controls[controls.length - 1];
+    if (!leaving) return;
+    if (opener?.isConnected) {
+      opener.focus({ preventScroll: true });
+      if (event.shiftKey) event.preventDefault();
+    }
+    onclose();
+  }
 </script>
 
-<!-- Any press, right-click, scroll or resize elsewhere dismisses it; mousedown
-     (not click) so the very next press closes it immediately. Scrolling inside
-     the popover (a long list) does not. -->
+<!-- Any press, right-click or resize elsewhere dismisses it; mousedown (not
+     click) so the very next press closes it immediately. So does a scroll
+     that can move what it belongs to (see `scrolled`); scrolling inside the
+     popover (a long list) does not. -->
 <svelte:window
   onmousedowncapture={(e) => pressed(e.target)}
   oncontextmenucapture={(e) => pressed(e.target)}
-  onscrollcapture={(e) => {
-    if (!inside(e.target, false)) onclose();
-  }}
+  onscrollcapture={(e) => scrolled(e.target)}
   onresize={onclose}
   onkeydowncapture={(e) => {
     if (e.key === "Escape") {
       e.stopPropagation();
       onclose();
-    } else if (role === "menu" && el && inside(e.target, false)) {
+    } else if (!el || !inside(e.target, false)) {
+      return;
+    } else if (role === "menu") {
       onMenuKeydown(e, el);
+    } else if (e.key === "Tab") {
+      onDialogTab(e, el);
     }
   }}
 />

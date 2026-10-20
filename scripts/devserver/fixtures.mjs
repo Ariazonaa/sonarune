@@ -96,13 +96,33 @@ function buildLibrary() {
     }
   }
 
-  const genres = GENRES.map((name) => ({ id: idFor("genre", name), name }));
+  const genres = GENRES.map((name) => ({ name, musicGenreId: musicGenreId(name), genreId: genreId(name) }));
   return { artists, albums, tracks, genres };
 }
 
+// Jellyfin 10.11 knows a genre twice: as a `MusicGenre` item, which is what
+// tracks and albums name in GenreItems and what `/Genres` lists below a music
+// library, and as a `Genre` item, which exists only when something other than
+// music carries the genre too (a playlist takes on its tracks' genres) and is
+// what `/Genres` lists without a music parent. Their ids differ.
+export function musicGenreId(name) {
+  return idFor("musicgenre", name);
+}
+export function genreId(name) {
+  return idFor("genre", name);
+}
+
+/** The one music library ("view") the demo user sees. */
+export const musicLibraryId = idFor("view", "music");
+
 export const library = buildLibrary();
 
-/** A small set of playlists over the fake tracks. */
+/**
+ * A small set of playlists over the fake tracks. Mutable: the server adds,
+ * removes and reorders entries like Jellyfin 10.11 does. "On Repeat" holds a
+ * track twice — 10.11 refuses to add a duplicate, but playlists from older
+ * servers and imported .m3u files have them.
+ */
 export const playlists = [
   {
     id: idFor("playlist", "Late Shift"),
@@ -113,6 +133,30 @@ export const playlists = [
     id: idFor("playlist", "Sunday Morning"),
     name: "Sunday Morning",
     trackIds: library.tracks.filter((_, i) => i % 5 === 2).slice(0, 11).map((t) => t.id),
+  },
+  {
+    id: idFor("playlist", "On Repeat"),
+    name: "On Repeat",
+    trackIds: [0, 9, 0, 21, 33, 9].map((i) => library.tracks[i].id),
+  },
+];
+
+/**
+ * Collections (box sets). One holds music albums; the other stands for the
+ * movie collections a mixed server has, which hold no music at all.
+ */
+export const collections = [
+  {
+    id: idFor("boxset", "Quiet Hours"),
+    name: "Quiet Hours",
+    albumIds: library.albums.filter((a) => a.genre === "Ambient").map((a) => a.id),
+    otherMembers: 0,
+  },
+  {
+    id: idFor("boxset", "Film Night Collection"),
+    name: "Film Night Collection",
+    albumIds: [],
+    otherMembers: 4,
   },
 ];
 

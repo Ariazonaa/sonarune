@@ -2,7 +2,9 @@
   "extends": "$app/tsconfig",
   "compilerOptions": {
     // $app/tsconfig (SvelteKit 3) no longer sets these; without checkJs the
-    // .js files (scripts, vite/vitest config) would drop out of type-checking.
+    // .js files below (vite.config.js, the generated src/lib/paraglide) would
+    // drop out of type-checking. scripts/ and e2e/ are not included: they are
+    // plain Node scripts without JSDoc types and would fail by the hundreds.
     "allowJs": true,
     "checkJs": true,
     "esModuleInterop": true,
@@ -11,6 +13,7 @@
   },
   "include": [
     "src",
-    "vite.config.js"
+    "vite.config.js",
+    "vitest.config.ts"
   ]
 }

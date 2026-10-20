@@ -77,12 +77,18 @@ body {
  * the ground with the playing cover's colors. The panels above it are opaque,
  * so what stays visible of that is a thin colored seam: the gaps between the
  * panels, the title bar strip and the margin around the player bar.
+ *
+ * `clip`, not `hidden`: a hidden box is still a scroll container, and the
+ * ::before's -20% inset gives it room to scroll. A scrollIntoView, a focus
+ * or anything else that reveals an element scrolls every scroll container
+ * above it, and moved the whole shell — title bar and window buttons out of
+ * the window — with nothing the user could scroll back.
  */
 .app-root {
   position: relative;
   height: 100vh;
   border-radius: 16px;
-  overflow: hidden;
+  overflow: clip;
   background-color: var(--color-base);
   box-shadow: inset 0 0 0 1px var(--color-edge);
 }

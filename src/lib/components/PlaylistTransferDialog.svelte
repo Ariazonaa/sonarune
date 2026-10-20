@@ -2,8 +2,9 @@
   import { onDestroy, onMount } from "svelte";
   import { apiLibrary } from "#lib/api/library.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { entryRowKeys } from "#lib/playlistEntries.js";
   import { portal } from "#lib/portal.js";
-  import type { PlaylistDto, PlaylistTrackDto } from "#lib/types.js";
+  import type { PlaylistDto, PlaylistTrackDto, PlaylistTransfer } from "#lib/types.js";
 
   let {
     sourcePlaylistId,
@@ -18,7 +19,12 @@
       movedEntryIds: string[];
       targetId: string;
       targetName: string;
+      /** The entries left the source (a move whose removal went through). */
       moved: boolean;
+      /** Tracks the target gained; null when unknown. */
+      added: number | null;
+      /** A move that copied but could not remove from the source. */
+      removeError: string | null;
     }) => void;
   } = $props();
 
@@ -40,9 +46,12 @@
   let observedSource: string | null = null;
 
   const normalizedQuery = $derived(query.trim().toLocaleLowerCase());
+  // Row keys from the whole list, so they stay put while the filter changes.
+  const rowKeys = $derived(entryRowKeys(tracks));
   const visibleTracks = $derived.by(() => {
-    if (!normalizedQuery) return tracks;
-    return tracks.filter(({ track }) =>
+    const rows = tracks.map((entry, index) => ({ entry, key: rowKeys[index] }));
+    if (!normalizedQuery) return rows;
+    return rows.filter(({ entry: { track } }) =>
       [track.name, track.artist, track.album].some((value) =>
         value.toLocaleLowerCase().includes(normalizedQuery),
       ),
@@ -131,14 +140,14 @@
   function selectVisible() {
     if (busy) return;
     const next = new Set(selectedEntryIds);
-    for (const entry of visibleTracks) next.add(entry.entryId);
+    for (const { entry } of visibleTracks) next.add(entry.entryId);
     selectedEntryIds = next;
   }
 
   function clearVisible() {
     if (busy) return;
     const next = new Set(selectedEntryIds);
-    for (const entry of visibleTracks) next.delete(entry.entryId);
+    for (const { entry } of visibleTracks) next.delete(entry.entryId);
     selectedEntryIds = next;
   }
 
@@ -189,11 +198,14 @@
     const target = targets?.find((playlist) => playlist.id === targetId);
     if (!target) return;
 
-    // Filter the source array instead of iterating the Set so duplicate tracks
-    // remain independently addressable and their original order is preserved.
-    const entryIds = tracks
-      .filter((entry) => selectedEntryIds.has(entry.entryId))
-      .map((entry) => entry.entryId);
+    // In source order. A track that is in the playlist twice shares one entry
+    // id on Jellyfin 10.11 (its rows are selected together), so it is sent
+    // once — and moving it takes every copy out of the source.
+    const entryIds = [
+      ...new Set(
+        tracks.filter((entry) => selectedEntryIds.has(entry.entryId)).map((entry) => entry.entryId),
+      ),
+    ];
     if (entryIds.length === 0) return;
 
     const source = sourcePlaylistId;
@@ -204,8 +216,9 @@
     busy = true;
     error = null;
 
+    let result: PlaylistTransfer;
     try {
-      await apiLibrary.transferPlaylistEntries(source, destination, entryIds, moved);
+      result = await apiLibrary.transferPlaylistEntries(source, destination, entryIds, moved);
     } catch (cause) {
       if (!closing && request === transferRequest && source === sourcePlaylistId) {
         error = String(cause);
@@ -217,7 +230,16 @@
     if (closing || request !== transferRequest || source !== sourcePlaylistId) return;
     busy = false;
     closing = true;
-    oncomplete({ movedEntryIds: entryIds, targetId: destination, targetName, moved });
+    // A move that could not remove from the source still copied: it completes
+    // as a copy, and running it again would not undo anything.
+    oncomplete({
+      movedEntryIds: entryIds,
+      targetId: destination,
+      targetName,
+      moved: moved && result.removeError === null,
+      added: result.added,
+      removeError: result.removeError,
+    });
   }
 </script>
 
@@ -337,7 +359,7 @@
             </p>
           {:else}
             <ul class="p-1.5">
-              {#each visibleTracks as entry (entry.entryId)}
+              {#each visibleTracks as { entry, key } (key)}
                 <li>
                   <label
                     class="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 transition-colors hover:bg-panel-2 has-[:focus-visible]:bg-panel-2 {busy

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { apiLibrary } from "#lib/api/library.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { modalFocus } from "#lib/modal.js";
   import { portal } from "#lib/portal.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import type { BulkMetadataEdits, BulkMetadataResult } from "#lib/types.js";
@@ -91,6 +92,15 @@
       toast.show(m.edit_bulk_done({ count: result.changed }));
       tellCaller();
     }
+    if (result.skipped > 0) {
+      // Stopped at a server out of reach: the rest was never tried, which is
+      // not the same as refused.
+      saveError = m.edit_bulk_stopped({
+        count: result.failed + result.skipped,
+        message: result.error ?? "",
+      });
+      return;
+    }
     if (result.failed > 0) {
       // Partly through: say how many, and keep the dialog open with the
       // reason rather than closing on a half-done write.
@@ -131,6 +141,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
   {@attach portal}
+  {@attach modalFocus}
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
   onclick={(event) => {
     if (event.target === event.currentTarget && !saving) onclose();
@@ -149,8 +160,11 @@
           {m.edit_bulk_subtitle({ count: itemIds.length })}
         </p>
       </div>
+      <!-- Like Cancel, Escape and the backdrop: closing mid-write would only
+           hide a run that goes on, and lose its result. -->
       <button
-        class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink"
+        class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-40"
+        disabled={saving}
         onclick={onclose}
         aria-label={m.dismiss()}
         title={m.dismiss()}

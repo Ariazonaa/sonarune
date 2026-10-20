@@ -16,7 +16,7 @@ pub struct Store {
     analysis_generation: std::sync::atomic::AtomicU64,
 }
 
-const DB_FILE: &str = "sonarune.db";
+pub(crate) const DB_FILE: &str = "sonarune.db";
 
 pub mod keys {
     pub const SERVER_URL: &str = "server_url";
@@ -40,7 +40,18 @@ pub mod keys {
     pub const PLAYBACK_SPEED: &str = "playback_speed";
     /// Analyse the whole library in the background (`sonic_scan.rs`).
     pub const SONIC_SCAN: &str = "sonic_scan";
+    /// How far the last complete listing found the analysis, for whom
+    /// (`sonic_scan.rs`), so Settings has a number before the first listing
+    /// of a session and while the scan is off.
+    pub const SONIC_SCAN_PROGRESS: &str = "sonic_scan_progress";
 }
+
+/// `server_url` of an analysis whose track the last complete scan of its
+/// server did not list: deleted, moved to a new item id, or hidden from the
+/// account that scanned. It stays — another account may still see the track,
+/// and a scan that lists it again claims it back without a download — but no
+/// server's index offers it in the meantime.
+const RELEASED: &str = "";
 
 impl Store {
     pub fn open(dir: &Path) -> AppResult<Self> {
@@ -60,10 +71,10 @@ impl Store {
              );",
         )?;
         conn.execute_batch(crate::history::SCHEMA)?;
-        // Which server an analysis was made on: the sonic index must only
+        // Which server an analysis belongs to: the sonic index must only
         // offer tracks of the library signed in now. Rows from before the
-        // column existed stay NULL and count for every server (they are a
-        // few played tracks; a stale id only drops out when queued).
+        // column existed stay NULL and count for every server until a scan
+        // whose library lists them claims them (`claim_analyses`).
         let has_server: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('track_analysis') WHERE name = 'server_url'")?
             .exists([])?;
@@ -106,15 +117,34 @@ impl Store {
         .ok()
     }
 
-    pub fn put_analysis(&self, item_id: &str, json: &str) -> AppResult<()> {
+    /// [`get_analysis`](Self::get_analysis), with the server the analysis
+    /// is tagged with (`None` for rows from before analyses recorded it).
+    pub fn analysis_row(&self, item_id: &str) -> Option<(String, Option<String>)> {
         let conn = self.conn.lock().unwrap();
-        let server: Option<String> = conn
-            .query_row(
-                "SELECT value FROM kv WHERE key = ?1",
-                [keys::SERVER_URL],
-                |row| row.get(0),
-            )
-            .ok();
+        conn.query_row(
+            "SELECT json, server_url FROM track_analysis WHERE item_id = ?1",
+            [item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()
+    }
+
+    /// Store an analysis made on the server signed in now (the player's).
+    pub fn put_analysis(&self, item_id: &str, json: &str) -> AppResult<()> {
+        let server = self.get(keys::SERVER_URL);
+        self.put_analysis_from(server.as_deref(), item_id, json)
+    }
+
+    /// Store an analysis made on `server`: the base URL the audio came from.
+    /// The library scan says so itself, because a download can still be
+    /// finishing after a sign-in to another server.
+    pub fn put_analysis_from(
+        &self,
+        server: Option<&str>,
+        item_id: &str,
+        json: &str,
+    ) -> AppResult<()> {
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO track_analysis (item_id, json, server_url) VALUES (?1, ?2, ?3)
              ON CONFLICT(item_id) DO UPDATE SET json = excluded.json,
@@ -126,8 +156,99 @@ impl Store {
         Ok(())
     }
 
-    /// Every stored analysis made on `server` (or before analyses recorded
-    /// their server), as (item id, JSON).
+    /// Tag these analyses as `server`'s: its library lists the tracks, so
+    /// they belong to it, whatever address they were analysed under — the
+    /// same server reached under a new URL keeps its index. Returns how many
+    /// moved.
+    pub fn claim_analyses(&self, server: &str, item_ids: &[String]) -> AppResult<usize> {
+        self.retag_analyses(
+            "UPDATE track_analysis SET server_url = ?1
+             WHERE server_url IS NOT ?2 AND item_id = ?3",
+            server,
+            server,
+            item_ids,
+        )
+    }
+
+    /// Take these analyses of `server` out of its index ([`RELEASED`]): a
+    /// complete scan of its library did not list them. Returns how many.
+    pub fn release_analyses(&self, server: &str, item_ids: &[String]) -> AppResult<usize> {
+        self.retag_analyses(
+            "UPDATE track_analysis SET server_url = ?1
+             WHERE server_url = ?2 AND item_id = ?3",
+            RELEASED,
+            server,
+            item_ids,
+        )
+    }
+
+    /// Tag every analysis made under one of `addresses` as `server`'s: they
+    /// are other addresses of the same server (`history::other_addresses`).
+    /// Released rows stay released. Returns how many moved.
+    pub fn adopt_analyses(&self, server: &str, addresses: &[String]) -> AppResult<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut moved = 0;
+        {
+            let mut statement =
+                tx.prepare("UPDATE track_analysis SET server_url = ?1 WHERE server_url = ?2")?;
+            for address in addresses {
+                if address != RELEASED && address != server {
+                    moved += statement.execute(rusqlite::params![server, address])?;
+                }
+            }
+        }
+        tx.commit()?;
+        if moved > 0 {
+            self.analysis_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(moved)
+    }
+
+    /// Run `sql` with (`to`, `from`, item id) for every id.
+    fn retag_analyses(
+        &self,
+        sql: &str,
+        to: &str,
+        from: &str,
+        item_ids: &[String],
+    ) -> AppResult<usize> {
+        if item_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        // One transaction for a page of a library, not a commit per track.
+        let tx = conn.transaction()?;
+        let mut changed = 0;
+        {
+            let mut statement = tx.prepare(sql)?;
+            for item_id in item_ids {
+                changed += statement.execute(rusqlite::params![to, from, item_id])?;
+            }
+        }
+        tx.commit()?;
+        if changed > 0 {
+            self.analysis_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(changed)
+    }
+
+    /// Item ids whose analysis is tagged with exactly `server`.
+    pub fn analysis_ids_of(&self, server: &str) -> AppResult<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut statement =
+                conn.prepare("SELECT item_id FROM track_analysis WHERE server_url = ?1")?;
+            let ids = statement
+                .query_map([server], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(ids)
+        })
+    }
+
+    /// Every stored analysis of `server` (or from before analyses recorded
+    /// their server), as (item id, JSON). Released ones are no server's.
     pub fn analyses_for(&self, server: &str) -> AppResult<Vec<(String, String)>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
@@ -175,7 +296,13 @@ impl Store {
         ] {
             if let Some(value) = self.get(key) {
                 let value = if key == keys::EXTRAS {
-                    strip_extras_token(&value)
+                    // Unreadable: left out rather than risk a credential, and
+                    // rather than an empty blob that would reset every extra
+                    // on import.
+                    match strip_extras_token(&value) {
+                        Some(stripped) => stripped,
+                        None => continue,
+                    }
                 } else {
                     value
                 };
@@ -206,9 +333,16 @@ impl Store {
                         Ok(v) if v.is_finite() => v.clamp(0.0, 1.0).to_string(),
                         _ => continue,
                     },
-                    // Imports never carry a credential into the store.
+                    // Imports never carry a credential into the store. A blob
+                    // that is not JSON at all is skipped like any other: the
+                    // settings type fills in defaults for missing fields, so
+                    // anything that stood in for it would reset every extra
+                    // — history recording back on, Auto-DJ off.
                     keys::EXTRAS => {
-                        let stripped = strip_extras_token(value);
+                        let Some(stripped) = strip_extras_token(value) else {
+                            tracing::warn!("settings import skipped an entry that does not parse");
+                            continue;
+                        };
                         if !parses_as::<crate::player::ExtrasSettings>(&stripped) {
                             continue;
                         }
@@ -434,18 +568,14 @@ fn parses_as<T: serde::de::DeserializeOwned>(raw: &str) -> bool {
 
 /// Remove the ListenBrainz token from a serialized extras blob. The token
 /// lives in the Windows Credential Manager; the store/export only ever sees
-/// the non-secret fields.
-fn strip_extras_token(extras_json: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(extras_json) {
-        Ok(mut value) => {
-            if let Some(obj) = value.as_object_mut() {
-                obj.remove("listenbrainzToken");
-            }
-            value.to_string()
-        }
-        // Unparseable blob: drop it rather than risk leaking a credential.
-        Err(_) => "{}".to_string(),
+/// the non-secret fields. `None` for a blob that is not JSON: there is no
+/// telling what in it is a credential, so the caller drops all of it.
+fn strip_extras_token(extras_json: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(extras_json).ok()?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("listenbrainzToken");
     }
+    Some(value.to_string())
 }
 
 #[cfg(test)]
@@ -496,6 +626,79 @@ mod tests {
         // Re-analysed on b: it moves there.
         store.put_analysis("a1", "{}").unwrap();
         assert!(ids("https://a.home").is_empty());
+        // The scan names the server the audio came from, whatever is signed
+        // in by the time the download is done.
+        store
+            .put_analysis_from(Some("https://a.home"), "a2", "{}")
+            .unwrap();
+        assert_eq!(ids("https://a.home"), ["a2"]);
+    }
+
+    #[test]
+    fn a_listed_track_is_claimed_and_an_unlisted_one_released() {
+        let store = temp_store();
+        let old = "http://10.0.0.5:8096";
+        let new = "https://music.example.org";
+        store.put_analysis_from(Some(old), "t1", "{}").unwrap();
+        store.put_analysis_from(Some(old), "t2", "{}").unwrap();
+        store.put_analysis_from(None, "legacy", "{}").unwrap();
+        let ids = |server: &str| {
+            let mut ids: Vec<String> = store
+                .analyses_for(server)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let list = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        // The same server under a new address: what its library lists is
+        // its own, without a download.
+        let generation = store.analysis_generation();
+        assert_eq!(
+            store.claim_analyses(new, &list(&["t1", "legacy"])).unwrap(),
+            2
+        );
+        assert!(
+            store.analysis_generation() > generation,
+            "the index rebuilds"
+        );
+        assert_eq!(ids(new), ["legacy", "t1"]);
+        assert_eq!(ids(old), ["t2"]);
+        assert_eq!(store.claim_analyses(new, &list(&["t1"])).unwrap(), 0);
+        // A complete scan did not list t1 any more: it leaves every index,
+        // but its analysis stays.
+        assert_eq!(store.release_analyses(new, &list(&["t1"])).unwrap(), 1);
+        assert_eq!(ids(new), ["legacy"]);
+        assert!(!ids(old).contains(&"t1".to_string()));
+        assert!(store.get_analysis("t1").is_some());
+        // Listed again: claimed back.
+        assert_eq!(store.claim_analyses(new, &list(&["t1"])).unwrap(), 1);
+        assert_eq!(ids(new), ["legacy", "t1"]);
+        // A server only releases its own.
+        assert_eq!(store.release_analyses(new, &list(&["t2"])).unwrap(), 0);
+        assert_eq!(store.analysis_ids_of(old).unwrap(), ["t2"]);
+    }
+
+    #[test]
+    fn an_extras_entry_that_is_not_json_is_skipped_not_reset() {
+        let store = temp_store();
+        let mine = r#"{"recordHistory":false,"autoDjEnabled":true}"#;
+        store.set(keys::EXTRAS, mine).unwrap();
+        // A hand-edited export with a trailing comma inside the blob.
+        let export = serde_json::json!({
+            "extras": r#"{"recordHistory":false,}"#,
+            "volume": "0.5",
+        })
+        .to_string();
+        assert_eq!(store.import_settings(&export).unwrap(), ["volume"]);
+        assert_eq!(store.get(keys::EXTRAS).as_deref(), Some(mine));
+        // Nor does an unreadable stored blob go out as an empty one.
+        store.set(keys::EXTRAS, "not json").unwrap();
+        let exported: serde_json::Value =
+            serde_json::from_str(&store.export_settings().unwrap()).unwrap();
+        assert!(exported.get("extras").is_none(), "{exported}");
     }
 
     fn temp_store() -> TempStore {

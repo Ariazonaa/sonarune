@@ -11,10 +11,13 @@
     loadSensitivitySetting,
     loadQualitySetting,
     loadRemotePresetsSetting,
+    saveBlendSetting,
+    saveCycleSetting,
     saveRemotePresetsSetting,
     type CycleSetting,
     type VisualizerQuality,
   } from "#lib/visualizer/controller.js";
+  import { VisualizerBanner } from "#lib/visualizer/banner.svelte.js";
   import type { EnergyLevel } from "#lib/visualizer/engine.js";
   import type {
     PresetCatalogProgress,
@@ -41,7 +44,9 @@
   let sensitivity = $state(loadSensitivitySetting());
   let quality = $state<VisualizerQuality>(loadQualitySetting());
   let overlayVisible = $state(true);
-  let error = $state<string | null>(null);
+  const banner = new VisualizerBanner();
+  /** The controller is up and put a first preset on screen (e2e marker). */
+  let ready = $state(false);
   /** Briefly surfaces the preset name whenever it changes. */
   let nameVisible = $state(false);
 
@@ -97,19 +102,24 @@
 
   function flashName(name: string) {
     presetName = name;
+    if (name) ready = true;
     nameVisible = true;
     clearTimeout(nameTimer);
     nameTimer = setTimeout(() => (nameVisible = false), 4_000);
   }
 
+  // Without a controller (still starting, or creation failed) the choice is
+  // stored: the controller starts from it, or gets it once it is up.
   function setCycle(value: CycleSetting) {
     cycle = value;
-    controller?.setCycle(value);
+    if (controller) controller.setCycle(value);
+    else saveCycleSetting(value);
   }
 
   function setBlend(value: number) {
     blend = value;
-    controller?.setBlend(value);
+    if (controller) controller.setBlend(value);
+    else saveBlendSetting(value);
   }
 
   function setSensitivity(value: number) {
@@ -172,10 +182,13 @@
       favorites = new Set(controller.favoriteNames());
       blocked = new Set(controller.blockedNames());
       backupStatus = m.visualizer_backup_imported();
+      banner.clearNotice();
     } catch (cause) {
-      error = m.visualizer_backup_error({
-        message: cause instanceof Error ? cause.message : String(cause),
-      });
+      banner.notice(
+        m.visualizer_backup_error({
+          message: cause instanceof Error ? cause.message : String(cause),
+        }),
+      );
     }
   }
 
@@ -230,8 +243,9 @@
       try {
         if (!canvas) return;
         controller = await VisualizerController.create(canvas, {
-          onError: (message) => {
-            error = message;
+          onError: (message) => banner.error(message),
+          onNotice: (message) => {
+            banner.notice(message);
             quarantined = new Set(controller?.quarantinedNames() ?? []);
           },
           onPreset: flashName,
@@ -261,12 +275,16 @@
         remotePresets = controller.remotePresetsEnabled;
         sensitivity = controller.sensitivity;
         quality = controller.quality;
+        // A cycle or blend picked while the controller was starting is newer
+        // than the stored one it started from.
+        if (controller.cycle !== cycle) controller.setCycle(cycle);
+        if (controller.blend !== blend) controller.setBlend(blend);
         observer = new ResizeObserver(() => {
           if (canvas && controller) controller.setSize(canvas.clientWidth, canvas.clientHeight);
         });
         if (container) observer.observe(container);
       } catch (e) {
-        error = String(e);
+        banner.error(String(e));
       }
     })();
 
@@ -276,6 +294,7 @@
       cancelled = true;
       clearTimeout(overlayTimer);
       clearTimeout(nameTimer);
+      banner.dismiss();
       observer?.disconnect();
       controller?.destroy();
       controller = null;
@@ -308,13 +327,19 @@
   onmousemove={pokeOverlay}
   role="presentation"
   data-testid="visualizer"
+  data-ready={ready ? "true" : undefined}
 >
   <canvas bind:this={canvas} class="h-full w-full"></canvas>
 
-  {#if error}
-    <p class="absolute inset-x-0 top-4 mx-auto w-fit rounded-md border border-red-900 bg-red-950/80 px-3 py-2 text-sm text-red-300">
-      {m.error_generic({ message: error })}
-    </p>
+  {#if banner.message}
+    <button
+      class="absolute inset-x-0 top-4 mx-auto w-fit rounded-md border border-red-900 bg-red-950/80 px-3 py-2 text-left text-sm text-red-300"
+      data-testid={banner.isError ? "visualizer-error" : "visualizer-notice"}
+      onclick={() => banner.dismiss()}
+      title={m.dismiss()}
+    >
+      {m.error_generic({ message: banner.message })}
+    </button>
   {/if}
 
   <!-- Preset name flash: visible for a few seconds on every switch, even

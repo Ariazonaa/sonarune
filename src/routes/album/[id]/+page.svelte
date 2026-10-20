@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { page } from "$app/state";
   import { goto } from "$app/navigation";
   import { api, formatDuration } from "#lib/api.js";
@@ -11,6 +12,7 @@
   import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
   import SongInfo from "#lib/components/SongInfo.svelte";
   import { contextMenuKey, menuPoint } from "#lib/menu.js";
+  import { activatesRow } from "#lib/rowKeys.js";
   import { deleteTracks, trackMenuItems } from "#lib/trackMenu.js";
   import { startDrag } from "#lib/dragToPlaylist.js";
   import MetadataEditor from "#lib/components/MetadataEditor.svelte";
@@ -24,7 +26,7 @@
 
   let detail = $state<AlbumDetail | null>(null);
   let error = $state<string | null>(null);
-  let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
+  let addTo = $state<{ x: number; y: number; trackIds: string[]; trigger?: HTMLElement } | null>(null);
   let edit = $state<{ itemId: string; name: string } | null>(null);
   let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
@@ -71,6 +73,26 @@
       });
   });
 
+  // Nothing to show after a failed load (server down, album not cached): try
+  // again when the library is poked — the offline banner's Retry and the
+  // recovery after an outage do that (net.svelte.ts).
+  $effect(() => {
+    void library.revision;
+    untrack(() => {
+      if (!error || detail) return;
+      const id = albumId;
+      api
+        .getAlbum(id)
+        .then((d) => {
+          swrSet(`album:${id}`, d);
+          if (id !== page.params.id) return;
+          detail = d;
+          error = null;
+        })
+        .catch(() => {});
+    });
+  });
+
   const trackCount = $derived(detail?.tracks.length ?? 0);
 
   type TrackRow =
@@ -112,10 +134,12 @@
     });
   }
 
+  // A track's heart goes through the player store, so the player bar shows
+  // the same state for it — and a heart set there shows here.
   function toggleTrackFavorite(track: TrackDto) {
-    const next = !track.isFavorite;
+    const next = !player.isFavorite(track.id, track.isFavorite);
     track.isFavorite = next;
-    apiLibrary.setFavorite(track.id, next).catch(() => {
+    player.setFavorite(track.id, next).catch(() => {
       track.isFavorite = !next;
     });
   }
@@ -150,6 +174,13 @@
   function dropTracks(ids: string[]) {
     const removed = new Set(ids);
     if (detail) detail.tracks = detail.tracks.filter((track) => !removed.has(track.id));
+  }
+
+  /** The playlist picker of an "Add to playlist" button; the button's next
+   *  click closes it again (a press on it does not count as outside). */
+  function toggleAddTo(event: MouseEvent, trackIds: string[]) {
+    const trigger = event.currentTarget as HTMLElement;
+    addTo = addTo?.trigger === trigger ? null : { ...menuPoint(event), trackIds, trigger };
   }
 
   function onRowContextMenu(event: MouseEvent, track: TrackDto, index: number) {
@@ -243,7 +274,7 @@
       <button
         class="rounded-full border border-ink-muted/50 px-4 py-1.5 text-sm font-bold text-ink-muted transition-colors hover:border-ink hover:text-ink"
         aria-haspopup="menu"
-        onclick={(e) => detail && (addTo = { ...menuPoint(e), trackIds: detail.tracks.map((t) => t.id) })}
+        onclick={(e) => detail && toggleAddTo(e, detail.tracks.map((t) => t.id))}
       >
         {m.add_to_playlist()}
       </button>
@@ -289,6 +320,7 @@
             {:else}
             {@const track = row.track}
             {@const i = row.index}
+            {@const favorite = player.isFavorite(track.id, track.isFavorite)}
             <tr
               class="group cursor-pointer outline-none transition-colors hover:bg-ink/10 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent
                 {track.id === currentTrackId ? 'text-accent' : ''}"
@@ -301,7 +333,7 @@
               {@attach contextMenuKey}
               onclick={() => player.run(api.playAlbum(albumId, i))}
               onkeydown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
+                if (activatesRow(e)) {
                   e.preventDefault();
                   player.run(api.playAlbum(albumId, i));
                 }
@@ -319,19 +351,19 @@
               <td class="w-40 px-1 py-2">
                 <span class="flex items-center justify-end gap-1">
                   <button
-                    class="rounded p-1 {track.isFavorite
+                    class="rounded p-1 {favorite
                       ? 'text-accent hover:text-accent-hover'
                       : 'invisible text-ink-muted group-hover:visible hover:text-ink'}"
                     onclick={(e) => {
                       e.stopPropagation();
                       toggleTrackFavorite(track);
                     }}
-                    aria-pressed={track.isFavorite}
-                    aria-label={track.isFavorite ? m.favorite_remove() : m.favorite_add()}
-                    title={track.isFavorite ? m.favorite_remove() : m.favorite_add()}
+                    aria-pressed={favorite}
+                    aria-label={favorite ? m.favorite_remove() : m.favorite_add()}
+                    title={favorite ? m.favorite_remove() : m.favorite_add()}
                   >
                     <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor" aria-hidden="true">
-                      <path d={track.isFavorite ? HEART_ON : HEART_OFF} />
+                      <path d={favorite ? HEART_ON : HEART_OFF} />
                     </svg>
                   </button>
                   <button
@@ -364,7 +396,7 @@
                     class="invisible rounded p-1 text-ink-muted group-hover:visible hover:text-ink"
                     onclick={(e) => {
                       e.stopPropagation();
-                      addTo = { ...menuPoint(e), trackIds: [track.id] };
+                      toggleAddTo(e, [track.id]);
                     }}
                     aria-haspopup="menu"
                     aria-label={m.add_to_playlist()}
@@ -438,10 +470,10 @@
   <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
 {/if}
 {#if info}
-  <SongInfo itemId={info.itemId} name={info.name} onclose={() => (info = null)} />
+  <SongInfo itemId={info.itemId} name={info.name} playCount={info.playCount} onclose={() => (info = null)} />
 {/if}
 {#if addTo}
-  <AddToPlaylistMenu x={addTo.x} y={addTo.y} trackIds={addTo.trackIds} onclose={() => (addTo = null)} />
+  <AddToPlaylistMenu x={addTo.x} y={addTo.y} trackIds={addTo.trackIds} trigger={addTo.trigger} onclose={() => (addTo = null)} />
 {/if}
 {#if edit}
   <MetadataEditor itemId={edit.itemId} displayName={edit.name} onclose={() => (edit = null)} onsaved={reloadAlbum} />

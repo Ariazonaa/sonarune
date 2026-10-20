@@ -8,9 +8,9 @@
   import CardSkeleton from "#lib/components/CardSkeleton.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
   import { player } from "#lib/state/player.svelte.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
-  import { homeRows, type HomeRowId } from "#lib/state/homeRows.svelte.js";
+  import { HOME_ROWS, homeRows, type HomeRowId } from "#lib/state/homeRows.svelte.js";
   import { startDrag } from "#lib/dragToPlaylist.js";
   import { contextMenuKey } from "#lib/menu.js";
   import { swrGet, swrSet } from "#lib/swr.js";
@@ -47,9 +47,7 @@
 
   // Refetch when the server library changes (new music adds a "recently
   // added" entry).
-  $effect(() => {
-    if (library.revision > 0) load();
-  });
+  onLibraryChange(load);
 
   // The headings, by the field each row reads. The order and which of them
   // show at all is the user's (homeRows); a row the server has nothing for
@@ -68,6 +66,17 @@
       .map((id) => ({ id, title: ROW_TITLE[id](), albums: data[id] }))
       .filter((row) => row.albums.length > 0);
   });
+
+  /** The rows the page draws, for the arrows: they swap with what is seen. */
+  const shownIds = $derived(rows.map((row) => row.id));
+
+  // An empty page because of the user's own choice: rows that have something
+  // are hidden, or every row is. Saying "play something" then is wrong, and
+  // the hide buttons that would explain it went away with the rows.
+  const rowsHidden = $derived(
+    homeRows.visible.length === 0 ||
+      HOME_ROWS.some((id) => homeRows.isHidden(id) && (home?.[id].length ?? 0) > 0),
+  );
 </script>
 
 {#snippet albumCard(album: AlbumDto)}
@@ -112,6 +121,13 @@
     <p class="mb-4 rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
       {m.error_generic({ message: error })}
     </p>
+  {:else if home && rows.length === 0 && rowsHidden}
+    <EmptyState
+      icon="home"
+      title={m.home_rows_hidden()}
+      hint={m.home_rows_hidden_hint()}
+      action={{ label: m.home_rows_show_all(), onclick: () => homeRows.showAll() }}
+    />
   {:else if home && rows.length === 0}
     <EmptyState
       icon="home"
@@ -143,7 +159,7 @@
           <button
             class="rounded p-1 text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent"
             disabled={position === 0}
-            onclick={() => homeRows.moveAmongVisible(row.id, -1)}
+            onclick={() => homeRows.moveAmong(row.id, -1, shownIds)}
             aria-label={m.home_row_move_up()}
             title={m.home_row_move_up()}
           >
@@ -154,7 +170,7 @@
           <button
             class="rounded p-1 text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent"
             disabled={position === rows.length - 1}
-            onclick={() => homeRows.moveAmongVisible(row.id, 1)}
+            onclick={() => homeRows.moveAmong(row.id, 1, shownIds)}
             aria-label={m.home_row_move_down()}
             title={m.home_row_move_down()}
           >

@@ -1,13 +1,16 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { SmartFilter } from "#lib/api/discovery.js";
-import type { SessionInfo } from "#lib/types.js";
+import type { GenreDto, SessionInfo } from "#lib/types.js";
 import {
   cloneSmartFilter,
   emptySmartFilter,
+  genreIdReplacements,
   loadSmartViews,
   newSmartView,
   persistSmartViews,
+  replaceGenreIds,
   smartYearProblem,
+  unknownGenreIds,
 } from "./smartViews";
 
 const years = (yearFrom: number | null, yearTo: number | null): SmartFilter => ({
@@ -125,5 +128,41 @@ describe("persist + load round-trip", () => {
       JSON.stringify([{ id: "x" }, { nope: true }]),
     );
     expect(loadSmartViews(session)).toEqual([]);
+  });
+});
+
+describe("genre ids of views saved before the list named music genres", () => {
+  // What the genre list holds now: the music genres' own ids.
+  const listed: GenreDto[] = [
+    { id: "mg-rock", name: "Rock" },
+    { id: "mg-jazz", name: "Jazz" },
+  ];
+  const genres = (...genreIds: string[]): SmartFilter => ({ ...emptySmartFilter(), genreIds });
+
+  it("finds the selected ids the list lacks, each once", () => {
+    expect(unknownGenreIds([genres("g-rock", "mg-jazz"), genres("gone", "g-rock")], listed)).toEqual([
+      "g-rock",
+      "gone",
+    ]);
+    expect(unknownGenreIds([genres("mg-rock")], listed)).toEqual([]);
+  });
+
+  it("maps an old id to the listed genre of the same name", () => {
+    const replacements = genreIdReplacements(
+      // The `Genre` item of Rock, spelled a little differently; a genre the
+      // library no longer has; and a listed id, which needs nothing.
+      { "g-rock": " rock ", "g-polka": "Polka", "mg-jazz": "Jazz" },
+      listed,
+    );
+    expect([...replacements]).toEqual([["g-rock", "mg-rock"]]);
+  });
+
+  it("replaces the ids in a filter and keeps each once", () => {
+    const replacements = new Map([["g-rock", "mg-rock"]]);
+    const migrated = replaceGenreIds(genres("g-rock", "gone", "mg-rock"), replacements);
+    expect(migrated.genreIds).toEqual(["mg-rock", "gone"]);
+    // Nothing to replace: the very same filter, so nothing is saved again.
+    const untouched = genres("mg-jazz");
+    expect(replaceGenreIds(untouched, replacements)).toBe(untouched);
   });
 });

@@ -56,6 +56,7 @@ export class VisualizerEngine {
   #channel: Channel<ArrayBuffer>;
   #onError: (message: string) => void;
   #contextLost: () => void;
+  #lost = false;
   #raf = 0;
   #destroyed = false;
   /** Cap on the device-pixel-ratio used when sizing (quality control). */
@@ -87,13 +88,27 @@ export class VisualizerEngine {
     this.#canvas = canvas;
     this.#channel = channel;
     this.#onError = onError;
-    // Without preventDefault the context is never restorable; either way we
-    // stop rendering and let the route surface the error.
+    // Without preventDefault the context is never restored: the visuals are
+    // gone until the surface is reopened. Stop what would still drive them —
+    // the render loop and the PCM feed, and with it the energy analysis that
+    // asks for preset switches — and let the route surface the error.
     this.#contextLost = () => {
-      this.#onError(m.visualizer_error_context_lost());
+      this.#lost = true;
       cancelAnimationFrame(this.#raf);
+      void invoke("visualizer_unsubscribe", { channelId: this.#channel.id }).catch(() => {});
+      this.#onError(m.visualizer_error_context_lost());
     };
     canvas.addEventListener("webglcontextlost", this.#contextLost);
+  }
+
+  /**
+   * The WebGL context is gone for good: nothing can be drawn or loaded any
+   * more, and a preset that fails to load now says nothing about the preset.
+   * True from the moment of the loss — the context reports it before its
+   * (asynchronous) event fires, and a load in between already fails.
+   */
+  get contextLost(): boolean {
+    return this.#lost || (this.#canvas.getContext("webgl2")?.isContextLost() ?? false);
   }
 
   /**
@@ -154,7 +169,9 @@ export class VisualizerEngine {
         await created.destroy();
         return null;
       }
-      await invoke("visualizer_subscribe", { channel });
+      // A visualizer: its window must not be suspended in the background
+      // (src-tauri/src/player/tap.rs, `TapConsumer`).
+      await invoke("visualizer_subscribe", { channel, consumer: "visualizer" });
 
       const loop = () => {
         if (created.#destroyed) return;
@@ -179,9 +196,12 @@ export class VisualizerEngine {
   }
 
   #feed(frame: ArrayBuffer) {
-    if (this.#destroyed) return;
+    if (this.#destroyed || this.#lost) return;
     const pcm = decodeFrame(frame);
     if (!pcm) return;
+    // The frame's pace on the clock: the tap scales the track's rate by the
+    // playback speed, so resampling to the context rate plays every chunk
+    // out in exactly the time it takes to be heard.
     const rate = pcm.sampleRate > 0 ? pcm.sampleRate : 48000;
     // Energy and beats keep running on the mid signal: their thresholds were
     // tuned on the mono feed, and a power sum over two channels would read

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cleanRows, moveRow, swapRows, HOME_ROWS, type HomeRowId } from "./homeRows.svelte";
+import { cleanRows, moveAmong, moveRow, swapRows, HOME_ROWS, type HomeRowId } from "./homeRows.svelte";
 
 describe("cleanRows", () => {
   it("keeps a stored order", () => {
@@ -77,5 +77,55 @@ describe("swapRows", () => {
   it("leaves the order alone when a row is not in it", () => {
     const order: HomeRowId[] = ["recentlyPlayed", "mostPlayed"];
     expect(swapRows(order, "recentlyPlayed", "forgottenFavorites")).toBe(order);
+  });
+});
+
+describe("moveAmong", () => {
+  const order: HomeRowId[] = ["recentlyPlayed", "forgottenFavorites", "recentlyAdded", "mostPlayed"];
+
+  it("swaps with the next row the page draws, past one it does not", () => {
+    // No favorites, so the home page drops the empty "forgotten favorites"
+    // row: "move down" on the first row must land below "recently added".
+    const shown: HomeRowId[] = ["recentlyPlayed", "recentlyAdded", "mostPlayed"];
+    expect(moveAmong(order, shown, "recentlyPlayed", 1)).toEqual([
+      "recentlyAdded",
+      "forgottenFavorites",
+      "recentlyPlayed",
+      "mostPlayed",
+    ]);
+    expect(moveAmong(order, shown, "recentlyAdded", -1)).toEqual([
+      "recentlyAdded",
+      "forgottenFavorites",
+      "recentlyPlayed",
+      "mostPlayed",
+    ]);
+  });
+
+  it("leaves the order alone at the ends and for rows not drawn", () => {
+    const shown: HomeRowId[] = ["recentlyPlayed", "mostPlayed"];
+    expect(moveAmong(order, shown, "recentlyPlayed", -1)).toBe(order);
+    expect(moveAmong(order, shown, "mostPlayed", 1)).toBe(order);
+    expect(moveAmong(order, shown, "recentlyAdded", 1)).toBe(order);
+  });
+});
+
+describe("the way back to a hidden row", () => {
+  // A hidden row has nothing left to click on the home page, so its tooltip
+  // and the "rows hidden" state name the place in the settings where it comes
+  // back. They have to name it the way the settings label it.
+  const catalogs = Object.entries(
+    import.meta.glob("/messages/*.json", { import: "default", eager: true }) as Record<
+      string,
+      Record<string, string>
+    >,
+  );
+
+  it("names the settings section and list as they are labelled", () => {
+    expect(catalogs.map(([path]) => path).sort()).toEqual(["/messages/de.json", "/messages/en.json"]);
+    for (const [, messages] of catalogs) {
+      const place = [messages.settings_title, messages.settings_layout, messages.settings_home_rows].join(" → ");
+      expect(messages.home_rows_hidden_hint).toContain(place);
+      expect(messages.home_row_hide_hint).toContain(place);
+    }
   });
 });

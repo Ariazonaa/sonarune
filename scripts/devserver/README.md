@@ -25,8 +25,12 @@ password — authentication is not checked.
 
 ## What's in the library
 
-Eight invented artists, ten albums, 56 tracks, two playlists, six genres
-(`fixtures.mjs`). Nothing is a real recording and no name refers to anything.
+Eight invented artists, ten albums, 56 tracks, three playlists, two
+collections, six genres (`fixtures.mjs`). Nothing is a real recording and no
+name refers to anything. The playlist "On Repeat" holds a track twice, the way
+playlists from older servers and imported `.m3u` files can; "Film Night
+Collection" stands for the movie collections of a mixed server and holds no
+music.
 
 Media is generated on first run into `~/.cache/sonarune/devserver-media`, not
 into the repo:
@@ -43,10 +47,27 @@ regenerate.
 
 ## What it implements
 
-Sign-in, `/Users/Me`, `/Items` (albums, tracks, artists, playlists, with the
-filters and sorts the app sends), `/Artists`, `/Genres`, `/Years`, instant mix,
-similar artists, playlist contents, favorites, cover images, audio streaming
-with `Range` (so seeking works) and the `/Sessions/Playing*` reports.
+Sign-in, `/Users/Me`, `/UserViews`, `/Items` (albums, tracks, artists,
+playlists, collections, with the filters and sorts the app sends), `/Artists`,
+`/Genres`, `/Years`, instant mix, similar artists, playlists, favorites, cover
+images, audio streaming with `Range` (so seeking works) and the
+`/Sessions/Playing*` reports.
+
+Where Jellyfin 10.11 behaves in a way a client can get wrong, so does this
+server:
+
+- **Genres** exist twice. `/Genres` below the music library lists the
+  `MusicGenre` items, whose ids tracks and albums carry; without a parent it
+  lists `Genre` items, which exist only for genres a playlist carries too, under
+  other ids. `genreIds` accepts both, matched by name, and `/Items?ids=` finds
+  both.
+- **Playlists** know an entry only by its item id: `PlaylistItemId` is the
+  track's id, adding skips tracks already there (and still answers 204),
+  removing by an entry id takes every copy, moving moves the first one, and
+  `Ids` on `POST /Playlists/{id}` replaces the entries, each track once. A
+  playlist's `ChildCount` counts distinct tracks. `GET /Playlists/{id}` names
+  every entry's item id (`ItemIds`); in Jellyfin that includes entries hidden
+  from the user, which this server does not have.
 
 It is **not** a Jellyfin implementation: it ignores authentication, keeps
 everything in memory, and answers anything it does not know with an empty page

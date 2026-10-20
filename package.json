@@ -15,7 +15,7 @@
     "dev": "vite dev",
     "build": "node scripts/clean-build.mjs && vite build",
     "i18n:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --strategy localStorage preferredLanguage baseLocale",
-    "check": "npm run i18n:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check": "npm run i18n:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -33,6 +33,7 @@
   },
   "devDependencies": {
     "@inlang/paraglide-js": "^2.20.2",
+    "@inlang/plugin-message-format": "4.5.4",
     "@sveltejs/adapter-static": "^4.0.0",
     "@sveltejs/kit": "^3.0.0",
     "@sveltejs/vite-plugin-svelte": "^7.0.0",

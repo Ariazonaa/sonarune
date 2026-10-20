@@ -4541,8 +4541,12 @@ dependencies = [
 name = "sonarune"
 version = "0.6.0"
 dependencies = [
+ "bytes",
  "dirs",
  "flate2",
+ "futures-core",
+ "futures-util",
+ "hyper-util",
  "keyring",
  "ogg",
  "opus",
@@ -4553,6 +4557,7 @@ dependencies = [
  "rustfft",
  "rustls",
  "rustls-native-certs",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "sha2",
@@ -4566,11 +4571,13 @@ dependencies = [
  "tauri-plugin-window-state",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
  "webview2-com",
  "windows 0.61.3",
+ "windows-registry",
  "windows-sys 0.61.2",
 ]
 

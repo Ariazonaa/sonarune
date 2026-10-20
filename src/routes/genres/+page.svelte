@@ -3,7 +3,7 @@
   import { api } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
   import EmptyState from "#lib/components/EmptyState.svelte";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
   import type { GenreDto } from "#lib/types.js";
 
@@ -24,9 +24,7 @@
   }
 
   onMount(load);
-  $effect(() => {
-    if (library.revision > 0) load();
-  });
+  onLibraryChange(load);
 
   // Deterministic hue from the genre name so cards are varied but stable.
   function hue(name: string): number {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { m } from "#lib/paraglide/messages.js";
   import { formatDuration } from "#lib/api.js";
@@ -13,6 +13,7 @@
     VisualizerController,
     loadRemotePresetsSetting,
   } from "#lib/visualizer/controller.js";
+  import { VisualizerBanner } from "#lib/visualizer/banner.svelte.js";
   import {
     PROJECTOR_SETTINGS_EVENT,
     PROJECTOR_SETTINGS_KEY,
@@ -29,7 +30,7 @@
   let canvas = $state<HTMLCanvasElement | null>(null);
   let controller: VisualizerController | null = null;
   let settings = $state<VisualizerProjectorSettings>(loadProjectorSettings());
-  let error = $state<string | null>(null);
+  const banner = new VisualizerBanner();
   let presetName = $state("");
   let now = $state(performance.now());
   let positionMs = $state(0);
@@ -112,10 +113,12 @@
     if (!settings.songChangeOnly) activateOverlays();
   }
 
+  // The panel in the main window hears it as a storage event: this window
+  // emits nothing (capabilities/projector.json) — an event from a webview
+  // reaches every window, and code running here includes online presets.
   function persist(next: VisualizerProjectorSettings) {
     settings = normalizeProjectorSettings(next);
     saveProjectorSettings(settings);
-    void emit(PROJECTOR_SETTINGS_EVENT, settings);
   }
 
   function toggleLock() {
@@ -130,7 +133,7 @@
       await window.setFullscreen(fullscreen);
       persist({ ...settings, fullscreen });
     } catch (cause) {
-      error = String(cause);
+      banner.notice(String(cause));
     }
   }
 
@@ -162,6 +165,9 @@
       if (event.key === null || event.key === REMOTE_PRESETS_KEY) {
         controller?.setRemotePresetsEnabled(loadRemotePresetsSetting(), false);
       }
+      // So is everything else about presets (favorites, hidden presets,
+      // cycle, blend, quality, …): the projector has no browser of its own.
+      controller?.syncStoredPreferences(event.key);
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "F11") {
@@ -189,7 +195,8 @@
       try {
         if (!canvas) return;
         controller = await VisualizerController.create(canvas, {
-          onError: (message) => (error = message),
+          onError: (message) => banner.error(message),
+          onNotice: (message) => banner.notice(message),
           onPreset: (name) => (presetName = name),
           isCancelled: () => cancelled,
         });
@@ -208,7 +215,7 @@
         });
         if (container) observer.observe(container);
       } catch (cause) {
-        error = String(cause);
+        banner.error(String(cause));
       }
     })();
 
@@ -217,6 +224,7 @@
       cancelled = true;
       clearInterval(tick);
       clearTimeout(controlTimer);
+      banner.dismiss();
       observer?.disconnect();
       unlistenSettings?.();
       window.removeEventListener("storage", onStorage);
@@ -267,10 +275,14 @@
   {/if}
 
   {#if activeLyric && layerVisible("lyrics")}
+    <!-- Centered by the translate utilities alone: Tailwind 4 compiles them to
+         the CSS `translate` property, which the browser applies on top of
+         `transform` — repeating the -50% there shifted the block by its whole
+         size. `transform` only carries the burn-in drift, as on every layer. -->
     <div
       class="pointer-events-none absolute left-1/2 top-1/2 w-[min(76vw,1100px)] -translate-x-1/2 -translate-y-1/2 text-center drop-shadow-[0_3px_10px_rgba(0,0,0,0.95)]"
       style:opacity={settings.overlays.lyrics.opacity}
-      style:transform={`${layerTransform("lyrics")} translate(-50%, -50%)`}
+      style:transform={layerTransform("lyrics")}
       style:transition={settings.reducedMotion ? "none" : "transform 20s ease-in-out, opacity 350ms"}
     >
       <p class="whitespace-pre-wrap text-[clamp(1.7rem,4vw,4.5rem)] font-black leading-tight">
@@ -301,10 +313,14 @@
     </div>
   {/if}
 
-  {#if error}
-    <p class="absolute inset-x-0 top-4 mx-auto w-fit max-w-[80vw] rounded-md border border-red-900 bg-red-950/85 px-3 py-2 text-sm text-red-300">
-      {m.error_generic({ message: error })}
-    </p>
+  {#if banner.message}
+    <button
+      class="absolute inset-x-0 top-4 mx-auto w-fit max-w-[80vw] rounded-md border border-red-900 bg-red-950/85 px-3 py-2 text-left text-sm text-red-300"
+      onclick={() => banner.dismiss()}
+      title={m.dismiss()}
+    >
+      {m.error_generic({ message: banner.message })}
+    </button>
   {/if}
 
   <div

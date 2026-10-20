@@ -4,7 +4,7 @@ use crate::api::types::{AlbumDto, ArtistDto, GenreDto, Page, SmartFilter, TrackD
 use crate::api::validate_smart_filter;
 use crate::commands::{to_queue_tracks, with_retry};
 use crate::error::{AppError, AppResult};
-use crate::player::PlayerCommand;
+use crate::player::PlayTicket;
 use crate::AppState;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -80,6 +80,9 @@ impl SimilarArtistsRow {
     }
 }
 
+/// The Discover hub's rows. "Long not heard" is not among them: it ranks the
+/// whole play history, which takes a scan, so the page asks for it on its own
+/// (`get_long_not_heard_albums`) instead of every row waiting for that scan.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverData {
@@ -88,7 +91,6 @@ pub struct DiscoverData {
     pub instant_mix_seeds: DiscoverRow<TrackDto>,
     pub similar_artists: SimilarArtistsRow,
     pub decades: DiscoverRow<DecadeDto>,
-    pub long_not_heard: DiscoverRow<AlbumDto>,
 }
 
 pub(crate) fn validate_page(limit: u32) -> AppResult<()> {
@@ -106,19 +108,59 @@ pub(crate) fn shuffle_items<T>(items: &mut [T]) {
     }
 }
 
-fn start_queue(state: &AppState, tracks: Vec<crate::player::QueueTrack>) -> AppResult<()> {
+/// Upper bound for a queue built from a query (a smart view, a genre, a
+/// decade): a library-wide view matches tens of thousands of tracks, and every
+/// queue edit writes and sends the whole list. Five thousand tracks are two
+/// weeks of music; shuffled, they are a random five thousand of the matches.
+const MAX_QUERY_QUEUE: usize = 5_000;
+
+/// Most albums one Discover play resolves (one request per album).
+const MAX_PLAY_ALBUMS: usize = 100;
+/// Most tracks one Discover play queues.
+const MAX_PLAY_TRACKS: usize = 500;
+
+/// At most `max` of `ids` for one play: the first ones, or a random sample
+/// when the result is shuffled anyway. The "see all" pages keep loading more
+/// on demand, and refusing a list past the cap made Play and Shuffle fail
+/// after a "load more" or two.
+fn play_selection(mut ids: Vec<String>, shuffle: bool, max: usize) -> Vec<String> {
+    if ids.len() > max {
+        if shuffle {
+            shuffle_items(&mut ids);
+        }
+        ids.truncate(max);
+    }
+    ids
+}
+
+async fn start_queue(
+    state: &AppState,
+    ticket: PlayTicket,
+    tracks: Vec<crate::player::QueueTrack>,
+) -> AppResult<()> {
     if tracks.is_empty() {
         return Err(AppError::Other("the selection has no tracks".into()));
     }
-    state.player.send(PlayerCommand::PlayQueue {
-        tracks,
-        start_index: 0,
-    })
+    state.player.play_queue(ticket, tracks, 0).await
 }
 
 #[tauri::command]
 pub async fn get_genres(state: State<'_, AppState>) -> AppResult<Vec<GenreDto>> {
     with_retry(&state, |c| async move { c.genres().await }).await
+}
+
+/// Names for genre ids the genre list does not have — the ids an older smart
+/// view was saved with (see `JellyfinClient::genres_by_id`).
+#[tauri::command]
+pub async fn get_genres_by_id(
+    state: State<'_, AppState>,
+    genre_ids: Vec<String>,
+) -> AppResult<Vec<GenreDto>> {
+    with_retry(&state, |c| {
+        let genre_ids = genre_ids.clone();
+        async move { c.genres_by_id(&genre_ids).await }
+    })
+    .await
 }
 
 /// Index of the first item whose name sorts at/after letter.
@@ -185,18 +227,9 @@ pub async fn get_discover(state: State<'_, AppState>) -> AppResult<DiscoverData>
             .take(CHIP_ROW as usize)
             .collect())
     });
-    let long_not_heard = with_retry(&state, |client| async move {
-        Ok(client.long_not_heard_albums(0, ALBUM_ROW).await?.items)
-    });
 
-    let (random_albums, genres, mix_seeds, similar, decades, long_not_heard) = tokio::join!(
-        random_albums,
-        genres,
-        mix_seeds,
-        similar,
-        decades,
-        long_not_heard
-    );
+    let (random_albums, genres, mix_seeds, similar, decades) =
+        tokio::join!(random_albums, genres, mix_seeds, similar, decades);
 
     Ok(DiscoverData {
         random_albums: DiscoverRow::from_result(random_albums),
@@ -204,7 +237,6 @@ pub async fn get_discover(state: State<'_, AppState>) -> AppResult<DiscoverData>
         instant_mix_seeds: DiscoverRow::from_result(mix_seeds),
         similar_artists: SimilarArtistsRow::from_result(similar),
         decades: DiscoverRow::from_result(decades),
-        long_not_heard: DiscoverRow::from_result(long_not_heard),
     })
 }
 
@@ -282,15 +314,21 @@ pub async fn get_discover_decade_albums(
     .await
 }
 
+/// `reuse_recent`: a ranking from the last few minutes will do for a first
+/// page too (the Discover row); otherwise a first page ranks afresh.
 #[tauri::command]
 pub async fn get_long_not_heard_albums(
     state: State<'_, AppState>,
     start_index: u32,
     limit: u32,
+    reuse_recent: Option<bool>,
 ) -> AppResult<Page<AlbumDto>> {
     validate_page(limit)?;
+    let reuse_recent = reuse_recent.unwrap_or(false);
     with_retry(&state, |client| async move {
-        client.long_not_heard_albums(start_index, limit).await
+        client
+            .long_not_heard_albums(start_index, limit, reuse_recent)
+            .await
     })
     .await
 }
@@ -301,11 +339,11 @@ pub async fn play_discover_albums(
     album_ids: Vec<String>,
     shuffle: bool,
 ) -> AppResult<()> {
-    if album_ids.is_empty() || album_ids.len() > 100 {
-        return Err(AppError::Other(
-            "albumIds must contain between 1 and 100 ids".into(),
-        ));
+    if album_ids.is_empty() {
+        return Err(AppError::Other("albumIds must not be empty".into()));
     }
+    let ticket = state.player.play_ticket();
+    let album_ids = play_selection(album_ids, shuffle, MAX_PLAY_ALBUMS);
     let queue = with_retry(&state, |client| {
         let album_ids = album_ids.clone();
         async move {
@@ -317,7 +355,7 @@ pub async fn play_discover_albums(
         }
     })
     .await?;
-    start_queue(&state, queue)
+    start_queue(&state, ticket, queue).await
 }
 
 #[tauri::command]
@@ -326,11 +364,11 @@ pub async fn play_discover_tracks(
     track_ids: Vec<String>,
     shuffle: bool,
 ) -> AppResult<()> {
-    if track_ids.is_empty() || track_ids.len() > 500 {
-        return Err(AppError::Other(
-            "trackIds must contain between 1 and 500 ids".into(),
-        ));
+    if track_ids.is_empty() {
+        return Err(AppError::Other("trackIds must not be empty".into()));
     }
+    let ticket = state.player.play_ticket();
+    let track_ids = play_selection(track_ids, shuffle, MAX_PLAY_TRACKS);
     let queue = with_retry(&state, |client| {
         let track_ids = track_ids.clone();
         async move {
@@ -342,7 +380,7 @@ pub async fn play_discover_tracks(
         }
     })
     .await?;
-    start_queue(&state, queue)
+    start_queue(&state, ticket, queue).await
 }
 
 #[tauri::command]
@@ -394,6 +432,7 @@ async fn play_smart_filter(
     should_shuffle: bool,
 ) -> AppResult<()> {
     validate_smart_filter(&filter)?;
+    let ticket = state.player.play_ticket();
     let queue = with_retry(state, |client| {
         let filter = filter.clone();
         async move {
@@ -401,11 +440,12 @@ async fn play_smart_filter(
             if should_shuffle {
                 shuffle_items(&mut tracks);
             }
+            tracks.truncate(MAX_QUERY_QUEUE);
             to_queue_tracks(&client, tracks)
         }
     })
     .await?;
-    start_queue(state, queue)
+    start_queue(state, ticket, queue).await
 }
 
 #[tauri::command]
@@ -471,6 +511,23 @@ mod tests {
                     label: "1990s".into(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_long_play_list_is_capped_instead_of_refused() {
+        let ids = (0..120).map(|n| n.to_string()).collect::<Vec<_>>();
+        // Play keeps the page's order: the first ones.
+        assert_eq!(play_selection(ids.clone(), false, 100), ids[..100].to_vec());
+        // Shuffle draws from all of them, each at most once.
+        let sample = play_selection(ids.clone(), true, 100);
+        assert_eq!(sample.len(), 100);
+        assert_eq!(sample.iter().collect::<HashSet<_>>().len(), 100);
+        assert!(sample.iter().all(|id| ids.contains(id)));
+        // Within the cap nothing changes.
+        assert_eq!(
+            play_selection(ids[..5].to_vec(), true, 100),
+            ids[..5].to_vec()
         );
     }
 

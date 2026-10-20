@@ -98,13 +98,18 @@ export function pointBelow(element: Element): { x: number; y: number } {
 }
 
 /**
- * Where to open a menu for a click on its trigger: at the pointer — or under
- * the trigger when the click came from the keyboard (Enter/Space clicks have
- * `detail` 0 and no coordinates, which would open the menu in the corner).
+ * Where to open a menu for a click on its trigger, or for a right-click: at
+ * the pointer — or under the trigger when a click came from the keyboard
+ * (Enter/Space clicks have `detail` 0 and no coordinates, which would open the
+ * menu in the corner). Only a click says so: a `contextmenu` event has
+ * `detail` 0 even from the mouse, and the keyboard's one (`contextMenuKey`)
+ * already carries the point under the element.
  */
 export function menuPoint(event: MouseEvent): { x: number; y: number } {
   const trigger = event.currentTarget;
-  if (event.detail === 0 && trigger instanceof Element) return pointBelow(trigger);
+  if (event.type === "click" && event.detail === 0 && trigger instanceof Element) {
+    return pointBelow(trigger);
+  }
   return { x: event.clientX, y: event.clientY };
 }
 

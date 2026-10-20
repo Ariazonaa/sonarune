@@ -18,6 +18,23 @@ pub enum AppError {
     Other(String),
 }
 
+impl AppError {
+    /// The same error once more, for callers that share one failed attempt.
+    /// A network or database error cannot be cloned; its text is kept, so the
+    /// UI shows the same message.
+    pub fn replay(&self) -> AppError {
+        match self {
+            AppError::Server { status, message } => AppError::Server {
+                status: *status,
+                message: message.clone(),
+            },
+            AppError::NotConnected => AppError::NotConnected,
+            AppError::Audio(message) => AppError::Audio(message.clone()),
+            other => AppError::Other(other.to_string()),
+        }
+    }
+}
+
 impl From<reqwest::Error> for AppError {
     /// Strip the URL before the error can reach a log or the UI banner.
     ///

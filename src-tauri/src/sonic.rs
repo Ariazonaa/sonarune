@@ -357,6 +357,17 @@ const REBUILD_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 /// coming. Parsing a large library's analyses takes a moment; this is the one
 /// place that pays for it. Empty while signed out.
 pub fn index(store: &crate::store::Store) -> std::sync::Arc<SonicIndex> {
+    index_containing(store, &[])
+}
+
+/// [`index`] for a caller that needs `needed` in it: when one of them is
+/// missing from a cached index that analyses have been written since, it is
+/// rebuilt at once instead of after [`REBUILD_AFTER`] — a track analysed a
+/// moment ago must not be reported as not analysed.
+pub fn index_containing(
+    store: &crate::store::Store,
+    needed: &[&str],
+) -> std::sync::Arc<SonicIndex> {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Instant;
     struct Built {
@@ -375,9 +386,14 @@ pub fn index(store: &crate::store::Store) -> std::sync::Arc<SonicIndex> {
     // instead of starting the same one.
     let mut cached = cache.lock().unwrap();
     if let Some(built) = cached.as_ref() {
-        let fresh = built.generation == generation
-            || (built.at.elapsed() < REBUILD_AFTER && !built.index.points.is_empty());
-        if built.server == server && fresh {
+        if built.server == server
+            && still_good(
+                &built.index,
+                built.generation != generation,
+                built.at.elapsed(),
+                needed,
+            )
+        {
             return built.index.clone();
         }
     }
@@ -403,6 +419,21 @@ pub fn index(store: &crate::store::Store) -> std::sync::Arc<SonicIndex> {
     index
 }
 
+/// Whether a cached index may be served instead of a rebuild: nothing was
+/// written since it was built, or it is young and holds what the caller
+/// needs. An empty index is never young — the first analyses make it useful.
+fn still_good(
+    index: &SonicIndex,
+    written_since: bool,
+    age: std::time::Duration,
+    needed: &[&str],
+) -> bool {
+    !written_since
+        || (age < REBUILD_AFTER
+            && !index.points.is_empty()
+            && needed.iter().all(|id| index.contains(id)))
+}
+
 /// Whether a stored analysis already carries a current sound vector.
 pub fn has_sound(analysis: &TrackAnalysis) -> bool {
     usable(&analysis.sonic).is_some()
@@ -415,6 +446,41 @@ pub fn sound_attempted(analysis: &TrackAnalysis) -> bool {
         .sonic
         .as_ref()
         .is_some_and(|f| f.version == SONIC_VERSION)
+}
+
+/// Whether the stored analysis of `item_id` is through the current sound
+/// analysis without a sound to compare: too short or too quiet. Unlike a
+/// track not analysed yet, no scan and no play will change that.
+pub fn without_sound(store: &crate::store::Store, item_id: &str) -> bool {
+    store
+        .get_analysis(item_id)
+        .and_then(|json| serde_json::from_str::<TrackAnalysis>(&json).ok())
+        .is_some_and(|analysis| sound_attempted(&analysis) && !has_sound(&analysis))
+}
+
+/// Take the analyses of `gone` — tracks the server no longer returns to the
+/// account `user` — out of the index (`Store::release_analyses`), as far as
+/// that holds for every account here. The server answers for the account
+/// signed in, but an analysis serves every account of its server, and a
+/// track hidden from this one may be another's. So where another account has
+/// played on this server, only the tracks this account has played itself
+/// are released: it saw them, and now they are gone. Returns how many.
+pub fn release_gone(
+    store: &crate::store::Store,
+    server: &str,
+    user: &str,
+    gone: Vec<String>,
+) -> crate::error::AppResult<usize> {
+    if gone.is_empty() {
+        return Ok(0);
+    }
+    let gone: Vec<String> = if crate::history::shared_with_others(store, user, server)? {
+        let played = crate::history::played_by(store, user, &gone)?;
+        gone.into_iter().filter(|id| played.contains(id)).collect()
+    } else {
+        gone
+    };
+    store.release_analyses(server, &gone)
 }
 
 /// The tempo part of a distance. An unknown or doubtful tempo costs what a
@@ -494,6 +560,7 @@ mod tests {
                 audible_start_ms: 0.0,
                 audible_end_ms: 1.0,
                 duration_ms: 1.0,
+                server_duration_ms: None,
                 sonic: Some(SonicFeatures {
                     version: SONIC_VERSION,
                     vector,
@@ -546,6 +613,25 @@ mod tests {
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
         assert!(positions[0] > 0 && positions[3] < 11);
         assert!(index.path("t0", "nope", 4, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn a_young_index_is_rebuilt_for_a_track_it_does_not_hold_yet() {
+        use std::time::Duration;
+        let index = line(3);
+        let young = Duration::from_secs(5);
+        let old = REBUILD_AFTER + Duration::from_secs(1);
+        // Nothing written since it was built: good, whatever is asked for.
+        assert!(still_good(&index, false, old, &["unknown"]));
+        // Written since: a young index with what is needed is good enough …
+        assert!(still_good(&index, true, young, &["t1"]));
+        assert!(still_good(&index, true, young, &[]));
+        // … but not when the track asked for is missing: it may be the one
+        // analysed a moment ago …
+        assert!(!still_good(&index, true, young, &["t1", "new"]));
+        // … and not once it is old, or while it is empty.
+        assert!(!still_good(&index, true, old, &[]));
+        assert!(!still_good(&SonicIndex::default(), true, young, &[]));
     }
 
     #[test]

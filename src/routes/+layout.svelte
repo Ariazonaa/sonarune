@@ -8,6 +8,7 @@
   import QueuePanel from "#lib/components/QueuePanel.svelte";
   import LyricsPanel from "#lib/components/LyricsPanel.svelte";
   import SetupScreen from "#lib/components/SetupScreen.svelte";
+  import CertificateBanner from "#lib/components/CertificateBanner.svelte";
   import TitleBar from "#lib/components/TitleBar.svelte";
   import CommandPalette from "#lib/components/CommandPalette.svelte";
   import ShortcutHelp from "#lib/components/ShortcutHelp.svelte";
@@ -25,13 +26,21 @@
   import { help } from "#lib/state/help.svelte.js";
   import { layoutPreferences } from "#lib/state/layout.svelte.js";
   import { installShortcuts } from "#lib/shortcuts.js";
+  import { isTextField } from "#lib/controls.js";
   import { syncTrayLabels } from "#lib/tray.js";
   import { coverUrl } from "#lib/api.js";
   import { ambientColors } from "#lib/ambient.js";
   import { setCoverHue } from "#lib/theme.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { getLocale } from "#lib/paraglide/runtime.js";
 
   let { children } = $props();
+
+  // The document's language, for screen readers (a German label read with an
+  // English voice is barely understandable). app.html says "en"; Paraglide
+  // only resolves the locale, and changing it reloads the page, so setting
+  // it once per load is enough.
+  document.documentElement.lang = getLocale();
 
   // Cross-fade route changes via the View Transitions API (Chromium/WebView2).
   onNavigate((navigation) => {
@@ -59,14 +68,14 @@
   const viewLayout = $derived(layoutPreferences.active);
 
   onMount(() => {
-    // Suppress the WebView's default right-click menu (Share link / Print /
-    // Save as …) everywhere except text inputs (keep copy/paste there). The
-    // app's own context menus still fire — their handlers run on the target
-    // first, this only kills the browser menu on unhandled elements.
+    // Suppress the WebView's default right-click menu (Back / Refresh / Print
+    // / Save as …) everywhere except text fields (keep copy/paste there) — a
+    // slider or a checkbox is an <input> too, but has nothing to paste, and
+    // Refresh would reload the whole UI. The app's own context menus still
+    // fire — their handlers run on the target first, this only kills the
+    // browser menu on unhandled elements.
     window.addEventListener("contextmenu", (e) => {
-      const el = e.target as HTMLElement | null;
-      const tag = el?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || el?.isContentEditable) return;
+      if (isTextField(e.target)) return;
       e.preventDefault();
     });
 
@@ -78,7 +87,13 @@
       return;
     }
     void syncTrayLabels();
-    session.restore();
+    // A session kept without reaching the server (offline grace, or on a
+    // certificate that is not trusted) shows its banner right away, not only
+    // at the next focus. Only this window follows a session the backend
+    // ends: it is the one with the sign-in screen.
+    // Signed out, the check is what announces a session the startup restore
+    // in Rust ended before this window listened: check_server repeats it.
+    void session.restore({ followEnds: true }).then(() => net.check());
     player.init();
     library.init();
     void sonic.init();
@@ -101,11 +116,30 @@
     return installShortcuts();
   });
 
-  // Land on the user's chosen startup view once, right after sign-in.
-  let didStartupNav = false;
+  // Land on the user's chosen startup view once, right after sign-in — once
+  // per app start, not per page load. Switching the language reloads the
+  // page, and the user who just picked Deutsch in Settings must stay there.
+  // sessionStorage survives a reload of this window but not a restart.
+  const STARTUP_NAV_KEY = "sonarune.startupNavDone";
+  function startupNavDone(): boolean {
+    try {
+      return sessionStorage.getItem(STARTUP_NAV_KEY) !== null;
+    } catch {
+      return false;
+    }
+  }
+  function markStartupNavDone() {
+    try {
+      sessionStorage.setItem(STARTUP_NAV_KEY, "1");
+    } catch {
+      /* no session storage: a reload goes to the startup view again */
+    }
+  }
+  let didStartupNav = startupNavDone();
   $effect(() => {
     if (isStandalone || !session.info || didStartupNav) return;
     didStartupNav = true;
+    markStartupNavDone();
     const startup = localStorage.getItem("sonarune.startupView");
     // goto rejects a path that is no route (since SvelteKit 3); a stored view
     // from an older build then just leaves the app where it is.
@@ -119,7 +153,8 @@
     const s = player.state;
     const c = s.current;
     if (!c || s.status === "idle") return "Sonarune";
-    const icon = s.status === "paused" ? "⏸" : "▶";
+    // A load counts as what it arrives as, like the Play/Pause button.
+    const icon = player.playing ? "▶" : "⏸";
     return `${icon} ${c.artist} – ${c.name}`;
   });
 
@@ -137,13 +172,19 @@
   // chrome floats over a soft field of the playing album's colors. Reuses the
   // now-playing ambient extraction; a stale resolve just re-tints for the newer
   // track on its own pass. The same extraction feeds the "accent from cover"
-  // theme option (a no-op while the accent is fixed).
-  $effect(() => {
+  // theme option (a no-op while the accent is fixed). Keyed on the cover, not
+  // on the player state: that is replaced on every 400 ms tick, and each pass
+  // re-reads the theme, forces a style flush, rewrites storage and wakes the
+  // canvas drawers — or refetches a cover that failed to load.
+  const coverSrc = $derived.by(() => {
     const cur = player.state.current;
-    const src = cur ? coverUrl(cur.imageItemId, cur.imageTag, 360) : null;
+    return cur ? coverUrl(cur.imageItemId, cur.imageTag, 360) : null;
+  });
+  $effect(() => {
+    const src = coverSrc;
     if (!src) return;
     void ambientColors(src).then((colors) => {
-      if (!colors || player.state.current?.imageItemId !== cur?.imageItemId) return;
+      if (!colors || coverSrc !== src) return;
       const root = document.documentElement;
       root.style.setProperty("--cover-a", colors.a);
       root.style.setProperty("--cover-b", colors.b);
@@ -166,7 +207,9 @@
         <SetupScreen />
       </div>
     {:else}
-      {#if !net.online}
+      {#if net.untrustedCertificate}
+        <CertificateBanner fingerprint={net.untrustedCertificate} />
+      {:else if !net.online}
         <button
           class="flex w-full items-center justify-center gap-3 bg-amber-500/90 px-4 py-1.5 text-xs font-semibold text-black"
           onclick={() => net.retry()}

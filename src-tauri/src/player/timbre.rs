@@ -3,10 +3,14 @@
 //!
 //! Computed inside the tempo/key analysis from the same decimated mono
 //! (~11 kHz) and the same onset spectra, so it costs one pass more of
-//! arithmetic and no decoding. That signal ends near 5.5 kHz: enough for the
-//! colour of a mix (bass weight, brightness, how noisy or tonal it is), not
-//! for the shimmer of cymbals — sonic similarity compares tracks with each
-//! other, and they all lose the same top octave.
+//! arithmetic and no decoding. Everything here looks at one fixed band, 60 Hz
+//! to 5 kHz: enough for the colour of a mix (bass weight, brightness, how
+//! noisy or tonal it is), not for the shimmer of cymbals. Fixed, because the
+//! analysis rate is the source rate over a whole factor — 11 025 Hz from
+//! 44.1 kHz, 12 000 Hz from 48 kHz — and the same track must come out the
+//! same from a FLAC and from its Opus transcode. The analyser low-passes the
+//! signal at the top of the band before it decimates (`analysis.rs`), so
+//! nothing above it folds in.
 //!
 //! Per sampled frame: 12 mel-cepstral coefficients (MFCC 1–12, the spectral
 //! envelope without its loudness), spectral centroid, flatness and 85 %
@@ -18,7 +22,11 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when the features change; older vectors are not compared with new
 /// ones and get recomputed.
-pub const SONIC_VERSION: u32 = 1;
+///
+/// 2: a fixed band and an anti-alias filter instead of everything up to the
+/// Nyquist frequency of the source; level and dynamic range over the audible
+/// hops only.
+pub const SONIC_VERSION: u32 = 2;
 
 /// Length of [`SonicFeatures::vector`].
 pub const DIMENSIONS: usize = 32;
@@ -67,6 +75,9 @@ pub struct Timbre {
     /// DCT-II basis, `CEPSTRA` rows of `MEL_BANDS`.
     dct: Vec<[f32; MEL_BANDS]>,
     bin_khz: f32,
+    /// First and last bin of the band the centroid, flatness and rolloff
+    /// are taken over: the mel filters' [`MEL_LOW_HZ`]..[`MEL_HIGH_HZ`].
+    band: (usize, usize),
     frames: Vec<Frame>,
 }
 
@@ -120,17 +131,34 @@ impl Timbre {
                 row
             })
             .collect();
+        let band = (
+            (MEL_LOW_HZ / bin_hz).ceil() as usize,
+            ((high / bin_hz).floor() as usize).min(bins.saturating_sub(1)),
+        );
         Self {
             filters,
             dct,
             bin_khz: bin_hz / 1000.0,
+            band,
             frames: Vec::new(),
         }
     }
 
+    /// The onset bins the attack shares are measured over: from the first
+    /// bin above DC (where the bass band of the analyser starts too) to the
+    /// top of the band.
+    pub fn flux_bins(&self) -> std::ops::RangeInclusive<usize> {
+        1..=self.band.1
+    }
+
     /// One frame: `power[bin]` is the squared magnitude of bin `bin`.
     pub fn push(&mut self, hop: usize, power: &[f32]) {
-        let total: f32 = power.iter().sum();
+        let (low, high) = (self.band.0, self.band.1.min(power.len().saturating_sub(1)));
+        if low > high {
+            return;
+        }
+        let band = &power[low..=high];
+        let total: f32 = band.iter().sum();
         if total <= 1e-12 {
             return;
         }
@@ -148,22 +176,22 @@ impl Timbre {
             *slot = row.iter().zip(&log_mel).map(|(b, v)| b * v).sum::<f32>() / MEL_BANDS as f32;
         }
 
-        let centroid_bin = power
+        let centroid_bin = band
             .iter()
             .enumerate()
-            .map(|(i, p)| i as f32 * p)
+            .map(|(i, p)| (low + i) as f32 * p)
             .sum::<f32>()
             / total;
         // Flatness: geometric over arithmetic mean, 0 (a pure tone) … 1 (noise).
         let floor = 1e-12f32;
-        let log_mean = power.iter().map(|p| (p + floor).ln()).sum::<f32>() / power.len() as f32;
-        let flatness = (log_mean.exp() / (total / power.len() as f32 + floor)).clamp(0.0, 1.0);
+        let log_mean = band.iter().map(|p| (p + floor).ln()).sum::<f32>() / band.len() as f32;
+        let flatness = (log_mean.exp() / (total / band.len() as f32 + floor)).clamp(0.0, 1.0);
         let mut running = 0.0;
-        let mut rolloff_bin = power.len();
-        for (i, p) in power.iter().enumerate() {
+        let mut rolloff_bin = high;
+        for (i, p) in band.iter().enumerate() {
             running += p;
             if running >= 0.85 * total {
-                rolloff_bin = i;
+                rolloff_bin = low + i;
                 break;
             }
         }
@@ -256,7 +284,18 @@ impl Timbre {
             0.0
         });
 
-        let mut levels: Vec<f32> = audible.to_vec();
+        // Level and dynamics of the music, not of the gaps in it: the stretch
+        // between the first and the last audible hop can hold minutes of
+        // digital silence (a hidden track), which would put the track's level
+        // near -120 dB and its range near 100 dB.
+        let mut levels: Vec<f32> = audible
+            .iter()
+            .copied()
+            .filter(|level| *level > loudest + super::analysis::SILENCE_DB)
+            .collect();
+        if levels.is_empty() {
+            return None;
+        }
         levels.sort_by(f32::total_cmp);
         let at = |q: f32| levels[((levels.len() - 1) as f32 * q).round() as usize];
         vector.push(levels.iter().sum::<f32>() / levels.len() as f32);
@@ -319,6 +358,34 @@ mod tests {
         assert!((dark[28] - 0.5).abs() < 1e-6 && (dark[29] - 0.5).abs() < 1e-6);
         // A steady level has no dynamic range.
         assert_eq!(dark[31], 0.0);
+    }
+
+    #[test]
+    fn a_silent_gap_does_not_count_as_level_or_dynamics() {
+        // Music, a long stretch of digital silence, then a hidden track: the
+        // audible range runs from the first hop to the last.
+        let bins = 512;
+        let hops = 1_600;
+        let gap = 400..1_400;
+        let mut timbre = Timbre::new(bins, 11_025.0 / 1024.0);
+        let mut level = vec![-12.0; hops];
+        for (hop, slot) in level.iter_mut().enumerate() {
+            if gap.contains(&hop) {
+                *slot = -120.0;
+                timbre.push(hop, &vec![0.0; bins]);
+            } else {
+                timbre.push(hop, &tone(bins, 40, 1e-4));
+            }
+        }
+        let flux = vec![1.0; hops];
+        let envelope = vec![0.5; hops];
+        let low = vec![0.25; hops];
+        let vector = timbre
+            .finish(0, hops, &level, &flux, &envelope, &low)
+            .expect("enough frames")
+            .vector;
+        assert_eq!(vector[30], -12.0, "level");
+        assert_eq!(vector[31], 0.0, "dynamic range");
     }
 
     #[test]

@@ -2,6 +2,7 @@ import { goto } from "$app/navigation";
 import { api } from "#lib/api.js";
 import { apiLibrary } from "#lib/api/library.js";
 import { m } from "#lib/paraglide/messages.js";
+import { sonicPathEntries } from "#lib/sonicPathMenu.js";
 import { confirm } from "#lib/state/confirm.svelte.js";
 import { downloads } from "#lib/state/downloads.svelte.js";
 import { player } from "#lib/state/player.svelte.js";
@@ -83,9 +84,11 @@ export interface TrackMenuHooks {
    * Play the track in the context the list stands for — its album, the
    * playlist, the search result. Left out where there is none: a "play" that
    * quietly queues a single track and nothing else is a lie about what the
-   * list does. `disabled` keeps the entry visible but inert where the context
-   * is missing for this one row (a track without an album), which says more
-   * than an entry that is simply not there.
+   * list does. Where only this one row lacks the context (a track without an
+   * album, or one its album no longer lists), the track plays on its own and
+   * the entry stays enabled; `playInAlbum` does both. `disabled` keeps the
+   * entry visible but inert for a row the list cannot play at all, which says
+   * more than an entry that is simply not there.
    */
   play?: { run: () => void; disabled?: boolean };
   /** Open the playlist picker for these tracks (the caller knows where). */
@@ -158,20 +161,7 @@ export function trackMenuItems(tracks: TrackDto[], hooks: TrackMenuHooks): Conte
       icon: TRACK_ICON.sonic,
       action: () => void sonic.radio(track.id),
     });
-    const start = sonic.pathStart;
-    if (start && start.id !== track.id) {
-      items.push({
-        label: m.ctx_sonic_path_to({ name: start.name }),
-        icon: TRACK_ICON.path,
-        action: () => void sonic.finishPath(track.id),
-      });
-    } else {
-      items.push({
-        label: m.ctx_sonic_path_from(),
-        icon: TRACK_ICON.path,
-        action: () => sonic.startPath(track.id, track.name),
-      });
-    }
+    items.push(...sonicPathEntries(track, TRACK_ICON.path));
     items.push({
       label: m.ctx_go_to_album(),
       icon: TRACK_ICON.album,

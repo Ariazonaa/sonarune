@@ -38,3 +38,4 @@ src/lib/paraglide/
 /.gitleaks.toml
 /archive/
 /scripts/publish-public.mjs
+/scripts/publish-public.test.ts

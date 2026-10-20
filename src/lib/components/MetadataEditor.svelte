@@ -1,8 +1,10 @@
 <script lang="ts">
   import { apiLibrary } from "#lib/api/library.js";
+  import { sameNames, splitNames } from "#lib/metadataNames.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { modalFocus } from "#lib/modal.js";
   import { portal } from "#lib/portal.js";
   import type { EditableMetadata, MetadataEdits } from "#lib/types.js";
 
@@ -53,21 +55,6 @@
       });
   });
 
-  /** Comma-split, trim, drop empties, dedupe case-insensitively (mirrors Rust). */
-  function splitList(s: string): string[] {
-    const out: string[] = [];
-    const seen = new Set<string>();
-    for (const raw of s.split(",")) {
-      const t = raw.trim();
-      const key = t.toLowerCase();
-      if (t && !seen.has(key)) {
-        seen.add(key);
-        out.push(t);
-      }
-    }
-    return out;
-  }
-
   function parseIntField(s: string): { value: number | null; invalid: boolean } {
     const t = s.trim();
     if (t === "") return { value: null, invalid: false };
@@ -84,34 +71,68 @@
   );
   const nameInvalid = $derived(name.trim() === "");
 
-  const edits = $derived<MetadataEdits>({
-    name: name.trim(),
-    albumArtists: splitList(albumArtistsText),
-    year: yearParsed.value,
-    genres: splitList(genresText),
-    trackNumber: trackParsed.value,
-    discNumber: discParsed.value,
+  // Only what the user changed is sent; everything else stays as the server
+  // has it. Writing back what the form was filled with is not a no-op: the
+  // list fields went through a comma join and split, which cut "Earth, Wind &
+  // Fire" in two on every save, whatever else was edited.
+  const edits = $derived.by((): MetadataEdits => {
+    const o = original;
+    const out: MetadataEdits = {};
+    if (!o) return out;
+    const title = name.trim();
+    if (title !== o.name.trim()) out.name = title;
+    // Compared with what the untouched field reads as, so stray spaces or a
+    // name the server lists twice do not count as an edit.
+    const list = (text: string, names: string[]) => {
+      const value = splitNames(text, names);
+      return sameNames(value, splitNames(names.join(", "), names)) ? undefined : value;
+    };
+    const albumArtists = list(albumArtistsText, o.albumArtists);
+    if (albumArtists) out.albumArtists = albumArtists;
+    if (yearParsed.value !== o.year) out.year = yearParsed.value;
+    const genres = list(genresText, o.genres);
+    if (genres) out.genres = genres;
+    if (o.isAudio) {
+      if (trackParsed.value !== o.trackNumber) out.trackNumber = trackParsed.value;
+      if (discParsed.value !== o.discNumber) out.discNumber = discParsed.value;
+    }
+    return out;
   });
 
-  const diff = $derived.by(() => {
+  /** A review row. List fields show each value apart, so a name that would be
+   *  split into two is seen as two. */
+  interface DiffRow {
+    label: string;
+    before: string[];
+    after: string[];
+    list: boolean;
+  }
+
+  const diff = $derived.by((): DiffRow[] => {
     const o = original;
-    if (!o) return [] as { label: string; before: string; after: string }[];
-    const rows: { label: string; before: string; after: string }[] = [];
-    const show = (v: string) => (v === "" ? m.edit_value_empty() : v);
-    const num = (n: number | null) => (n != null ? String(n) : "");
-    const push = (label: string, before: string, after: string) => {
-      if (before !== after) rows.push({ label, before: show(before), after: show(after) });
-    };
-    push(m.edit_field_name(), o.name, edits.name);
-    push(m.edit_field_album_artist(), o.albumArtists.join(", "), edits.albumArtists.join(", "));
-    push(m.edit_field_year(), num(o.year), num(edits.year));
-    push(m.edit_field_genres(), o.genres.join(", "), edits.genres.join(", "));
-    if (o.isAudio) {
-      push(m.edit_field_track_number(), num(o.trackNumber), num(edits.trackNumber));
-      push(m.edit_field_disc_number(), num(o.discNumber), num(edits.discNumber));
+    if (!o) return [];
+    const rows: DiffRow[] = [];
+    const one = (v: string | number | null | undefined) => (v == null || v === "" ? [] : [String(v)]);
+    const scalar = (label: string, before: string | number | null, after: string | number | null) =>
+      rows.push({ label, before: one(before), after: one(after), list: false });
+    const list = (label: string, before: string[], after: string[]) =>
+      rows.push({ label, before, after, list: true });
+    if (edits.name !== undefined) scalar(m.edit_field_name(), o.name, edits.name);
+    if (edits.albumArtists) list(m.edit_field_album_artist(), o.albumArtists, edits.albumArtists);
+    if (edits.year !== undefined) scalar(m.edit_field_year(), o.year, edits.year);
+    if (edits.genres) list(m.edit_field_genres(), o.genres, edits.genres);
+    if (edits.trackNumber !== undefined) {
+      scalar(m.edit_field_track_number(), o.trackNumber, edits.trackNumber);
+    }
+    if (edits.discNumber !== undefined) {
+      scalar(m.edit_field_disc_number(), o.discNumber, edits.discNumber);
     }
     return rows;
   });
+
+  /** Whether one of the field's current names has a comma in it: its hint then
+   *  says such a name stays whole. */
+  const keepsCommaNames = (names: readonly string[]) => names.some((value) => value.includes(","));
 
   const canSave = $derived(
     original != null &&
@@ -185,6 +206,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
   {@attach portal}
+  {@attach modalFocus}
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
   onclick={(e) => {
     if (e.target === e.currentTarget) onclose();
@@ -245,7 +267,9 @@
             bind:value={albumArtistsText}
             class="w-full rounded-md border border-edge bg-base px-3 py-2 text-sm outline-none focus:border-accent"
           />
-          <span class="mt-1 block text-xs text-ink-muted">{m.edit_multi_hint()}</span>
+          <span class="mt-1 block text-xs text-ink-muted">
+            {keepsCommaNames(original.albumArtists) ? m.edit_multi_hint_keep() : m.edit_multi_hint()}
+          </span>
         </label>
 
         <div class="grid grid-cols-2 gap-3">
@@ -293,8 +317,26 @@
             bind:value={genresText}
             class="w-full rounded-md border border-edge bg-base px-3 py-2 text-sm outline-none focus:border-accent"
           />
-          <span class="mt-1 block text-xs text-ink-muted">{m.edit_multi_hint()}</span>
+          <span class="mt-1 block text-xs text-ink-muted">
+            {keepsCommaNames(original.genres) ? m.edit_multi_hint_keep() : m.edit_multi_hint()}
+          </span>
         </label>
+
+        {#snippet values(list: string[], multiple: boolean, before: boolean)}
+          {#if list.length === 0}
+            <span class="text-ink-muted {before ? 'line-through' : ''}">{m.edit_value_empty()}</span>
+          {:else if multiple}
+            <span class="inline-flex flex-wrap gap-1">
+              {#each list as value, index (index)}
+                <span
+                  class="rounded bg-panel-2 px-1.5 {before ? 'text-ink-muted line-through' : 'font-semibold'}"
+                >{value}</span>
+              {/each}
+            </span>
+          {:else}
+            <span class={before ? "text-ink-muted line-through" : "font-semibold"}>{list[0]}</span>
+          {/if}
+        {/snippet}
 
         <div class="rounded-lg border border-edge bg-base/50 p-3">
           <p class="mb-2 text-xs font-bold uppercase tracking-wider text-ink-muted">{m.edit_diff_title()}</p>
@@ -303,11 +345,11 @@
           {:else}
             <ul class="space-y-1.5 text-sm">
               {#each diff as row (row.label)}
-                <li class="flex flex-wrap items-baseline gap-x-2">
+                <li class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                   <span class="font-medium text-ink-muted">{row.label}:</span>
-                  <span class="text-ink-muted line-through">{row.before}</span>
+                  {@render values(row.before, row.list, true)}
                   <span aria-hidden="true">→</span>
-                  <span class="font-semibold">{row.after}</span>
+                  {@render values(row.after, row.list, false)}
                 </li>
               {/each}
             </ul>

@@ -390,9 +390,10 @@ WebView2 (WebdriverIO → `tauri-driver`). Details and the manual live-test matr
 are in [`docs/testing.md`](docs/testing.md) and [`e2e/README.md`](e2e/README.md).
 
 CI runs the same gates on every push and pull request
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on a Windows runner.
-The workflow installs Node, Rust and cmake itself and sets up the MSVC
-environment, so it needs nothing beyond the image's C++ build tools.
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on GitHub's hosted
+Windows image. It relies on what that image ships — rustup, the MSVC build
+tools, cmake and LLVM — and only adds Node 22, the current stable Rust and
+caching.
 
 ## Project layout
 

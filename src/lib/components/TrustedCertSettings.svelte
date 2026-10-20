@@ -55,8 +55,7 @@
       await api.forgetTrustedCertificate(cert.serverUrl, cert.fingerprint);
       if (active) {
         // The running session was built trusting this certificate and would
-        // keep doing so until the next start — and then fail on it, with no
-        // way back to the confirmation prompt. Sign out so the next sign-in
+        // keep doing so until the next start. Sign out so the next sign-in
         // asks for the certificate again.
         await session.disconnect();
         return;

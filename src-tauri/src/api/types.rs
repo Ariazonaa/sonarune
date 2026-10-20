@@ -62,27 +62,43 @@ impl UserDto {
 // dropped on the round-trip. The `no_key_outside_the_whitelist_is_modified` test
 // pins that invariant.
 
-/// Desired final values for the in-scope fields (camelCase from the editor).
-/// The editor always sends all six; an unchanged field simply re-writes the
-/// same value. `None` on a numeric field clears it.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// The fields the single-item editor changed (camelCase from the editor). A
+/// field left out stays exactly as the server has it. Re-sending the values
+/// the form was filled with is not harmless: a name with a comma in it does
+/// not survive being joined into the text box and split again, and a value
+/// another client changed in the meantime would be reverted. An explicit
+/// `null` on a numeric field clears it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct MetadataEdits {
-    pub name: String,
-    pub album_artists: Vec<String>,
-    pub year: Option<i32>,
-    pub genres: Vec<String>,
-    pub track_number: Option<i32>,
-    pub disc_number: Option<i32>,
+    pub name: Option<String>,
+    pub album_artists: Option<Vec<String>>,
+    #[serde(deserialize_with = "present")]
+    pub year: Option<Option<i32>>,
+    pub genres: Option<Vec<String>>,
+    #[serde(deserialize_with = "present")]
+    pub track_number: Option<Option<i32>>,
+    #[serde(deserialize_with = "present")]
+    pub disc_number: Option<Option<i32>>,
+}
+
+/// `Some` for a field that is there, `null` included, so `null` ("clear it")
+/// and an absent field ("leave it") stay apart; with the struct's
+/// `#[serde(default)]` an absent field is `None`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Edits meant for many tracks at once.
 ///
-/// The single-track editor sends every field and rewrites them all; that is
-/// exactly wrong here. A field left out stays untouched on every item — so a
-/// hundred tracks can be given a genre without their titles, track numbers or
-/// years being flattened into each other. There is no title here at all: a
-/// title is not something several tracks share.
+/// Like the single-item edit, a field left out stays untouched on every
+/// item — so a hundred tracks can be given a genre without their titles,
+/// track numbers or years being flattened into each other. There is no title
+/// here at all: a title is not something several tracks share.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct BulkMetadataEdits {
@@ -107,6 +123,8 @@ pub struct BulkMetadataEdits {
 pub struct BulkMetadataResult {
     pub changed: usize,
     pub failed: usize,
+    /// Never tried: the run stopped once the server could not be reached.
+    pub skipped: usize,
     /// The first failure, for the message; the rest are only counted.
     pub error: Option<String>,
 }
@@ -228,41 +246,53 @@ fn clean_names(list: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Merge whitelisted edits onto a full fetched item, in place. Only the six
-/// whitelisted keys are ever written; every other field is left intact, so a
-/// concurrent change to another field and any unknown fields are preserved.
+/// Merge whitelisted edits onto a full fetched item, in place. Only the
+/// whitelisted keys the edit names are written; every other field is left
+/// intact, so a concurrent change to another field and any unknown fields are
+/// preserved.
 pub fn apply_metadata_edits(item: &mut Value, edits: &MetadataEdits) -> AppResult<()> {
     let obj = item
         .as_object_mut()
         .ok_or_else(|| AppError::Other("server item is not a JSON object".into()))?;
 
-    let name = edits.name.trim();
-    if name.is_empty() {
-        return Err(AppError::Other("title must not be empty".into()));
+    if let Some(name) = &edits.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::Other("title must not be empty".into()));
+        }
+        obj.insert("Name".into(), json!(name));
     }
-    obj.insert("Name".into(), json!(name));
 
-    let artists = clean_names(&edits.album_artists);
-    obj.insert(
-        "AlbumArtists".into(),
-        Value::Array(artists.iter().map(|n| json!({ "Name": n })).collect()),
-    );
+    if let Some(artists) = &edits.album_artists {
+        let artists = clean_names(artists);
+        obj.insert(
+            "AlbumArtists".into(),
+            Value::Array(artists.iter().map(|n| json!({ "Name": n })).collect()),
+        );
+    }
 
     // The server rebuilds GenreItems from Genres on write; leave GenreItems be.
-    obj.insert("Genres".into(), json!(clean_names(&edits.genres)));
-
-    match edits.year {
-        Some(y) if (1..=9999).contains(&y) => {
-            obj.insert("ProductionYear".into(), json!(y));
-        }
-        Some(_) => return Err(AppError::Other("year must be between 1 and 9999".into())),
-        None => {
-            obj.insert("ProductionYear".into(), Value::Null);
-        }
+    if let Some(genres) = &edits.genres {
+        obj.insert("Genres".into(), json!(clean_names(genres)));
     }
 
-    set_opt_index(obj, "IndexNumber", edits.track_number)?;
-    set_opt_index(obj, "ParentIndexNumber", edits.disc_number)?;
+    match edits.year {
+        Some(Some(y)) if (1..=9999).contains(&y) => {
+            obj.insert("ProductionYear".into(), json!(y));
+        }
+        Some(Some(_)) => return Err(AppError::Other("year must be between 1 and 9999".into())),
+        Some(None) => {
+            obj.insert("ProductionYear".into(), Value::Null);
+        }
+        None => {}
+    }
+
+    if let Some(track) = edits.track_number {
+        set_opt_index(obj, "IndexNumber", track)?;
+    }
+    if let Some(disc) = edits.disc_number {
+        set_opt_index(obj, "ParentIndexNumber", disc)?;
+    }
     Ok(())
 }
 
@@ -388,13 +418,68 @@ mod metadata_tests {
 
     fn edits() -> MetadataEdits {
         MetadataEdits {
-            name: "New Title".into(),
-            album_artists: vec!["Artist A".into(), "Artist B".into()],
-            year: Some(2020),
-            genres: vec!["Pop".into(), "Electronic".into()],
-            track_number: Some(5),
-            disc_number: Some(2),
+            name: Some("New Title".into()),
+            album_artists: Some(vec!["Artist A".into(), "Artist B".into()]),
+            year: Some(Some(2020)),
+            genres: Some(vec!["Pop".into(), "Electronic".into()]),
+            track_number: Some(Some(5)),
+            disc_number: Some(Some(2)),
         }
+    }
+
+    #[test]
+    fn fields_left_out_stay_exactly_as_the_server_has_them() {
+        // Names with a comma in them: joined into the editor's text box and
+        // split again, each would come back as several names.
+        let mut item = sample();
+        item["AlbumArtists"] = json!([{ "Name": "Earth, Wind & Fire", "Id": "a1" }]);
+        item["Genres"] = json!(["Folk, World, & Country"]);
+        let before = item.clone();
+        apply_metadata_edits(
+            &mut item,
+            &MetadataEdits {
+                year: Some(Some(1978)),
+                ..MetadataEdits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(item["ProductionYear"], 1978);
+        for key in [
+            "Name",
+            "AlbumArtists",
+            "Genres",
+            "IndexNumber",
+            "ParentIndexNumber",
+        ] {
+            assert_eq!(item[key], before[key], "{key}");
+        }
+    }
+
+    #[test]
+    fn an_empty_edit_writes_nothing() {
+        let mut item = sample();
+        let before = item.clone();
+        apply_metadata_edits(&mut item, &MetadataEdits::default()).unwrap();
+        assert_eq!(item, before);
+    }
+
+    #[test]
+    fn a_null_number_clears_and_an_absent_one_is_left_alone() {
+        let edits: MetadataEdits =
+            serde_json::from_value(json!({ "year": null, "discNumber": 2 })).unwrap();
+        assert_eq!(edits.year, Some(None));
+        assert_eq!(edits.disc_number, Some(Some(2)));
+        assert_eq!(edits.track_number, None);
+        assert!(edits.name.is_none() && edits.album_artists.is_none() && edits.genres.is_none());
+
+        let mut item = sample();
+        apply_metadata_edits(&mut item, &edits).unwrap();
+        assert!(item["ProductionYear"].is_null());
+        assert_eq!(item["ParentIndexNumber"], 2);
+        assert_eq!(item["IndexNumber"], 3);
+
+        let nothing: MetadataEdits = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(nothing.year, None);
     }
 
     #[test]
@@ -434,7 +519,7 @@ mod metadata_tests {
     fn empty_title_is_rejected() {
         let mut item = sample();
         let mut e = edits();
-        e.name = "   ".into();
+        e.name = Some("   ".into());
         assert!(apply_metadata_edits(&mut item, &e).is_err());
     }
 
@@ -442,7 +527,7 @@ mod metadata_tests {
     fn clearing_year_writes_json_null() {
         let mut item = sample();
         let mut e = edits();
-        e.year = None;
+        e.year = Some(None);
         apply_metadata_edits(&mut item, &e).unwrap();
         assert_eq!(item["ProductionYear"], Value::Null);
     }
@@ -451,7 +536,7 @@ mod metadata_tests {
     fn out_of_range_year_is_rejected() {
         let mut item = sample();
         let mut e = edits();
-        e.year = Some(0);
+        e.year = Some(Some(0));
         assert!(apply_metadata_edits(&mut item, &e).is_err());
     }
 
@@ -459,7 +544,7 @@ mod metadata_tests {
     fn negative_track_number_is_rejected() {
         let mut item = sample();
         let mut e = edits();
-        e.track_number = Some(-1);
+        e.track_number = Some(Some(-1));
         assert!(apply_metadata_edits(&mut item, &e).is_err());
     }
 
@@ -467,7 +552,12 @@ mod metadata_tests {
     fn names_are_trimmed_and_deduped_case_insensitively() {
         let mut item = sample();
         let mut e = edits();
-        e.genres = vec!["Rock".into(), " rock ".into(), String::new(), "Jazz".into()];
+        e.genres = Some(vec![
+            "Rock".into(),
+            " rock ".into(),
+            String::new(),
+            "Jazz".into(),
+        ]);
         apply_metadata_edits(&mut item, &e).unwrap();
         assert_eq!(item["Genres"], json!(["Rock", "Jazz"]));
     }
@@ -570,8 +660,12 @@ pub struct BaseItem {
     pub user_data: Option<UserDataWire>,
     pub child_count: Option<i32>,
     /// Playlist entry id (only on /Playlists/{id}/Items responses); playlist
-    /// removal/reorder address entries by this, not by item id.
+    /// removal/reorder address entries by this. Jellyfin 10.11 fills it with
+    /// the entry's item id, so it is not unique when a track is in the
+    /// playlist twice.
     pub playlist_item_id: Option<String>,
+    /// A library's content type (`music`, `movies`, ...), on `/UserViews`.
+    pub collection_type: Option<String>,
     /// When the item was added to the library (needs `fields=DateCreated`).
     /// Used by the library-change watcher, not sent to the frontend.
     pub date_created: Option<String>,
@@ -640,6 +734,9 @@ pub struct ArtistDto {
     pub image_blur_hash: Option<String>,
     /// Biography/overview text (needs `fields=Overview`).
     pub overview: Option<String>,
+    /// Needs user data in the query; without it every artist reads as not a
+    /// favorite.
+    pub is_favorite: bool,
 }
 
 impl ArtistDto {
@@ -652,7 +749,37 @@ impl ArtistDto {
             image_tag,
             image_blur_hash,
             overview: item.overview.filter(|s| !s.trim().is_empty()),
+            is_favorite: item.user_data.map(|u| u.is_favorite).unwrap_or(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod artist_dto_tests {
+    use super::*;
+
+    fn artist(value: Value) -> ArtistDto {
+        ArtistDto::from_item(serde_json::from_value(value).expect("artist item"))
+    }
+
+    #[test]
+    fn an_artist_carries_its_favorite_state() {
+        // The Artists grid offers "Remove from favorites" from this; without it
+        // an artist favorited in the app could never be taken off again.
+        let favorite = artist(json!({
+            "Id": "a1",
+            "Name": "Artist",
+            "Type": "MusicArtist",
+            "UserData": { "IsFavorite": true, "PlayCount": 0 }
+        }));
+        assert!(favorite.is_favorite);
+        assert_eq!(
+            serde_json::to_value(&favorite).unwrap()["isFavorite"],
+            json!(true)
+        );
+
+        let plain = artist(json!({ "Id": "a2", "Name": "Other", "Type": "MusicArtist" }));
+        assert!(!plain.is_favorite);
     }
 }
 
@@ -682,6 +809,9 @@ pub struct TrackDto {
     pub artist: String,
     pub album: String,
     pub album_id: Option<String>,
+    /// The album's artist as the track is tagged (Jellyfin's `AlbumArtist`):
+    /// whom the play history credits the album to.
+    pub album_artist: Option<String>,
     pub index_number: Option<i32>,
     pub disc_number: Option<i32>,
     pub duration_ms: u64,
@@ -904,12 +1034,13 @@ impl TrackDto {
             id: item.id,
             name: item.name,
             artist: if item.artists.is_empty() {
-                item.album_artist.unwrap_or_default()
+                item.album_artist.clone().unwrap_or_default()
             } else {
                 item.artists.join(", ")
             },
             album: item.album.unwrap_or_default(),
             album_id: item.album_id,
+            album_artist: item.album_artist,
             index_number: item.index_number,
             disc_number: item.parent_index_number,
             duration_ms: item.run_time_ticks.map(ticks_to_ms).unwrap_or(0),
@@ -1027,6 +1158,15 @@ pub struct CreatePlaylistResult {
     pub id: String,
 }
 
+/// GET /Playlists/{id} (10.9+): the item id of every entry the playlist
+/// holds, in order — including the ones hidden from the user, which
+/// `/Playlists/{id}/Items` leaves out.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PlaylistInfoWire {
+    pub item_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistDto {
@@ -1056,6 +1196,9 @@ impl PlaylistDto {
 pub struct PlaylistTrackDto {
     pub track: TrackDto,
     /// Playlist entry id — removal and reorder use this, not the item id.
+    /// Not a row identity: on Jellyfin 10.11 it is the track's own id, so the
+    /// two entries of a track that is in the playlist twice share it, and the
+    /// server removes or moves by it (every copy, the first copy).
     pub entry_id: String,
 }
 
@@ -1067,6 +1210,18 @@ impl PlaylistTrackDto {
             entry_id,
         }
     }
+}
+
+/// What cleaning up a playlist's duplicates did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistCleanup {
+    /// Later entries of repeated tracks that went.
+    pub removed: usize,
+    /// Entries the user cannot see. The clean-up rewrites the playlist, which
+    /// keeps only what the user may see, so while there are any it changes
+    /// nothing (and `removed` is 0).
+    pub hidden: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

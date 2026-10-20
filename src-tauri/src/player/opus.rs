@@ -36,6 +36,11 @@ const MAX_PACKET_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HEADER_PACKET_BYTES: u64 = 64 * 1024 * 1024;
 /// Bound for the OpusHead output gain (dB), which is applied to every sample.
 const OUTPUT_GAIN_LIMIT_DB: f32 = 24.0;
+/// Damaged pages or packets in a row after which a stream counts as
+/// unreadable and ends. One is skipped, as Symphonia does for the other
+/// formats; a run this long is no longer damage but garbage, and reading on
+/// through it would hold up the audio callback.
+const MAX_BAD_RUN: u32 = 32;
 
 /// Bytes the demuxer consumed since the last completed packet, and how many it
 /// may. Shared: the reader counts, the source resets it whenever a packet does
@@ -181,6 +186,8 @@ where
                 pcm: VecDeque::new(),
                 scratch: vec![0.0; MAX_FRAME * usize::from(head.channels)],
                 ended: false,
+                bad_run: 0,
+                damage: 0,
                 seekable,
             };
             // Decode ahead: a player that starts paused never pulls a sample,
@@ -243,6 +250,11 @@ pub struct OggOpusSource<R: Read + Seek> {
     pcm: VecDeque<f32>,
     scratch: Vec<f32>,
     ended: bool,
+    /// Damaged pages or packets since the last good packet ([`MAX_BAD_RUN`]).
+    bad_run: u32,
+    /// Damaged spots got over so far. Counted, not logged: this runs on the
+    /// audio callback; the count is logged when the source is dropped.
+    damage: u32,
     seekable: bool,
 }
 
@@ -271,11 +283,36 @@ impl<R: Read + Seek> OggOpusSource<R> {
     ) {
         let ch = usize::from(self.channels.get());
         let frames = match self.decoder.decode_float(data, &mut self.scratch, false) {
-            Ok(n) => n,
+            Ok(n) => {
+                self.bad_run = 0;
+                n
+            }
             Err(e) => {
-                tracing::warn!("opus decode failed, ending stream: {e}");
-                self.ended = true;
-                return;
+                self.bad_run += 1;
+                if self.bad_run > MAX_BAD_RUN {
+                    tracing::warn!("opus decode failed, ending stream: {e}");
+                    self.ended = true;
+                    return;
+                }
+                if self.bad_run == 1 {
+                    self.damage += 1;
+                }
+                // Fill in for the damaged packet with libopus' packet-loss
+                // concealment, for as long as it would have played — or skip
+                // it when not even its length can be read. The page positions
+                // keep the timeline right either way.
+                let lost = self
+                    .decoder
+                    .get_nb_samples(data)
+                    .unwrap_or(0)
+                    .min(MAX_FRAME);
+                if lost == 0 {
+                    0
+                } else {
+                    self.decoder
+                        .decode_float(&[], &mut self.scratch[..lost * ch], false)
+                        .unwrap_or(0)
+                }
             }
         };
         let start = self.emit_from.saturating_sub(self.gp).min(frames as u64) as usize;
@@ -314,19 +351,28 @@ impl<R: Read + Seek> OggOpusSource<R> {
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!("ogg read failed, ending stream: {e}");
-                    self.ended = true;
-                    return;
+                    self.skip_damage(&e);
+                    continue;
                 }
             };
+            if packet.stream_serial() != self.serial {
+                continue;
+            }
+            // The stream starts over: a new first page, or page positions
+            // running backwards. That is a server restarting the stream, the
+            // new start appended to what came before, and playing on would
+            // play the track again from its beginning.
+            let absgp = packet.absgp_page();
+            if packet.first_in_stream() || (absgp != u64::MAX && absgp != 0 && absgp < self.gp) {
+                tracing::warn!("ogg stream starts over, ending it");
+                self.ended = true;
+                return;
+            }
             // Header pages carry granule position 0 (RFC 7845 section 4);
             // this also skips OpusHead/OpusTags re-read after a seek to 0.
             // Zero-length packets are legal Ogg framing but would be decoded
             // as packet loss (libopus PLC injects synthetic audio) — skip.
-            if packet.stream_serial() != self.serial
-                || packet.absgp_page() == 0
-                || packet.data.is_empty()
-            {
+            if absgp == 0 || packet.data.is_empty() {
                 continue;
             }
             self.process_packet(
@@ -335,6 +381,33 @@ impl<R: Read + Seek> OggOpusSource<R> {
                 packet.last_in_stream(),
                 packet.absgp_page(),
             );
+        }
+    }
+
+    /// A damaged stretch of the stream: a page failing its checksum, one the
+    /// Ogg layer cannot place. Drop what is buffered and pick up at the next
+    /// good page, as Symphonia does for the other formats — unless the stream
+    /// itself fails (I/O: the download gave up or was stopped) or the damage
+    /// keeps coming.
+    fn skip_damage(&mut self, e: &OggReadError) {
+        self.bad_run += 1;
+        if matches!(e, OggReadError::ReadError(_)) || self.bad_run > MAX_BAD_RUN {
+            tracing::warn!("ogg read failed, ending stream: {e}");
+            self.ended = true;
+            return;
+        }
+        if self.bad_run == 1 {
+            self.damage += 1;
+        }
+        self.packets.delete_unread_packets();
+    }
+}
+
+impl<R: Read + Seek> Drop for OggOpusSource<R> {
+    // Off the callback: finished sources go to the reaper thread.
+    fn drop(&mut self) {
+        if self.damage > 0 {
+            tracing::debug!("opus stream played over {} damaged spot(s)", self.damage);
         }
     }
 }
@@ -425,6 +498,7 @@ impl<R: Read + Seek> rodio::Source for OggOpusSource<R> {
 
         self.pcm.clear();
         self.ended = false;
+        self.bad_run = 0;
         self.emit_from = target;
         if let Err(e) = self.decoder.reset_state() {
             tracing::warn!("opus decoder reset failed after seek: {e}");
@@ -453,9 +527,15 @@ impl<R: Read + Seek> rodio::Source for OggOpusSource<R> {
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!("ogg read failed after seek, ending stream: {e}");
-                    self.ended = true;
-                    return Ok(());
+                    self.skip_damage(&e);
+                    if self.ended {
+                        return Ok(());
+                    }
+                    // What is buffered no longer runs up to the next page end:
+                    // land on the next good page instead.
+                    pending.clear();
+                    total_frames = 0;
+                    continue;
                 }
             };
             if packet.stream_serial() != self.serial
@@ -583,6 +663,115 @@ mod tests {
                 .unwrap();
         }
         writer.into_inner().into_inner()
+    }
+
+    /// Like [`make_ogg_opus`], but with a page every `per_page` packets, and
+    /// packet `bad` (if any) replaced by `data`.
+    fn make_paged_ogg_opus(per_page: usize, bad: Option<(usize, Vec<u8>)>) -> Vec<u8> {
+        let frames = SECONDS * 48_000;
+        let pcm: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let s = 0.8 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin();
+                [s, s]
+            })
+            .collect();
+        let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
+            .expect("encoder");
+        let serial = 0x4a53_4f50;
+        let mut writer = PacketWriter::new(Cursor::new(Vec::new()));
+        writer
+            .write_packet(
+                opus_head(2, PRE_SKIP, 0),
+                serial,
+                PacketWriteEndInfo::EndPage,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_packet(opus_tags(), serial, PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+        let packets = frames / FRAME;
+        for i in 0..packets {
+            let chunk = &pcm[i * FRAME * 2..(i + 1) * FRAME * 2];
+            let data = match &bad {
+                Some((at, data)) if *at == i => data.clone(),
+                _ => enc.encode_vec_float(chunk, 4000).expect("encode"),
+            };
+            let end = if i + 1 == packets {
+                PacketWriteEndInfo::EndStream
+            } else if (i + 1) % per_page == 0 {
+                PacketWriteEndInfo::EndPage
+            } else {
+                PacketWriteEndInfo::NormalPacket
+            };
+            writer
+                .write_packet(data, serial, end, ((i + 1) * FRAME) as u64)
+                .unwrap();
+        }
+        writer.into_inner().into_inner()
+    }
+
+    /// Where the Ogg pages of `bytes` start.
+    fn page_starts(bytes: &[u8]) -> Vec<usize> {
+        bytes
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"OggS")
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    const FULL: usize = (SECONDS * 48_000 - PRE_SKIP as usize) * 2;
+
+    #[test]
+    fn a_damaged_page_costs_that_page_not_the_rest_of_the_track() {
+        let mut ogg = make_paged_ogg_opus(5, None);
+        let pages = page_starts(&ogg);
+        // A flipped bit in the body of a page halfway through.
+        let page = pages[pages.len() / 2];
+        ogg[page + 40] ^= 0x10;
+        let samples: Vec<f32> = probe(Cursor::new(ogg), true).expect("probe").collect();
+        // One page of five 20 ms packets is 5 % of the track.
+        assert!(
+            samples.len() >= FULL * 9 / 10,
+            "decoded {} of ~{FULL} samples",
+            samples.len()
+        );
+    }
+
+    #[test]
+    fn an_undecodable_packet_is_concealed_not_the_end() {
+        // A two-frame packet whose payload cannot be split in two: libopus
+        // rejects it, but its length is readable.
+        let ogg = make_paged_ogg_opus(5, Some((50, vec![0xF9, 1, 2, 3])));
+        let samples: Vec<f32> = probe(Cursor::new(ogg), true).expect("probe").collect();
+        assert!(
+            samples.len().abs_diff(FULL) <= FULL / 20,
+            "decoded {} of ~{FULL} samples",
+            samples.len()
+        );
+    }
+
+    #[test]
+    fn a_stream_that_starts_over_ends_instead_of_playing_again() {
+        // What a restarted transcode appended to a broken-off one looks like:
+        // the first half of a stream, cut mid-page, then all of it again.
+        let ogg = make_paged_ogg_opus(5, None);
+        let pages = page_starts(&ogg);
+        let cut = pages[pages.len() / 2] + 30;
+        let mut spliced = ogg[..cut].to_vec();
+        spliced.extend_from_slice(&ogg);
+        let samples: Vec<f32> = probe(Cursor::new(spliced), true).expect("probe").collect();
+        assert!(
+            samples.len() <= FULL * 6 / 10,
+            "decoded {} samples, the track played again",
+            samples.len()
+        );
+        assert!(
+            samples.len() >= FULL * 4 / 10,
+            "decoded only {}",
+            samples.len()
+        );
     }
 
     #[test]

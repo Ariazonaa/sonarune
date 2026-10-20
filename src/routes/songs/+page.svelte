@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount } from "svelte";
   import { VList } from "virtua/svelte";
   import { goto } from "$app/navigation";
   import { api, formatDuration } from "#lib/api.js";
+  import { appendPage, pageWindow } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
@@ -12,10 +13,11 @@
   import BulkMetadataEditor from "#lib/components/BulkMetadataEditor.svelte";
   import NewContentPill from "#lib/components/NewContentPill.svelte";
   import { player } from "#lib/state/player.svelte.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { contextMenuKey } from "#lib/menu.js";
   import { trackMenuItems } from "#lib/trackMenu.js";
   import { startDrag } from "#lib/dragToPlaylist.js";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import type { TrackDto } from "#lib/types.js";
 
   const PAGE_SIZE = 200;
@@ -29,6 +31,12 @@
   let staleHint = $state(false);
   /** Bumped on a library refresh so an in-flight page discards itself. */
   let reloadSeq = 0;
+  /**
+   * Listed songs an edit here may have moved in the sort order, which
+   * `pageWindow` makes up for. A song leaves the set once a page brings it
+   * back.
+   */
+  const moved = new Set<string>();
 
   const hasMore = $derived(total === null || songs.length < total);
   const currentTrackId = $derived(player.state.current?.itemId);
@@ -49,14 +57,14 @@
     loading = true;
     error = null;
     try {
-      const page = await api.getSongs(songs.length, PAGE_SIZE);
+      const { start, limit } = pageWindow(songs.length, PAGE_SIZE, moved.size);
+      const page = await api.getSongs(start, limit);
       if (seq !== reloadSeq) return false; // a library refresh superseded this
-      // Items can shift between page fetches; duplicate keys would crash the
-      // keyed list.
-      const seen = new Set(songs.map((s) => s.id));
-      songs = [...songs, ...page.items.filter((i) => !seen.has(i.id))];
-      total = page.total;
-      return true;
+      for (const song of page.items) moved.delete(song.id); // where it belongs now
+      const merged = appendPage(songs, page.items, page.total, (song) => song.id);
+      songs = merged.items;
+      total = merged.total;
+      return merged.grew;
     } catch (e) {
       if (seq === reloadSeq) error = String(e);
       return false;
@@ -77,15 +85,8 @@
   }
 
   /** Play a song in its album context (Spotify behavior). */
-  async function playTrack(track: TrackDto) {
-    if (!track.albumId) return;
-    try {
-      const detail = await api.getAlbum(track.albumId);
-      const index = detail.tracks.findIndex((candidate) => candidate.id === track.id);
-      await api.playAlbum(track.albumId, Math.max(0, index));
-    } catch (e) {
-      player.error = String(e);
-    }
+  function playTrack(track: TrackDto) {
+    player.run(playInAlbum(track.id, track.albumId));
   }
 
   function onRowClick(event: MouseEvent, song: TrackDto, index: number) {
@@ -107,6 +108,7 @@
   /** Drop rows the server no longer has, without asking it again. */
   function dropTracks(ids: string[]) {
     const removed = new Set(ids);
+    for (const id of ids) moved.delete(id);
     songs = songs.filter((song) => !removed.has(song.id));
     if (total !== null) total = Math.max(0, total - ids.length);
     selected = new Set();
@@ -131,9 +133,8 @@
       x,
       y,
       items: trackMenuItems(picked.length > 1 ? picked : [song], {
-        // A song plays in its album's context here, so without an album there
-        // is nothing to play it in.
-        play: { run: () => void playTrack(song), disabled: !song.albumId },
+        // Same as double-clicking the row: play it inside its album where it has one.
+        play: { run: () => playTrack(song) },
         addToPlaylist: (tracks) => (addTo = { x, y, trackIds: tracks.map((track) => track.id) }),
         info: (track) =>
           (info = { itemId: track.id, name: track.name, playCount: track.playCount }),
@@ -151,6 +152,7 @@
   function refresh() {
     staleHint = false;
     reloadSeq++;
+    moved.clear();
     songs = [];
     total = null;
     loading = false;
@@ -161,15 +163,32 @@
   }
 
   // Reload live near the top, else offer a refresh pill (a deep scroll +
-  // selection shouldn't be yanked away). Only `library.revision` is tracked.
-  $effect(() => {
-    const rev = library.revision;
-    untrack(() => {
-      if (rev === 0) return;
-      if (!list || list.getScrollOffset() < 400) refresh();
-      else staleHint = true;
-    });
+  // selection shouldn't be yanked away).
+  onLibraryChange(() => {
+    if (!list || list.getScrollOffset() < 400) refresh();
+    else staleHint = true;
   });
+
+  /**
+   * Re-read the rows a metadata edit touched, where they are. A refresh would
+   * empty a list of thousands and send the user back to row 1; a renamed song
+   * keeps its place until the next one. `mayMove`: whether the edit can change
+   * the sort order. The single-song editor writes the title and the track and
+   * disc numbers, so it can; the bulk editor writes only artists, genres and
+   * year. Such songs count as moved before the re-read, so a page fetched
+   * meanwhile already starts early enough.
+   */
+  async function rereadTracks(ids: string[], { mayMove }: { mayMove: boolean }) {
+    if (mayMove) for (const id of ids) moved.add(id);
+    const seq = reloadSeq;
+    try {
+      const fresh = new Map((await api.getTracks(ids)).map((track) => [track.id, track]));
+      if (seq !== reloadSeq) return; // the list was replaced meanwhile
+      songs = songs.map((song) => fresh.get(song.id) ?? song);
+    } catch (e) {
+      if (seq === reloadSeq) error = String(e);
+    }
+  }
 </script>
 
 <div class="flex h-full min-h-0 flex-col p-6 pb-0">
@@ -250,8 +269,10 @@
   <SongInfo itemId={info.itemId} name={info.name} playCount={info.playCount} onclose={() => (info = null)} />
 {/if}
 {#if edit}
-  <MetadataEditor itemId={edit.itemId} displayName={edit.name} onclose={() => (edit = null)} onsaved={refresh} />
+  {@const itemId = edit.itemId}
+  <MetadataEditor itemId={edit.itemId} displayName={edit.name} onclose={() => (edit = null)} onsaved={() => rereadTracks([itemId], { mayMove: true })} />
 {/if}
 {#if bulkEdit}
-  <BulkMetadataEditor itemIds={bulkEdit} onclose={() => (bulkEdit = null)} onsaved={refresh} />
+  {@const itemIds = bulkEdit}
+  <BulkMetadataEditor itemIds={bulkEdit} onclose={() => (bulkEdit = null)} onsaved={() => rereadTracks(itemIds, { mayMove: false })} />
 {/if}

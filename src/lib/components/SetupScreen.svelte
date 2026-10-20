@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { api } from "#lib/api.js";
   import BrandMark from "#lib/components/BrandMark.svelte";
+  import { normalizeServerUrl } from "#lib/serverUrl.js";
   import { session } from "#lib/state/session.svelte.js";
   import { m } from "#lib/paraglide/messages.js";
   import type { QuickConnectSession } from "#lib/types.js";
@@ -14,17 +15,52 @@
   let error = $state<string | null>(null);
   // Set when the server presents an untrusted certificate the user must confirm.
   let pendingFingerprint = $state<string | null>(null);
+  // Where a damaged database was set aside at this start (db_recovery.rs).
+  let databaseReset = $state<string | null>(null);
 
   // Quick Connect: show a code, poll until it is approved on another device.
   let quickConnect = $state<QuickConnectSession | null>(null);
   let pollTimer: ReturnType<typeof setInterval> | undefined;
 
+  // Back here because the backend ended the session: server and account stay,
+  // only the password is missing. The event may also come in after this
+  // screen is up (a session ended during the restore), so empty fields only.
+  $effect(() => {
+    const ended = session.ended;
+    if (!ended) return;
+    untrack(() => {
+      if (!serverUrl.trim()) serverUrl = ended.serverUrl;
+      if (!username.trim()) username = ended.username;
+    });
+  });
+
+  onMount(() => {
+    api.getDatabaseRecovery().then(
+      (path) => (databaseReset = path),
+      () => {},
+    );
+  });
+
+  /** The address as `connect` takes it, written back into the field; null,
+   *  with the reason on screen, when it cannot work. */
+  function serverAddress(): string | null {
+    const url = normalizeServerUrl(serverUrl);
+    if (!url) {
+      error = m.setup_server_url_invalid();
+      return null;
+    }
+    serverUrl = url;
+    return url;
+  }
+
   async function connectWith(trustFingerprint?: string) {
-    busy = true;
     error = null;
+    const url = serverAddress();
+    if (!url) return;
+    busy = true;
     try {
       const result = await session.connect({
-        serverUrl,
+        serverUrl: url,
         username,
         password,
         acceptInvalidCerts,
@@ -53,11 +89,12 @@
 
   async function startQuickConnect() {
     if (!serverUrl.trim() || quickConnect) return;
-    busy = true;
     error = null;
     // Snapshot: edits to the form while the code screen is up must not
     // change what the poll talks to.
-    const url = serverUrl.trim();
+    const url = serverAddress();
+    if (!url) return;
+    busy = true;
     const certs = acceptInvalidCerts;
     let failures = 0;
     try {
@@ -72,6 +109,7 @@
           failures = 0;
           if (info) {
             stopQuickConnect();
+            session.ended = null;
             session.info = info;
           }
         } catch (e) {
@@ -110,11 +148,37 @@
     </div>
     <h2 class="mt-4 text-lg font-medium">{m.setup_title()}</h2>
     <p class="mb-6 text-sm text-ink-muted">{m.setup_subtitle()}</p>
+    {#if session.ended}
+      <p
+        class="mb-5 rounded-md border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-sm text-amber-200"
+        data-testid="setup-session-ended"
+      >
+        {session.ended.reason === "moved"
+          ? m.setup_session_moved({ server: session.ended.serverUrl })
+          : m.setup_session_rejected()}
+      </p>
+    {/if}
+
+    {#if databaseReset}
+      <p
+        class="mb-5 rounded-md border border-amber-700/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-200 wrap-anywhere"
+        data-testid="setup-database-reset"
+      >
+        {m.setup_database_reset({ path: databaseReset })}
+      </p>
+    {/if}
 
     <label class="mb-3 block">
       <span class="mb-1 block text-xs font-medium text-ink-muted">{m.setup_server_url()}</span>
+      <!-- Text, not type="url": the browser would refuse "10.0.0.5:8096"
+           with its own message and let "localhost:8096" through as a URL with
+           the scheme "localhost". normalizeServerUrl decides instead. -->
       <input
-        type="url"
+        type="text"
+        inputmode="url"
+        autocomplete="url"
+        autocapitalize="off"
+        spellcheck="false"
         required
         bind:value={serverUrl}
         placeholder={m.setup_server_placeholder()}

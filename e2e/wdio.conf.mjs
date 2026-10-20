@@ -105,10 +105,11 @@ export const config = {
     const build = spawnSync(
       "npm",
       // Built under its own identifier (e2e/tauri.e2e.conf.json), so a test
-      // run gets its own data directory: it cannot touch a real session, and
-      // it cannot create io.sonarune.app on a machine whose Jellysic install
-      // has not been migrated yet -- an existing directory there would stop
-      // that migration (src-tauri/src/legacy.rs).
+      // run gets its own data directory and its own Credential Manager
+      // entries (the keyring service follows the identifier): it cannot touch
+      // a real session, and it cannot create io.sonarune.app on a machine
+      // whose Jellysic install has not been migrated yet -- an existing
+      // directory there would stop that migration (src-tauri/src/legacy.rs).
       ["run", "tauri", "build", "--", "--debug", "--no-bundle", "--config", "e2e/tauri.e2e.conf.json"],
       { cwd: projectRoot, stdio: "inherit", shell: true },
     );

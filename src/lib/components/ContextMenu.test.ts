@@ -1,5 +1,6 @@
 import { flushSync, mount, tick, unmount } from "svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import ContextMenu from "#lib/components/ContextMenu.svelte";
 import Harness from "#lib/components/ContextMenu.harness.svelte";
 
 // Keyboard access to context menus, end to end through a row with
@@ -34,8 +35,8 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-function render(onpick: (label: string) => void = () => {}) {
-  instance = mount(Harness, { target: host, props: { onpick } });
+function render(onpick: (label: string) => void = () => {}, opensDialog = false) {
+  instance = mount(Harness, { target: host, props: { onpick, opensDialog } });
   flushSync();
 }
 
@@ -153,6 +154,28 @@ describe("ContextMenu keyboard access", () => {
     expect(event.defaultPrevented).toBe(false);
   });
 
+  it("opened from the keyboard, closes when the row's list scrolls, whatever lies below the row", async () => {
+    // The menu opens just below the row; below the last visible row of the
+    // page that point is on the player bar. The page's scroll must still
+    // close it rather than leave it floating while the row scrolls away.
+    const playerBar = document.createElement("div");
+    document.body.appendChild(playerBar);
+    Object.defineProperty(document, "elementFromPoint", { configurable: true, value: () => playerBar });
+    try {
+      render();
+      await openWithKeyboard();
+      playerBar.dispatchEvent(new Event("scroll"));
+      flushSync();
+      expect(menu()).not.toBeNull();
+
+      host.dispatchEvent(new Event("scroll"));
+      flushSync();
+      expect(menu()).toBeNull();
+    } finally {
+      delete (document as { elementFromPoint?: unknown }).elementFromPoint;
+    }
+  });
+
   it("opened with the pointer, focuses the menu itself so ArrowUp starts from the bottom", async () => {
     render();
     row().focus(); // the WebView focuses a pressed button
@@ -178,6 +201,39 @@ describe("ContextMenu keyboard access", () => {
     expect(document.activeElement).not.toBe(row());
   });
 
+  it("hands focus to a dialog an item opens, and back to the row when it closes", async () => {
+    // The menu returns focus to the row as it closes; a dialog opened by the
+    // item in the same update must still end up with it — otherwise Space or
+    // Enter would play the row behind the backdrop.
+    render(() => {}, true);
+    await openWithKeyboard();
+    press("Enter");
+    expect(menu()).toBeNull();
+    expect(document.activeElement).toBe(document.getElementById("dialog"));
+
+    document.getElementById("dialog-close")!.click();
+    flushSync();
+    expect(document.getElementById("dialog")).toBeNull();
+    expect(document.activeElement).toBe(row());
+  });
+
+  it("lets the button that opened it close it again", async () => {
+    render();
+    const more = document.getElementById("more")!;
+    more.click();
+    flushSync();
+    await settle();
+    expect(menu()).not.toBeNull();
+    // A press on the trigger is not "outside": its click toggles instead of
+    // the press closing the menu and the click opening it again.
+    more.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    flushSync();
+    expect(menu()).not.toBeNull();
+    more.click();
+    flushSync();
+    expect(menu()).toBeNull();
+  });
+
   it("keeps its keys away from page handlers and global shortcuts", async () => {
     render();
     await openWithKeyboard();
@@ -191,5 +247,31 @@ describe("ContextMenu keyboard access", () => {
       window.removeEventListener("keydown", shortcut);
     }
     expect(shortcut).not.toHaveBeenCalled();
+  });
+});
+
+describe("ContextMenu items", () => {
+  it("renders items whose labels repeat", () => {
+    // One "Go to artist" entry per credit: a name credited twice gives two
+    // equal labels, which as keys made Svelte throw and no menu open at all.
+    const action = vi.fn();
+    instance = mount(ContextMenu, {
+      target: host,
+      props: {
+        x: 10,
+        y: 10,
+        items: [
+          { label: "Go to artist: Foo", action },
+          { label: "Go to artist: Bar", action },
+          { label: "Go to artist: Foo", action },
+        ],
+        onclose: () => {},
+      },
+    });
+    flushSync();
+    const labels = Array.from(menu()?.querySelectorAll('[role="menuitem"]') ?? []).map((item) =>
+      item.textContent?.trim(),
+    );
+    expect(labels).toEqual(["Go to artist: Foo", "Go to artist: Bar", "Go to artist: Foo"]);
   });
 });

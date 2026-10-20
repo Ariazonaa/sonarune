@@ -8,6 +8,7 @@ mod commands_library;
 mod commands_metadata;
 mod commands_sonic;
 mod commands_visualizer;
+mod db_recovery;
 mod desktop;
 mod diagnostics;
 mod download;
@@ -20,9 +21,11 @@ mod proto;
 mod sonic;
 mod sonic_scan;
 mod store;
+mod system_proxy;
 mod tls;
 mod tray;
 mod updater;
+mod webview_drop;
 mod webview_power;
 
 use library_watch::LibraryWatchHandle;
@@ -47,22 +50,49 @@ pub struct AppState {
     /// AuthenticateByName` with a password the server no longer accepts, which
     /// can trip Jellyfin's brute-force lockout on the user's own account.
     pub relogin_blocked: Arc<std::sync::atomic::AtomicBool>,
+    /// Tells the UI when the backend ends a session on its own
+    /// (`session:ended`), e.g. after the server refused the stored password.
+    pub session_notice: commands::SessionNotice,
+    /// Serializes restoring the stored session: Rust does it at startup, and
+    /// every window asks again (`commands::restore_stored_session`).
+    pub restore_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Let the player flush its final "stopped" report and ListenBrainz listen,
-/// and cancel in-flight downloads. Every path out of the process goes through
-/// this: quitting, and the updater handing over to the installer, which kills
-/// us just as abruptly.
+/// cancel in-flight downloads and take the tray icon down. Every way out
+/// through the event loop comes here: quitting, and a Windows shutdown,
+/// restart or sign-out, which ends the loop without any close request (the
+/// `RunEvent::Exit` handler at the end of [`run`]). Handing over to the
+/// installer does the same, but undoably, because that launch can fail and
+/// leave the process running (`updater::hand_over`).
+///
+/// Runs once. Quitting raises `Exit` afterwards too, and a second `Shutdown`
+/// could reach the player thread while it is still letting go of the audio
+/// device — it would then wait out the whole timeout for nothing.
 pub fn flush_before_exit(app: &tauri::AppHandle) {
-    if let Some(state) = app.try_state::<AppState>() {
-        state
-            .player
-            .shutdown(std::time::Duration::from_millis(2500));
-    }
-    if let Some(downloads) = app.try_state::<download::DownloadManager>() {
-        downloads.cancel_all();
-    }
+    static FLUSHED: std::sync::Once = std::sync::Once::new();
+    FLUSHED.call_once(|| {
+        if let Some(state) = app.try_state::<AppState>() {
+            state
+                .player
+                .shutdown(std::time::Duration::from_millis(2500));
+        }
+        if let Some(downloads) = app.try_state::<download::DownloadManager>() {
+            downloads.cancel_all();
+        }
+        tray::set_icon_visible(app, false);
+    });
 }
+
+/// What the window-state plugin keeps: size, position and maximized only.
+/// Crucially NOT decorations: the window is frameless by config
+/// (decorations:false), and a saved state from an older decorated build would
+/// otherwise restore the native Windows title bar on top of our custom one.
+/// The updater saves with the same flags (`updater::hand_over`).
+pub(crate) const WINDOW_STATE_FLAGS: tauri_plugin_window_state::StateFlags =
+    tauri_plugin_window_state::StateFlags::SIZE
+        .union(tauri_plugin_window_state::StateFlags::POSITION)
+        .union(tauri_plugin_window_state::StateFlags::MAXIMIZED);
 
 /// Shut the app down in order: flush, then let the process (and with it the
 /// async runtime) go away.
@@ -78,7 +108,10 @@ pub fn run() {
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,sonarune_lib=debug".into()),
+                // The OS certificate verifier logs every certificate it
+                // rejects as an error — for a pinned self-signed server that
+                // is every connection, and tls.rs accepts them anyway.
+                .unwrap_or_else(|_| "info,sonarune_lib=debug,rustls_platform_verifier=off".into()),
         )
         .init();
 
@@ -88,6 +121,8 @@ pub fn run() {
     if !cfg!(debug_assertions) {
         legacy::migrate_data_dirs(&context.config().identifier);
     }
+    // The credentials follow the identifier as well, before anything reads them.
+    commands::init_keyring_service(&context.config().identifier);
 
     tauri::Builder::default()
         // A second launch (e.g. while closed to the tray) must not start a
@@ -102,18 +137,45 @@ pub fn run() {
         // are our own commands, so no window can reach the plugin's own.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
-            // Persist size/position/maximized only. Crucially NOT decorations:
-            // the window is frameless by config (decorations:false), and a saved
-            // state from an older decorated build would otherwise restore the
-            // native Windows title bar on top of our custom one.
             tauri_plugin_window_state::Builder::default()
-                .with_state_flags(
-                    tauri_plugin_window_state::StateFlags::SIZE
-                        | tauri_plugin_window_state::StateFlags::POSITION
-                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
-                )
+                .with_state_flags(WINDOW_STATE_FLAGS)
+                // The visualizer's projector panel opens the projector on the
+                // monitor picked there; a restored geometry would move it back
+                // onto the one it was last closed on.
+                .with_denylist(&["projector"])
+                // The mini player has one fixed size and cannot be resized: a
+                // size saved on a monitor with other scaling (or by an older
+                // build) would crop it for good. It only gets its position
+                // back, from the plugin below.
+                .skip_initial_state("mini")
                 .build(),
         )
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("mini-position")
+                .on_window_ready(|window| {
+                    if window.label() == "mini" {
+                        use tauri_plugin_window_state::{StateFlags, WindowExt};
+                        let _ = window.restore_state(StateFlags::POSITION);
+                    }
+                })
+                .build(),
+        )
+        // HTML5 drag and drop needs WebView2's own drop target (see
+        // webview_drop.rs).
+        .plugin(webview_drop::init())
+        .on_page_load(|webview, payload| {
+            // A reload (F5 and Ctrl+R stay live in WebView2) or a navigation
+            // starts a new document without the old one's teardown running.
+            // Its visualizer subscriptions would stay registered — the channel
+            // never reports the dead consumer back — and keep the audio tap
+            // sending into a page that knows none of them, and the window
+            // from being suspended, for the rest of the session.
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                if let Some(state) = webview.try_state::<AppState>() {
+                    state.player.tap().unsubscribe_window(webview.label());
+                }
+            }
+        })
         .on_window_event(|window, event| {
             // Any window going away releases its visualizer subscription. The
             // frontend's unsubscribe does not survive the WebView teardown,
@@ -150,8 +212,16 @@ pub fn run() {
         })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            let store = Arc::new(Store::open(&data_dir)?);
-            commands::migrate_legacy_credentials(&store);
+            // Not `?`: Tauri panics on a setup error, and the app would vanish
+            // without a word on every start (db_recovery).
+            let (store, recovery) = db_recovery::open(&data_dir);
+            let store = Arc::new(store);
+            app.manage(recovery);
+            // Same rule as for the data directories: only the real app's
+            // release build takes over what the old name left behind.
+            if !cfg!(debug_assertions) && app.config().identifier == legacy::IDENTIFIER {
+                commands::migrate_legacy_credentials(&store);
+            }
             let session: SharedSession = Arc::new(tokio::sync::RwLock::new(None));
             let desktop_settings = desktop::load(&store);
             let downloads_dir = app
@@ -198,6 +268,21 @@ pub fn run() {
                 sonic_scan,
                 relogin_gate: Arc::new(tokio::sync::Mutex::new(())),
                 relogin_blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                session_notice: commands::SessionNotice::new(app.handle().clone()),
+                restore_gate: Arc::new(tokio::sync::Mutex::new(())),
+            });
+
+            // Restore the session here rather than waiting for the page: with
+            // "start minimized" the WebView is suspended right below, maybe
+            // before its script ever runs, and the tray, the media keys, the
+            // library watch and the sonic scan need a session regardless. The
+            // window's own restore then gets this one back.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                if let Err(e) = commands::restore_stored_session(&state).await {
+                    tracing::warn!("restoring the session at startup failed: {e}");
+                }
             });
             tray::setup(app.handle())?;
 
@@ -212,10 +297,10 @@ pub fn run() {
             // Bring last session's queue back (paused) so the app never starts
             // with an empty player after a restart.
             let state = app.state::<AppState>();
-            if let Some((tracks, index)) = player::load_persisted_queue(&state.store) {
+            if let Some(queue) = player::load_persisted_queue(&state.store) {
                 let _ = state
                     .player
-                    .send(player::PlayerCommand::RestoreQueue { tracks, index });
+                    .send(player::PlayerCommand::RestoreQueue(queue));
             }
             Ok(())
         })
@@ -227,11 +312,13 @@ pub fn run() {
             commands::disconnect,
             commands::list_trusted_certificates,
             commands::forget_trusted_certificate,
+            commands::trust_session_certificate,
             commands::get_albums,
             commands::get_album,
             commands::get_artists,
             commands::get_artist,
             commands::get_songs,
+            commands::get_tracks,
             commands::get_track_info,
             commands_metadata::get_item_metadata,
             commands_metadata::update_item_metadata,
@@ -243,6 +330,7 @@ pub fn run() {
             commands::clear_finished_downloads,
             commands::open_downloads_folder,
             commands::play_album,
+            commands::play_track_in_album,
             commands::enqueue_album,
             commands::enqueue_tracks,
             commands::search,
@@ -270,6 +358,7 @@ pub fn run() {
             commands::get_playback_settings,
             commands::set_playback_settings,
             commands::list_audio_devices,
+            commands::restore_output_device,
             commands::get_desktop_settings,
             commands::set_desktop_settings,
             commands::set_tray_labels,
@@ -293,6 +382,7 @@ pub fn run() {
             commands::queue_move,
             commands::get_lyrics,
             commands_discover::get_genres,
+            commands_discover::get_genres_by_id,
             commands_discover::letter_index,
             commands_discover::get_similar_artists,
             commands_discover::get_discover,
@@ -322,6 +412,7 @@ pub fn run() {
             commands_library::playlist_add,
             commands_library::playlist_remove,
             commands_library::playlist_move,
+            commands_library::remove_playlist_duplicates,
             commands_library::transfer_playlist_entries,
             commands_library::play_playlist,
             commands_library::set_favorite,
@@ -343,11 +434,20 @@ pub fn run() {
             commands_library::get_favorite_artists,
             commands::check_library_now,
             commands::check_server,
+            db_recovery::get_database_recovery,
             updater::check_for_update,
+            updater::get_known_update,
             updater::install_update,
         ])
-        .run(context)
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // A Windows shutdown, restart or sign-out ends the event loop
+            // without a close request; this is all that still runs then.
+            if let tauri::RunEvent::Exit = event {
+                flush_before_exit(app);
+            }
+        });
 }
 
 #[cfg(test)]
@@ -444,6 +544,23 @@ mod acl_tests {
             assert!(!permissions
                 .iter()
                 .any(|p| p == "core:webview:allow-create-webview-window"));
+        }
+        // The secondary windows get core permissions one by one. A default
+        // set would also hand code running there (the projector runs preset
+        // code) the tray, native menus and more it never calls.
+        for permission in mini_permissions.iter().chain(&projector_permissions) {
+            assert!(
+                !(permission.ends_with(":default")
+                    || permission.starts_with("core:tray:")
+                    || permission.starts_with("core:menu:")),
+                "{permission} grants a secondary window more than it uses"
+            );
+            // Nor may they emit: an event from a webview reaches every
+            // window, and the main window acts on some (`session:ended`).
+            assert!(
+                !permission.starts_with("core:event:allow-emit"),
+                "{permission} lets a secondary window speak for the backend"
+            );
         }
     }
 }

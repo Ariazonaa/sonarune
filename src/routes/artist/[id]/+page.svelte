@@ -1,14 +1,18 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { page } from "$app/state";
   import { api, formatDuration } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import CoverBackdrop from "#lib/components/CoverBackdrop.svelte";
   import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
+  import { library } from "#lib/state/library.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
   import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
   import { contextMenuKey } from "#lib/menu.js";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import { swrGet, swrSet, swrDelete } from "#lib/swr.js";
+  import { apiLibrary } from "#lib/api/library.js";
   import type { AlbumDto, ArtistDetail, ArtistDto, TrackDto } from "#lib/types.js";
 
   const am = createAlbumMenu();
@@ -21,18 +25,8 @@
   const artistId = $derived(page.params.id!);
 
   // Play a top song in its album context (Spotify behavior).
-  async function playTopSong(track: TrackDto) {
-    if (!track.albumId) {
-      player.run(api.enqueueTracks([track.id], false));
-      return;
-    }
-    try {
-      const album = await api.getAlbum(track.albumId);
-      const index = album.tracks.findIndex((t) => t.id === track.id);
-      await api.playAlbum(track.albumId, Math.max(0, index));
-    } catch (e) {
-      player.error = String(e);
-    }
+  function playTopSong(track: TrackDto) {
+    player.run(playInAlbum(track.id, track.albumId));
   }
 
   $effect(() => {
@@ -69,7 +63,44 @@
       .catch(() => {});
   });
 
+  // Nothing to show after a failed load (server down, artist not cached): try
+  // again when the library is poked — the offline banner's Retry and the
+  // recovery after an outage do that (net.svelte.ts).
+  $effect(() => {
+    void library.revision;
+    untrack(() => {
+      if (!error || detail) return;
+      const id = artistId;
+      api
+        .getArtist(id)
+        .then((d) => {
+          swrSet(`artist:${id}`, d);
+          if (id !== page.params.id) return;
+          detail = d;
+          error = null;
+        })
+        .catch(() => {});
+    });
+  });
+
   const albumCount = $derived(detail?.albums.length ?? 0);
+
+  // Heart-shaped SVG paths (filled / outline), as on the album page.
+  const HEART_ON =
+    "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z";
+  const HEART_OFF =
+    "M16.5 3c-1.74 0-3.41.81-4.5 2.09C10.91 3.81 9.24 3 7.5 3 4.42 3 2 5.42 2 8.5c0 3.78 3.4 6.86 8.55 11.54L12 21.35l1.45-1.32C18.6 15.36 22 12.28 22 8.5 22 5.42 19.58 3 16.5 3zm-4.4 15.55l-.1.1-.1-.1C7.14 14.24 4 11.39 4 8.5 4 6.5 5.5 5 7.5 5c1.54 0 3.04.99 3.57 2.36h1.87C13.46 5.99 14.96 5 16.5 5c2 0 3.5 1.5 3.5 3.5 0 2.89-3.14 5.74-7.9 10.05z";
+
+  // Optimistic like the album heart: flip locally, revert if the server refuses.
+  function toggleFavorite() {
+    const d = detail;
+    if (!d) return;
+    const next = !d.artist.isFavorite;
+    d.artist.isFavorite = next;
+    apiLibrary.setFavorite(d.artist.id, next).catch(() => {
+      d.artist.isFavorite = !next;
+    });
+  }
 </script>
 
 {#snippet albumGrid(albums: AlbumDto[])}
@@ -143,6 +174,19 @@
               <path d="M12 2C6.48 2 2 6.48 2 12v8a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-8c0-5.52-4.48-10-10-10zm0 3a7 7 0 0 1 6.32 4H5.68A7 7 0 0 1 12 5zm0 13a3 3 0 1 1 0-6 3 3 0 0 1 0 6z" />
             </svg>
             {m.artist_radio()}
+          </button>
+          <button
+            class="rounded-full p-1.5 transition-colors {detail.artist.isFavorite
+              ? 'text-accent hover:text-accent-hover'
+              : 'text-ink-muted hover:text-ink'}"
+            onclick={toggleFavorite}
+            aria-pressed={detail.artist.isFavorite}
+            aria-label={detail.artist.isFavorite ? m.favorite_remove() : m.favorite_add()}
+            title={detail.artist.isFavorite ? m.favorite_remove() : m.favorite_add()}
+          >
+            <svg viewBox="0 0 24 24" class="h-6 w-6" fill="currentColor" aria-hidden="true">
+              <path d={detail.artist.isFavorite ? HEART_ON : HEART_OFF} />
+            </svg>
           </button>
           <p class="text-sm font-medium text-ink-muted">
             {(albumCount === 1 ? m.artist_albums_one : m.artist_albums_many)({ count: albumCount })}

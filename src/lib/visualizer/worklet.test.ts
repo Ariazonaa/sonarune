@@ -32,6 +32,29 @@ function render(feed: Feed, frames: number, channels = 2): Float32Array[] {
   return out;
 }
 
+/** Plays like the audio thread, in small render quanta; the left channel. */
+function play(feed: Feed, frames: number, quantum = 8): number[] {
+  const heard: number[] = [];
+  for (let done = 0; done < frames; done += quantum) {
+    heard.push(...render(feed, Math.min(quantum, frames - done))[0]);
+  }
+  return heard;
+}
+
+/** Chunks of frames numbered from 1 (left n, right -n): 0 only means silence. */
+function numberedChunks() {
+  let next = 1;
+  return (frames: number) => {
+    const data = new Float32Array(frames * 2);
+    for (let f = 0; f < frames; f++) {
+      data[2 * f] = next;
+      data[2 * f + 1] = -next;
+      next += 1;
+    }
+    return data;
+  };
+}
+
 describe("visualizer worklet", () => {
   it("puts left on channel 0 and right on channel 1", () => {
     const feed = new Processor();
@@ -58,16 +81,91 @@ describe("visualizer worklet", () => {
 
   it("skips ahead when the producer runs far ahead, keeping the pairs intact", () => {
     const feed = new Processor();
-    // 1 s of frames at a 1 kHz "sample rate": far beyond 3x the 100 ms target.
-    const burst = new Float32Array(2 * SAMPLE_RATE);
-    for (let f = 0; f < SAMPLE_RATE; f++) {
-      burst[2 * f] = f;
-      burst[2 * f + 1] = -f;
+    const chunk = numberedChunks();
+    // 1 s of 50 ms chunks at once at a 1 kHz "sample rate": far beyond 3x the
+    // 100 ms target. (Every message is one chunk, and a chunk is never cut.)
+    for (let i = 0; i < SAMPLE_RATE / 50; i++) feed.push(chunk(50));
+    const [l, r] = render(feed, 300);
+    const played = [...l].filter((frame) => frame !== 0);
+    // No more than the 300 ms clamp is left, the newest frames, and right
+    // still mirrors left.
+    expect(played[0]).toBeGreaterThan(SAMPLE_RATE - 300);
+    expect(played.at(-1)).toBe(SAMPLE_RATE);
+    for (let i = 0; i < played.length; i++) expect(r[i]).toBe(-l[i]);
+  });
+
+  // Slow playback of a low-rate track: a tap chunk (2048 frames) of an 8 kHz
+  // track lasts 341 ms at 0.75x and 512 ms at 0.5x. 400 ms is past the burst
+  // clamp, 800 ms past the backlog window.
+  it.each([400, 800])("plays %i ms chunks whole and back to back", (CHUNK) => {
+    const feed = new Processor();
+    const chunk = numberedChunks();
+    const heard: number[] = [];
+    // Delivered at exactly the pace they are played: each chunk arrives as
+    // the one before has played out.
+    for (let i = 0; i < 12; i++) {
+      feed.push(chunk(CHUNK));
+      heard.push(...play(feed, CHUNK));
     }
-    feed.push(burst);
-    const [l, r] = render(feed, 100);
-    // Only the newest ~100 ms is left, and right still mirrors left.
-    expect(l[0]).toBeGreaterThanOrEqual(SAMPLE_RATE - 100);
-    for (let i = 0; i < l.length; i++) expect(r[i]).toBe(-l[i]);
+    // Every frame, in order: no silence, nothing dropped.
+    expect(heard.filter((frame) => frame === 0)).toHaveLength(0);
+    expect(heard.at(-1)).toBe(12 * CHUNK);
+  });
+
+  it("cuts a burst of long chunks back to the newest one, whole", () => {
+    const feed = new Processor();
+    const chunk = numberedChunks();
+    const CHUNK = 400;
+    // A stall held three chunks back; they arrive at once.
+    for (let i = 0; i < 3; i++) feed.push(chunk(CHUNK));
+    const heard = play(feed, CHUNK);
+    expect(heard[0]).toBe(2 * CHUNK + 1);
+    expect(heard.at(-1)).toBe(3 * CHUNK);
+    // And on at the chunks' own pace, without a gap.
+    for (let i = 0; i < 3; i++) {
+      feed.push(chunk(CHUNK));
+      heard.push(...play(feed, CHUNK));
+    }
+    expect(heard.filter((frame) => frame === 0)).toHaveLength(0);
+    expect(heard.at(-1)).toBe(6 * CHUNK);
+  });
+
+  it("drops the backlog a stall left behind instead of lagging for good", () => {
+    const feed = new Processor();
+    const CHUNK = 43; // ~one tap frame
+    let next = 1; // frame numbers: 0 only ever means silence
+    const chunk = () => {
+      const data = new Float32Array(CHUNK * 2);
+      for (let f = 0; f < CHUNK; f++) {
+        data[2 * f] = next;
+        data[2 * f + 1] = -next;
+        next += 1;
+      }
+      return data;
+    };
+    const play = (frames: number) => render(feed, frames)[0];
+
+    for (let i = 0; i < 10; i++) {
+      feed.push(chunk());
+      play(CHUNK);
+    }
+    // The main thread stalls for 215 ms (a preset switch): the worklet runs
+    // dry, then the queued chunks arrive at once — less than the hard trim.
+    play(215);
+    for (let i = 0; i < 5; i++) feed.push(chunk());
+
+    // Steady delivery again, at exactly the rate it is played.
+    let silent = 0;
+    let last = 0;
+    for (let i = 0; i < 40; i++) {
+      feed.push(chunk());
+      const out = play(CHUNK);
+      silent += out.filter((sample) => sample === 0).length;
+      last = out[out.length - 1];
+    }
+    // The output trails the newest frame by the jitter margin, not by the
+    // stall, and the trim never ran it dry.
+    expect(next - 1 - last).toBeLessThan(100);
+    expect(silent).toBe(0);
   });
 });

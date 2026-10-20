@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod dsp;
 pub mod fade;
+mod limiter;
 pub mod opus;
 mod scrobble;
 pub mod source;
@@ -10,6 +11,7 @@ pub mod timbre;
 pub mod waveform;
 
 use crate::api::JellyfinClient;
+use crate::audio_devices::OutputDevice;
 use crate::error::{AppError, AppResult};
 use crate::store::{keys, Store};
 use dsp::AudioDsp;
@@ -31,10 +33,21 @@ const TICK: Duration = Duration::from_millis(400);
 /// How long to wait between attempts to open the audio output at startup when
 /// no device is available yet.
 const OUTPUT_RETRY_DELAY: Duration = Duration::from_secs(3);
+/// A stream that ran this long before it failed gets its own device back
+/// first, before the fallback to the default (see `handle_output_failed`).
+const OUTPUT_SETTLED: Duration = Duration::from_secs(10);
+/// How often "system default" looks whether the default device changed.
+const DEFAULT_OUTPUT_POLL: Duration = Duration::from_secs(2);
+/// A new default that did not open is tried again after this long, up to
+/// `DEFAULT_OUTPUT_ATTEMPTS` times in all: Bluetooth headphones become the
+/// default a moment before they can play.
+const DEFAULT_OUTPUT_RETRY: Duration = Duration::from_secs(5);
+const DEFAULT_OUTPUT_ATTEMPTS: u32 = 4;
 /// Upper bound on commands buffered while the audio output is unavailable.
 const DEFERRED_COMMAND_LIMIT: usize = 256;
-/// Report playback progress to the server roughly every 10 s (25 ticks).
-const REPORT_EVERY_TICKS: u32 = 25;
+/// Report playback progress to the server this often — on the clock, not in
+/// ticks: a planned transition can wake the loop early.
+const REPORT_EVERY: Duration = Duration::from_secs(10);
 /// Start opening the next track's stream this long before the current ends.
 const PREFETCH_OPEN_REMAINING_MS: u64 = 20_000;
 /// With beat transitions: earlier, so the next track is downloaded and
@@ -52,6 +65,10 @@ const PLAN_LATE_MS: u64 = 30;
 const APPEND_REMAINING_MS: u64 = 3_000;
 /// Pause/resume gain ramp length.
 const PAUSE_FADE_MS: u64 = 150;
+/// A player taken off the output (skip, stop, reopen) ramps to silence over
+/// this long before it is dropped; dropping it while it plays cuts the
+/// waveform off mid-swing.
+const RELEASE_FADE_MS: u64 = 50;
 
 /// User-facing playback behavior (persisted as one JSON blob).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -69,8 +86,15 @@ pub struct PlaybackSettings {
     pub crossfade_mode: CrossfadeMode,
     /// 1..=12 s, clamped on use.
     pub crossfade_seconds: f32,
-    /// None = system default output device.
+    /// None = system default output device. Otherwise the device id
+    /// (`OutputDevice::id`); builds before 0.6.1 stored cpal's bare endpoint
+    /// name here, which is still found and replaced by the id once that
+    /// device opens.
     pub output_device: Option<String>,
+    /// The chosen device's name as last seen, for Settings and the toasts
+    /// while the device is away, and to find it when Windows lists it under
+    /// a new id (see `resolve_output`).
+    pub output_device_name: Option<String>,
     /// Land crossfades on the beat: the next track starts so that its first
     /// beat falls on a beat of the current one (see `analysis.rs`). Only
     /// where a crossfade happens anyway and both tracks have a beat grid.
@@ -83,17 +107,20 @@ impl Default for PlaybackSettings {
             crossfade_mode: CrossfadeMode::Off,
             crossfade_seconds: 6.0,
             output_device: None,
+            output_device_name: None,
             beat_transitions: false,
         }
     }
 }
 
 /// Optional integrations, consumed by the player worker (persisted as JSON).
+///
+/// A seed this build does not know (written by a newer one) reads as the
+/// track seed, which is what every seed falls back to anyway: an unknown
+/// value must not cost the whole settings blob or the persisted queue.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AutoDjSeedMode {
-    #[default]
-    Track,
     Artist,
     Genre,
     Album,
@@ -102,6 +129,10 @@ pub enum AutoDjSeedMode {
     /// the last few tracks, ordered to flow. Falls back to a track mix from
     /// the server while too little of the library is analysed.
     Sonic,
+    /// Last only because serde wants the stand-in for unknown values there.
+    #[default]
+    #[serde(other)]
+    Track,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,11 +170,85 @@ impl Default for ExtrasSettings {
     }
 }
 
+/// Where the store keeps the sound seed: 0.6.0 has none and throws the whole
+/// extras blob away over a seed it does not know, so it is written as the
+/// track seed it falls back to, plus this flag only newer builds read.
+const STORED_BY_SOUND: &str = "autoDjBySound";
+
+impl ExtrasSettings {
+    /// The settings as the store keeps them (`keys::EXTRAS`). The UI gets
+    /// them as they are; only the stored form spells the sound seed so that
+    /// an older build still reads the rest.
+    pub fn to_stored_json(&self) -> serde_json::Result<String> {
+        let mut value = serde_json::to_value(self)?;
+        if self.auto_dj_seed_mode == AutoDjSeedMode::Sonic {
+            value["autoDjSeedMode"] = serde_json::to_value(AutoDjSeedMode::Track)?;
+            value[STORED_BY_SOUND] = serde_json::Value::Bool(true);
+        }
+        serde_json::to_string(&value)
+    }
+
+    /// Read what [`Self::to_stored_json`] wrote — or an older build did.
+    pub fn from_stored_json(json: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let by_sound = value
+            .get(STORED_BY_SOUND)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut settings: Self = serde_json::from_value(value).ok()?;
+        if by_sound && settings.auto_dj_seed_mode == AutoDjSeedMode::Track {
+            settings.auto_dj_seed_mode = AutoDjSeedMode::Sonic;
+        }
+        Some(settings)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(from = "AutoDjReasonWire", into = "AutoDjReasonWire")]
 pub struct AutoDjReason {
     pub kind: AutoDjSeedMode,
     pub label: String,
+}
+
+/// How a reason is written, in the persisted queue and to the UI alike. 0.6.0
+/// reads the stored queue with a closed list of seeds and loses all of it over
+/// one it does not know, so the sound seed goes out as the track seed it falls
+/// back to, flagged `bySound`.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoDjReasonWire {
+    kind: AutoDjSeedMode,
+    label: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    by_sound: bool,
+}
+
+impl From<AutoDjReasonWire> for AutoDjReason {
+    fn from(wire: AutoDjReasonWire) -> Self {
+        Self {
+            kind: if wire.by_sound {
+                AutoDjSeedMode::Sonic
+            } else {
+                wire.kind
+            },
+            label: wire.label,
+        }
+    }
+}
+
+impl From<AutoDjReason> for AutoDjReasonWire {
+    fn from(reason: AutoDjReason) -> Self {
+        let by_sound = reason.kind == AutoDjSeedMode::Sonic;
+        Self {
+            kind: if by_sound {
+                AutoDjSeedMode::Track
+            } else {
+                reason.kind
+            },
+            label: reason.label,
+            by_sound,
+        }
+    }
 }
 
 /// One entry in the play queue. Everything the player and the UI need to show
@@ -156,6 +261,10 @@ pub struct QueueTrack {
     pub artist: String,
     pub album: String,
     pub album_id: Option<String>,
+    /// The album's artist as the track is tagged, for the play history.
+    /// `None` in queues from older builds.
+    #[serde(default)]
+    pub album_artist: Option<String>,
     #[serde(default)]
     pub track_number: Option<i32>,
     #[serde(default)]
@@ -235,13 +344,15 @@ fn is_album_sequence(current: &QueueTrack, next: &QueueTrack) -> bool {
         return false;
     }
 
-    match (
-        current.disc_number,
-        current.track_number,
-        next.disc_number,
-        next.track_number,
-    ) {
-        (Some(disc), Some(track), Some(next_disc), Some(next_track)) => {
+    // A missing disc number is disc 1, as everywhere else (album shuffle, the
+    // album page): Jellyfin leaves it empty for files without a disc tag,
+    // which is common for single-disc rips.
+    let (disc, next_disc) = (
+        current.disc_number.unwrap_or(1),
+        next.disc_number.unwrap_or(1),
+    );
+    match (current.track_number, next.track_number) {
+        (Some(track), Some(next_track)) => {
             // checked_add so a hostile/corrupt item with track/disc == i32::MAX
             // can't overflow (debug panic / release wrap).
             (next_disc == disc && track.checked_add(1) == Some(next_track))
@@ -256,16 +367,22 @@ fn is_album_sequence(current: &QueueTrack, next: &QueueTrack) -> bool {
 /// (`busy`), and not already appended to the sink. The gapless hand-off takes
 /// the prefetched source, which leaves both slots empty until the transition —
 /// opening the track again there would start a second stream (or transcode)
-/// that is thrown away at the boundary.
+/// that is thrown away at the boundary. A next track whose prefetch already
+/// failed (`failed`) is not tried again every tick either: the boundary opens
+/// it as a plain Play, and that is the retry.
 fn should_start_prefetch(
     busy: bool,
     appended: Option<&str>,
+    failed: Option<&str>,
     next_id: &str,
     duration_ms: u64,
     remaining_ms: u64,
     window_ms: u64,
 ) -> bool {
-    !busy && appended != Some(next_id) && (duration_ms == 0 || remaining_ms <= window_ms)
+    !busy
+        && appended != Some(next_id)
+        && failed != Some(next_id)
+        && (duration_ms == 0 || remaining_ms <= window_ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -321,37 +438,153 @@ fn album_gain_from_queue(queue: &[QueueTrack], album_id: &str) -> Option<f32> {
     })
 }
 
-/// Does an armed stop fire at this boundary?
+/// One queue line as a command names it: by its entry id, which tells two
+/// copies of the same track apart, and by its item id for a line persisted
+/// before entry ids existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryRef {
+    pub entry_id: String,
+    pub item_id: String,
+}
+
+impl EntryRef {
+    fn of(track: &QueueTrack) -> Self {
+        Self {
+            entry_id: track.entry_id.clone(),
+            item_id: track.item_id.clone(),
+        }
+    }
+
+    fn matches(&self, track: &QueueTrack) -> bool {
+        if self.entry_id.is_empty() || track.entry_id.is_empty() {
+            track.item_id == self.item_id
+        } else {
+            track.entry_id == self.entry_id
+        }
+    }
+}
+
+/// The entries an album stop armed on `armed` covers, in play order: from
+/// `armed` to the last track of the album's run it sits in.
 ///
-/// `finished` is the track that just ended, `next` the one that would follow —
-/// `None` when the queue is out. An album ends where the next track belongs to
-/// a different one, which is also how a single-track album behaves.
+/// A run is the album's entries back to back in play order, split where the
+/// album starts over: a track the run already had begins the next copy. The
+/// split is counted from where the album's entries begin, so a stop armed in
+/// the middle of the first copy ends with that copy, not in the second one.
+/// The run never wraps around, so the album has a last track under Repeat
+/// All too. An entry without an album covers itself only.
+fn album_run(tracks: &[QueueTrack], order: &[usize], armed: usize) -> Vec<usize> {
+    let alone = vec![armed];
+    let Some(album) = tracks
+        .get(armed)
+        .and_then(|track| track.album_id.as_deref())
+        .filter(|id| !id.is_empty())
+    else {
+        return alone;
+    };
+    let len = if order.is_empty() {
+        tracks.len()
+    } else {
+        order.len()
+    };
+    let at = |position: usize| {
+        if order.is_empty() {
+            position
+        } else {
+            order[position]
+        }
+    };
+    let Some(armed_at) = (0..len).find(|&position| at(position) == armed) else {
+        return alone;
+    };
+    let of_album = |index: usize| {
+        tracks
+            .get(index)
+            .is_some_and(|track| track.album_id.as_deref() == Some(album))
+    };
+    let mut first = armed_at;
+    while first > 0 && of_album(at(first - 1)) {
+        first -= 1;
+    }
+    let mut had = std::collections::HashSet::new();
+    let mut last = armed_at;
+    for position in first..len {
+        let index = at(position);
+        if !of_album(index) {
+            break;
+        }
+        if !had.insert(tracks[index].item_id.as_str()) {
+            // The album starts over here: after the armed entry, that is
+            // where its run ended; before it, the armed one's run starts.
+            if position > armed_at {
+                break;
+            }
+            had.clear();
+            had.insert(tracks[index].item_id.as_str());
+        }
+        last = position.max(armed_at);
+    }
+    (armed_at..=last).map(at).collect()
+}
+
+/// Does an armed stop fire when `finished` ends?
+///
+/// `at` is the entry the stop was resolved to: the row itself for a track,
+/// the last entry of the album's run for an album (see [`album_run`] and
+/// [`stop_entry`]) — the row the queue marks, where the music ends.
+/// Repeat-One keeps restarting the entry that plays, so there the album ends
+/// with whichever of its tracks that is.
 ///
 /// Free function, and deliberately so: this is the whole rule, and it is worth
 /// testing without a player thread around it.
 fn stop_after_due(
     mode: StopAfter,
-    armed_item: Option<&str>,
+    at: Option<&EntryRef>,
     armed_album: Option<&str>,
     finished: &QueueTrack,
-    next: Option<&QueueTrack>,
+    repeat_one: bool,
 ) -> bool {
     match mode {
         StopAfter::Off => false,
-        StopAfter::Track => armed_item == Some(finished.item_id.as_str()),
+        StopAfter::Track => at.is_some_and(|at| at.matches(finished)),
         StopAfter::Album => {
             // No album, no album end. The command refuses to arm this, and the
             // rule refuses to fire on it: a loose track has no last track.
             let Some(armed_album) = armed_album else {
                 return false;
             };
-            // Armed on an album the player has since left: nothing to end.
-            if finished.album_id.as_deref() != Some(armed_album) {
-                return false;
+            if repeat_one {
+                return finished.album_id.as_deref() == Some(armed_album);
             }
-            next.is_none_or(|track| track.album_id.as_deref() != Some(armed_album))
+            at.is_some_and(|at| at.matches(finished))
         }
     }
+}
+
+/// The entry an armed stop ends after once the queue changed: the last entry
+/// of the ones it was armed over (`run`, in play order) that is still queued.
+/// The album's last track removed, the album ends one track earlier; put
+/// back by an undo, it ends there again. `None` when none is left: then
+/// there is nothing to stop after.
+fn stop_entry<'a>(run: &'a [EntryRef], queue: &[QueueTrack]) -> Option<&'a EntryRef> {
+    let queued = |entry: &EntryRef| queue.iter().any(|track| entry.matches(track));
+    let (end, rest) = run.split_last()?;
+    if queued(end) {
+        return Some(end);
+    }
+    // Searching further is rare (the end was removed) and can meet a
+    // replaced queue of thousands: look the entry ids up once. An entry
+    // without one goes by its item, as `EntryRef::matches` does.
+    let ids: std::collections::HashSet<&str> =
+        queue.iter().map(|track| track.entry_id.as_str()).collect();
+    let by_item = ids.contains("");
+    rest.iter().rev().find(|entry| {
+        if entry.entry_id.is_empty() || by_item {
+            queued(entry)
+        } else {
+            ids.contains(entry.entry_id.as_str())
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -433,6 +666,40 @@ fn order_prev(len: usize, index: usize, order: &[usize], repeat_all: bool) -> Op
     }
 }
 
+/// Where the queue pointer goes when the current entry `removed` leaves the
+/// queue: on to its successor in play order, or with none back to its
+/// predecessor — as an index after the removal, and `true` when it is the
+/// successor (only there may playback go on). `None` when the queue is empty
+/// then. Whatever slot the removal leaves the pointer on can sit anywhere in a
+/// shuffle order, with everything before it counting as played.
+fn landing_after_removal(
+    len: usize,
+    removed: usize,
+    order: &[usize],
+    repeat_all: bool,
+) -> Option<(usize, bool)> {
+    let shifted = |index: usize| if index > removed { index - 1 } else { index };
+    let other = |index: &usize| *index != removed;
+    if let Some(next) = order_next(len, removed, order, repeat_all).filter(other) {
+        return Some((shifted(next), true));
+    }
+    order_prev(len, removed, order, repeat_all)
+        .filter(other)
+        .map(|previous| (shifted(previous), false))
+}
+
+/// Whether the music goes on with the successor when the current entry is
+/// removed: when it was playing, or loading to play. A load with a pause
+/// waiting for it (Pause pressed while it loaded, a seek made while paused)
+/// was paused, and the successor stays put like after a paused track.
+fn plays_on_after_removal(status: PlaybackStatus, pending_pause: bool) -> bool {
+    match status {
+        PlaybackStatus::Playing => true,
+        PlaybackStatus::Loading => !pending_pause,
+        PlaybackStatus::Paused | PlaybackStatus::Idle => false,
+    }
+}
+
 /// Remap a physical queue index through a move (remove `from`, insert at `to`).
 fn remap_move(v: usize, from: usize, to: usize) -> usize {
     if v == from {
@@ -479,6 +746,32 @@ fn played_indices(len: usize, current: usize, order: &[usize]) -> Vec<usize> {
         }
     }
     (0..current).collect()
+}
+
+/// How many tracks [`played_indices`] lists, without listing them: the count
+/// goes with every track change, the list only with a cleanup.
+fn played_count(len: usize, current: usize, order: &[usize]) -> usize {
+    if len == 0 || current >= len {
+        return 0;
+    }
+    if !order.is_empty() {
+        if let Some(position) = order.iter().position(|&index| index == current) {
+            return order[..position]
+                .iter()
+                .filter(|&&index| index < len)
+                .count();
+        }
+    }
+    current
+}
+
+/// How many entries [`duplicate_indices`] removes. Which copy stays does not
+/// change how many go, so this follows the track list alone, not the current
+/// track.
+fn duplicate_count(tracks: &[QueueTrack]) -> usize {
+    let distinct: std::collections::HashSet<&str> =
+        tracks.iter().map(|track| track.item_id.as_str()).collect();
+    tracks.len() - distinct.len()
 }
 
 /// Duplicate occurrences to remove. The current occurrence wins over an
@@ -532,25 +825,38 @@ fn shuffle_slice<T>(values: &mut [T], state: &mut u64) {
 /// The current track's block comes first and starts at the current track; the
 /// album's earlier tracks follow the end of the block, so they still play.
 /// Tracks without an album id deliberately form singleton blocks.
+///
+/// An album queued twice is two blocks, one per copy, not one block that
+/// plays every track twice in a row: the n-th time a track of an album shows
+/// up, it belongs to that album's n-th block.
 fn build_album_shuffle_order(tracks: &[QueueTrack], current: usize, seed: u64) -> Vec<usize> {
     if tracks.is_empty() || current >= tracks.len() {
         return Vec::new();
     }
-    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: std::collections::HashMap<(&str, usize), usize> =
+        std::collections::HashMap::new();
+    let mut copies: std::collections::HashMap<(&str, &str), usize> =
+        std::collections::HashMap::new();
     for (index, track) in tracks.iter().enumerate() {
-        let key = track
-            .album_id
-            .as_ref()
-            .filter(|id| !id.is_empty())
-            .cloned()
-            .unwrap_or_else(|| format!("__track_{index}"));
-        if let Some((_, indices)) = groups.iter_mut().find(|(group, _)| group == &key) {
-            indices.push(index);
-        } else {
-            groups.push((key, vec![index]));
-        }
+        let group = match track.album_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(album) => {
+                let copy = copies.entry((album, track.item_id.as_str())).or_insert(0);
+                let key = (album, *copy);
+                *copy += 1;
+                *group_of.entry(key).or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                })
+            }
+            None => {
+                groups.push(Vec::new());
+                groups.len() - 1
+            }
+        };
+        groups[group].push(index);
     }
-    for (_, indices) in &mut groups {
+    for indices in &mut groups {
         indices.sort_by_key(|&index| {
             let track = &tracks[index];
             (
@@ -562,23 +868,38 @@ fn build_album_shuffle_order(tracks: &[QueueTrack], current: usize, seed: u64) -
     }
     let current_group = groups
         .iter()
-        .position(|(_, indices)| indices.contains(&current))
+        .position(|indices| indices.contains(&current))
         .unwrap_or(0);
     groups.swap(0, current_group);
     // Started mid-album: continue the album, then wrap to its start. Tracks
     // before the current one in play order would never play with repeat off
     // (and count as played).
-    if let Some(at) = groups[0].1.iter().position(|&index| index == current) {
-        groups[0].1.rotate_left(at);
+    if let Some(at) = groups[0].iter().position(|&index| index == current) {
+        groups[0].rotate_left(at);
     }
     let mut state = seed | 1;
     if groups.len() > 2 {
         shuffle_slice(&mut groups[1..], &mut state);
     }
-    groups
-        .into_iter()
-        .flat_map(|(_, indices)| indices)
-        .collect()
+    groups.into_iter().flatten().collect()
+}
+
+/// The shuffle order a restored queue was playing in, if it still fits: built
+/// for the shuffle mode that is on now, and a permutation of the queue's
+/// indices. Otherwise `None`, and a fresh order is built.
+fn restored_order(
+    saved: Option<PersistedOrder>,
+    mode: ShuffleMode,
+    len: usize,
+) -> Option<Vec<usize>> {
+    let saved = saved.filter(|saved| saved.mode == mode && mode != ShuffleMode::Off)?;
+    let mut seen = vec![false; len];
+    for &index in &saved.order {
+        if index >= len || std::mem::replace(&mut seen[index], true) {
+            return None;
+        }
+    }
+    (saved.order.len() == len).then_some(saved.order)
 }
 
 fn choose_auto_dj_seed(track: &QueueTrack, requested: AutoDjSeedMode) -> (String, AutoDjReason) {
@@ -617,10 +938,32 @@ fn choose_auto_dj_seed(track: &QueueTrack, requested: AutoDjSeedMode) -> (String
     (id, AutoDjReason { kind, label })
 }
 
+/// What of a fetched Auto-DJ mix may be appended: nothing already queued or
+/// just heard, by item (`existing`) or by recording (`heard`), and no more
+/// than `max` tracks.
+fn fresh_mix(
+    tracks: Vec<crate::api::types::TrackDto>,
+    existing: &std::collections::HashSet<String>,
+    heard: &crate::commands_sonic::Recordings,
+    max: usize,
+) -> Vec<crate::api::types::TrackDto> {
+    let unknown = tracks
+        .into_iter()
+        .filter(|track| !existing.contains(&track.id))
+        .collect();
+    let mut fresh = crate::commands_sonic::without_copies_of(unknown, heard);
+    fresh.truncate(max);
+    fresh
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerState {
     pub status: PlaybackStatus,
+    /// Only while loading: the source arrives paused — Pause was pressed
+    /// during the load, or a paused track is being reopened. Play/Pause shows
+    /// what the arrival will do, not the load itself.
+    pub pending_pause: bool,
     pub current: Option<QueueTrack>,
     pub index: usize,
     pub queue_len: usize,
@@ -634,7 +977,10 @@ pub struct PlayerState {
     /// (0 while waiting for the end of the current track).
     pub sleep_remaining_ms: Option<u64>,
     pub stop_after: StopAfter,
-    /// The queue entry the stop is armed on, so the list can mark the row.
+    /// The queue entry the music stops after, so the list can mark the row:
+    /// the armed row for a track, the last row of its album for an album.
+    /// Its entry id, and its item id for a line from before entry ids.
+    pub stop_after_entry: Option<String>,
     pub stop_after_item: Option<String>,
     /// Downloaded part of the current track as `[start, end]` in ms, for the
     /// seek bar. Estimated from bytes, so approximate for variable bitrates;
@@ -649,6 +995,7 @@ impl Default for PlayerState {
     fn default() -> Self {
         Self {
             status: PlaybackStatus::Idle,
+            pending_pause: false,
             current: None,
             index: 0,
             queue_len: 0,
@@ -660,11 +1007,37 @@ impl Default for PlayerState {
             repeat: RepeatMode::Off,
             sleep_remaining_ms: None,
             stop_after: StopAfter::Off,
+            stop_after_entry: None,
             stop_after_item: None,
             buffered_ms: None,
             speed: 1.0,
             preserve_pitch: true,
         }
+    }
+}
+
+/// Whether the source being loaded arrives paused: Pause pressed while it
+/// loads, or a paused track reopened. Only a load can; once a source is in,
+/// the status says it, and a flag left over from an open that failed means
+/// nothing.
+fn arrives_paused(status: PlaybackStatus, pending_pause: bool) -> bool {
+    status == PlaybackStatus::Loading && pending_pause
+}
+
+/// What the system media overlay (SMTC) shows. A load shows what its arrival
+/// will do, as the window's Play/Pause button does.
+fn media_playback(
+    status: PlaybackStatus,
+    pending_pause: bool,
+    position: Duration,
+) -> souvlaki::MediaPlayback {
+    let progress = Some(souvlaki::MediaPosition(position));
+    if status == PlaybackStatus::Idle {
+        souvlaki::MediaPlayback::Stopped
+    } else if status == PlaybackStatus::Paused || arrives_paused(status, pending_pause) {
+        souvlaki::MediaPlayback::Paused { progress }
+    } else {
+        souvlaki::MediaPlayback::Playing { progress }
     }
 }
 
@@ -683,9 +1056,41 @@ fn buffered_range_ms(fraction: Option<(f64, f64)>, duration_ms: u64) -> Option<(
     Some((at(start), at(end)))
 }
 
+/// How far short of its length a track must stop to count as broken off.
+const BROKE_OFF_SHORT_MS: u64 = 5_000;
+
+/// Whether a track that ran out at `stopped_at_ms` broke off rather than
+/// played through: a decoder ends on any read error, so a stream that broke
+/// off looks like a natural end otherwise. `download` is the source's
+/// downloaded range ([`DownloadProgress::fraction`]).
+///
+/// It takes both a stop clearly short of the track and a download that has
+/// not reached the end. The download alone proves nothing: a reopen at a
+/// position fetches from there to the end first and fills in the part before
+/// it only then, so a track reopened near its end plays out while that fill
+/// still runs. A short stop alone proves nothing either: a damaged frame also
+/// ends a decoder, with the whole file on disk. A live transcode has no
+/// length to tell by and never counts as broken off.
+fn stream_broke_off(stopped_at_ms: u64, duration_ms: u64, download: Option<(f64, f64)>) -> bool {
+    duration_ms > 0
+        && stopped_at_ms.saturating_add(BROKE_OFF_SHORT_MS) < duration_ms
+        && download.is_some_and(|(_, end)| end < 1.0)
+}
+
+/// `player:stream-broke-off` — the track stopped early because its stream
+/// broke off (`Worker::handle_track_end`). The UI words the message.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamBrokeOffEvent<'a> {
+    name: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueSnapshot {
+    /// Names this track list and order; a [`QueuePosition`] applies to the
+    /// snapshot with the same revision only.
+    pub revision: u64,
     pub tracks: Vec<QueueTrack>,
     pub index: usize,
     /// Shuffle play order as indices into `tracks`; empty while shuffle is
@@ -697,17 +1102,32 @@ pub struct QueueSnapshot {
     pub duplicate_count: usize,
 }
 
+/// `player:queue-index`: the queue moved on, the track list did not. Sent in
+/// place of the whole [`QueueSnapshot`] on a track change — a played smart
+/// view holds thousands of entries, and every window would get all of them
+/// again with every track.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuePosition {
+    pub revision: u64,
+    pub index: usize,
+    pub can_undo: bool,
+    pub played_count: usize,
+    pub duplicate_count: usize,
+}
+
 pub enum PlayerCommand {
-    /// Replace queue and start playing at `start_index`.
+    /// Replace queue and start playing at `start_index` (sent through
+    /// [`PlayerHandle::play_queue`], which drops a request overtaken by a
+    /// newer one).
     PlayQueue {
         tracks: Vec<QueueTrack>,
         start_index: usize,
+        /// Play it in exactly this order, also while shuffle is on.
+        in_order: bool,
     },
     /// Load a queue without starting playback (session restore).
-    RestoreQueue {
-        tracks: Vec<QueueTrack>,
-        index: usize,
-    },
+    RestoreQueue(RestoredQueue),
     /// Insert right after the current track.
     PlayNext(Vec<QueueTrack>),
     /// Append to the end of the queue.
@@ -715,8 +1135,9 @@ pub enum PlayerCommand {
     RemoveAt {
         index: usize,
         /// Identity check against stale UI indices (e.g. double-click on the
-        /// remove button must not delete the track that slid into the slot).
-        item_id: String,
+        /// remove button must not delete the track that slid into the slot,
+        /// even when that is another copy of the same track).
+        entry: EntryRef,
     },
     JumpTo(usize),
     MoveTrack {
@@ -758,7 +1179,24 @@ pub enum PlayerCommand {
     SetVolume {
         volume: f32,
     },
-    SetPlaybackSettings(PlaybackSettings),
+    /// `reply` gets the settings the worker ended up with: an output device
+    /// that does not open is refused, and the previous one stays.
+    SetPlaybackSettings {
+        settings: PlaybackSettings,
+        reply: Option<mpsc::SyncSender<PlaybackSettings>>,
+    },
+    /// Go back from a fallback to the configured output device (Settings'
+    /// "switch back"); `ack` once it was tried.
+    RestoreOutput {
+        ack: mpsc::SyncSender<()>,
+    },
+    /// A settings import wrote the volume (`Some`), the EQ/normalization
+    /// (already live) and maybe the per-device profiles: settle them on the
+    /// device playing now.
+    SoundImported {
+        volume: Option<f32>,
+        profiles: bool,
+    },
     SetSpeed(tempo::SpeedSetting),
     SetExtrasSettings(ExtrasSettings),
     /// None clears the timer; `end_of_track` pauses at the next boundary
@@ -769,11 +1207,11 @@ pub enum PlayerCommand {
         fade_seconds: u32,
     },
     /// Arm (or clear, with `StopAfter::Off`) a stop at the end of a track or
-    /// of its album. `item_id` names the queue entry; `None` means whatever is
+    /// of its album. `entry` names the queue entry; `None` means whatever is
     /// playing now.
     SetStopAfter {
         mode: StopAfter,
-        item_id: Option<String>,
+        entry: Option<EntryRef>,
     },
     /// The active output stream died (device unplugged); sent by the cpal
     /// error callback, never by the UI.
@@ -826,6 +1264,44 @@ struct PersistedQueue {
     /// which restore at their own `index`.
     #[serde(default)]
     snapshot_id: Option<String>,
+    /// The shuffle order the list was playing in. Without it every start
+    /// would shuffle anew: what was heard would come round again, and "play
+    /// next" would land anywhere. Absent while shuffle is off and in
+    /// snapshots from older builds. Read leniently: an order a later build
+    /// wrote for a shuffle mode this one does not know is dropped (shuffled
+    /// anew), and the tracks still come back.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "unless_unreadable"
+    )]
+    order: Option<PersistedOrder>,
+}
+
+/// An optional part of a stored blob, or `None` where it does not read: what
+/// a later build adds to it must not cost the whole blob.
+fn unless_unreadable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// A shuffle order and the mode it was built for (`ShuffleMode::Tracks`
+/// orders differ from album blocks): restored only under that same mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedOrder {
+    mode: ShuffleMode,
+    order: Vec<usize>,
+}
+
+/// A queue read back from the store, for [`PlayerCommand::RestoreQueue`].
+pub struct RestoredQueue {
+    tracks: Vec<QueueTrack>,
+    index: usize,
+    order: Option<PersistedOrder>,
 }
 
 /// The queue index, saved apart from the track list (`keys::QUEUE_INDEX`): it
@@ -897,6 +1373,62 @@ struct QueueUndo {
     status: PlaybackStatus,
 }
 
+/// A track that was just heard, kept out of the next Auto-DJ mixes: by item,
+/// and by recording, so another file of it stays out too — also once a
+/// "remove played" has taken it out of the queue.
+struct RecentTrack {
+    item_id: String,
+    artist: String,
+    name: String,
+    duration_ms: u64,
+}
+
+impl RecentTrack {
+    fn of(track: &QueueTrack) -> Self {
+        Self {
+            item_id: track.item_id.clone(),
+            artist: track.artist.clone(),
+            name: track.name.clone(),
+            duration_ms: track.duration_ms,
+        }
+    }
+}
+
+/// Pause before an Auto-DJ seed whose mix came back with nothing (a failure,
+/// or nothing that is not queued or heard already) may ask again, and how
+/// often it may ask: the answer rarely changes from one tick to the next, and
+/// the last 30 s of a track hold 75 of them.
+const AUTO_DJ_RETRY_AFTER: Duration = Duration::from_secs(10);
+const AUTO_DJ_ATTEMPTS: u32 = 3;
+
+struct AutoDjRetry {
+    seed: String,
+    attempts: u32,
+    not_before: Instant,
+}
+
+impl AutoDjRetry {
+    /// Whether `seed` has to wait (or has asked often enough) at `now`.
+    fn holds(&self, seed: &str, now: Instant) -> bool {
+        self.seed == seed && (self.attempts >= AUTO_DJ_ATTEMPTS || now < self.not_before)
+    }
+}
+
+/// How long the final report on quit or sign-out may wait for each server:
+/// the callers wait no longer (2.5 s on quit, 2 s on sign-out), and a server
+/// that does not answer must not hold the player for the client's whole
+/// timeout.
+const FINAL_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The final report of the track that was playing, taken while it still
+/// played (`Worker::take_final_report`).
+struct FinalReport {
+    track: QueueTrack,
+    position_ms: u64,
+    listen: scrobble::Listen,
+    session_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct PlayerHandle {
     tx: Sender<PlayerCommand>,
@@ -906,6 +1438,75 @@ pub struct PlayerHandle {
     tap: Arc<tap::VisualizerTap>,
     waveforms: Arc<waveform::WaveformCache>,
     analyses: Arc<analysis::AnalysisCache>,
+    /// Requests to replace the queue, numbered as they are made, and the
+    /// additions waiting behind them (see [`PlayerHandle::play_ticket`]).
+    play_requests: Arc<PlayRequests>,
+    /// Held by a request that adds to the queue while it fetches (see
+    /// [`PlayerHandle::enqueue_turn`]).
+    enqueue_turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// One request to replace the queue, numbered when it was made. Dropped
+/// without having replaced the queue (a failed fetch, a refusal), it gives
+/// way: an older request still fetching may then play after all.
+pub struct PlayTicket {
+    number: u64,
+    requests: Arc<PlayRequests>,
+}
+
+impl Drop for PlayTicket {
+    fn drop(&mut self) {
+        self.requests.settle(self.number);
+    }
+}
+
+/// Which requests to replace the queue are still fetching, and which one
+/// replaced it last.
+struct PlayRequests {
+    book: Mutex<PlayBook>,
+    /// Bumped whenever a request settles, to wake whoever waits for one.
+    settled: tokio::sync::watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct PlayBook {
+    /// Tickets handed out so far; the newest has this number.
+    issued: u64,
+    /// Requests still fetching: neither sent nor given up.
+    pending: std::collections::BTreeSet<u64>,
+    /// The newest request that replaced the queue.
+    sent: u64,
+}
+
+impl Default for PlayRequests {
+    fn default() -> Self {
+        Self {
+            book: Mutex::default(),
+            settled: tokio::sync::watch::Sender::new(0),
+        }
+    }
+}
+
+impl PlayRequests {
+    /// `number` no longer fetches: whoever waits on it looks again.
+    fn settle(&self, number: u64) {
+        let was_pending = self.book.lock().unwrap().pending.remove(&number);
+        if was_pending {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        self.settled
+            .send_modify(|settled| *settled = settled.wrapping_add(1));
+    }
+}
+
+/// A request's turn to add to the queue (see [`PlayerHandle::enqueue_turn`]).
+pub struct EnqueueTurn {
+    _turn: tokio::sync::OwnedMutexGuard<()>,
+    /// The newest play request made before the addition was asked for.
+    after: u64,
 }
 
 /// `player:analysis` — tempo and key of one track, once analysed.
@@ -947,6 +1548,130 @@ impl PlayerHandle {
             .map_err(|_| AppError::Audio("player thread is gone".into()))
     }
 
+    /// A ticket for a request that replaces the queue once it has fetched its
+    /// tracks. Taken before the fetch: what plays is what was asked for last,
+    /// not whichever fetch happens to come back last.
+    pub fn play_ticket(&self) -> PlayTicket {
+        let mut book = self.play_requests.book.lock().unwrap();
+        book.issued += 1;
+        let number = book.issued;
+        book.pending.insert(number);
+        PlayTicket {
+            number,
+            requests: self.play_requests.clone(),
+        }
+    }
+
+    /// Replace the queue with `tracks` and play from `start_index` — unless a
+    /// newer request has replaced it already: then this one has been
+    /// overtaken and is dropped. See [`Self::replace_queue`].
+    pub async fn play_queue(
+        &self,
+        ticket: PlayTicket,
+        tracks: Vec<QueueTrack>,
+        start_index: usize,
+    ) -> AppResult<()> {
+        self.replace_queue(ticket, tracks, start_index, false).await
+    }
+
+    /// Like [`Self::play_queue`], from the first track, in exactly this order
+    /// even while shuffle is on: a sonic radio or path, where the order is
+    /// what was asked for.
+    pub async fn play_in_order(
+        &self,
+        ticket: PlayTicket,
+        tracks: Vec<QueueTrack>,
+    ) -> AppResult<()> {
+        self.replace_queue(ticket, tracks, 0, true).await
+    }
+
+    /// While a newer request is still fetching, this one waits for it: if
+    /// that one replaces the queue, this one is overtaken; if it fails or is
+    /// refused, this one plays after all — what plays is the last request
+    /// that could.
+    async fn replace_queue(
+        &self,
+        ticket: PlayTicket,
+        tracks: Vec<QueueTrack>,
+        start_index: usize,
+        in_order: bool,
+    ) -> AppResult<()> {
+        let mut settled = self.play_requests.settled.subscribe();
+        loop {
+            {
+                let mut book = self.play_requests.book.lock().unwrap();
+                if book.sent > ticket.number {
+                    drop(book);
+                    tracing::debug!("play request overtaken by a newer one; dropped");
+                    return Ok(());
+                }
+                if book.pending.range(ticket.number + 1..).next().is_none() {
+                    // Sent under the lock: nothing newer can look and send
+                    // in between, and land before this one.
+                    book.sent = ticket.number;
+                    book.pending.remove(&ticket.number);
+                    let sent = self.send(PlayerCommand::PlayQueue {
+                        tracks,
+                        start_index,
+                        in_order,
+                    });
+                    drop(book);
+                    self.play_requests.wake();
+                    return sent;
+                }
+            }
+            if settled.changed().await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Wait for the turn to add to the queue, and hold it while fetching what
+    /// to add: two additions land in the order they were asked for, also when
+    /// the first one's fetch is the slower one. Taken first thing, so the
+    /// plays asked for before the addition are known (see [`Self::enqueue`]).
+    pub async fn enqueue_turn(&self) -> EnqueueTurn {
+        // Before waiting for the turn: a play asked for while an earlier
+        // addition still fetches came after this one.
+        let after = self.play_requests.book.lock().unwrap().issued;
+        EnqueueTurn {
+            _turn: self.enqueue_turn.clone().lock_owned().await,
+            after,
+        }
+    }
+
+    /// Add `tracks` right after the current track (`next`) or at the end,
+    /// once every play request made before the addition was asked for has
+    /// replaced the queue or given up: a slower play asked for first would
+    /// otherwise replace the queue right after, and take the addition along.
+    pub async fn enqueue(
+        &self,
+        turn: EnqueueTurn,
+        tracks: Vec<QueueTrack>,
+        next: bool,
+    ) -> AppResult<()> {
+        let mut settled = self.play_requests.settled.subscribe();
+        loop {
+            {
+                let book = self.play_requests.book.lock().unwrap();
+                if book.pending.range(..=turn.after).next().is_none() {
+                    // Under the lock, like a play: the two land in the order
+                    // they were decided.
+                    let sent = self.send(if next {
+                        PlayerCommand::PlayNext(tracks)
+                    } else {
+                        PlayerCommand::PlayLast(tracks)
+                    });
+                    drop(book);
+                    return sent;
+                }
+            }
+            if settled.changed().await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
     /// Ask the worker to flush its final playback report, then wait (bounded)
     /// for it. Called on the quit paths before `app.exit(0)`; a timeout just
     /// means we stop waiting, never that the app fails to close.
@@ -970,6 +1695,36 @@ impl PlayerHandle {
         if done.recv_timeout(timeout).is_err() {
             tracing::warn!("player did not confirm the stop report in time");
         }
+    }
+
+    /// Apply playback settings and wait (bounded) for the ones the worker
+    /// ended up with, so Settings shows what really applies. Blocking — call
+    /// it off the async runtime.
+    pub fn set_playback_settings(
+        &self,
+        settings: PlaybackSettings,
+        timeout: Duration,
+    ) -> AppResult<PlaybackSettings> {
+        let (reply, effective) = mpsc::sync_channel(1);
+        self.send(PlayerCommand::SetPlaybackSettings {
+            settings: settings.clone(),
+            reply: Some(reply),
+        })?;
+        // A worker still waiting for any output at all applies them later;
+        // until then they are what was asked for.
+        Ok(effective.recv_timeout(timeout).unwrap_or(settings))
+    }
+
+    /// Switch back from a fallback to the configured output device and wait
+    /// (bounded) until it was tried. Blocking — call it off the async
+    /// runtime.
+    pub fn restore_output(&self, timeout: Duration) -> AppResult<()> {
+        let (ack, done) = mpsc::sync_channel(1);
+        self.send(PlayerCommand::RestoreOutput { ack })?;
+        if done.recv_timeout(timeout).is_err() {
+            tracing::warn!("player did not get back to the configured output in time");
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> PlayerState {
@@ -1001,6 +1756,189 @@ impl PlayerHandle {
     }
 }
 
+/// A command that asks for sound: what a missing output device has to answer
+/// with an error, or the user is left clicking Play at nothing.
+fn asks_for_playback(cmd: &PlayerCommand) -> bool {
+    matches!(
+        cmd,
+        PlayerCommand::PlayQueue { .. }
+            | PlayerCommand::Play
+            | PlayerCommand::Toggle
+            | PlayerCommand::JumpTo(_)
+            | PlayerCommand::Next
+            | PlayerCommand::Prev
+    )
+}
+
+/// The queue and what plays from it: everything a new queue replaces.
+fn acts_on_queue(cmd: &PlayerCommand) -> bool {
+    matches!(
+        cmd,
+        PlayerCommand::PlayQueue { .. }
+            | PlayerCommand::RestoreQueue { .. }
+            | PlayerCommand::ResetQueue
+            | PlayerCommand::PlayNext(_)
+            | PlayerCommand::PlayLast(_)
+            | PlayerCommand::RemoveAt { .. }
+            | PlayerCommand::JumpTo(_)
+            | PlayerCommand::MoveTrack { .. }
+            | PlayerCommand::ClearQueue
+            | PlayerCommand::RemovePlayed
+            | PlayerCommand::RemoveDuplicates
+            | PlayerCommand::UndoQueue
+            | PlayerCommand::Play
+            | PlayerCommand::Pause
+            | PlayerCommand::Toggle
+            | PlayerCommand::Next
+            | PlayerCommand::Prev
+            | PlayerCommand::Seek { .. }
+            | PlayerCommand::Stop
+    )
+}
+
+/// Keep a command that arrived while there is no output, for when one opens.
+///
+/// Bounded, but not at the cost of what matters. A volume or speed drag sends
+/// one command per input event, so each keeps only its latest value. A new
+/// queue (a play, the session restore, a sign-out's reset) makes the queue
+/// edits and transport commands before it moot, so those go — and the new
+/// queue itself is never what falls off the end: a lost reset would replay
+/// the previous account's queue for the next one.
+fn defer_command(deferred: &mut Vec<PlayerCommand>, cmd: PlayerCommand) {
+    use std::mem::discriminant;
+    let replaces_queue = matches!(
+        cmd,
+        PlayerCommand::PlayQueue { .. }
+            | PlayerCommand::RestoreQueue { .. }
+            | PlayerCommand::ResetQueue
+    );
+    if matches!(
+        cmd,
+        PlayerCommand::SetVolume { .. } | PlayerCommand::SetSpeed(_)
+    ) {
+        deferred.retain(|earlier| discriminant(earlier) != discriminant(&cmd));
+    } else if replaces_queue {
+        deferred.retain(|earlier| !acts_on_queue(earlier));
+    }
+    if replaces_queue || deferred.len() < DEFERRED_COMMAND_LIMIT {
+        deferred.push(cmd);
+    }
+}
+
+/// When the worker loop ticks: every [`TICK`] on the clock, whatever arrives
+/// in between, or earlier when a planned transition asks for it. Restarting
+/// the wait on every command would let a stream of them — a volume drag sends
+/// one per input event, a held key one per repeat — starve everything that
+/// runs on the tick: the crossfade start, the gapless append, the sleep timer,
+/// progress reports.
+struct TickClock {
+    next: Instant,
+}
+
+impl TickClock {
+    fn new(now: Instant) -> Self {
+        Self { next: now + TICK }
+    }
+
+    /// The moment to wake up at: the next tick, or `early` from `now` when
+    /// that comes first ([`Worker::next_wake`]).
+    fn wake_at(&self, now: Instant, early: Duration) -> Instant {
+        self.next.min(now + early)
+    }
+
+    /// Woken at `now`, by a command or by the timeout: whether to tick, the
+    /// wake-up moment having come. The tick after it is a full interval away.
+    fn tick_due(&mut self, now: Instant, wake_at: Instant) -> bool {
+        let due = now >= wake_at;
+        if due {
+            self.next = now + TICK;
+        }
+        due
+    }
+}
+
+/// A new player on the output at `volume`, filled by `fill` — and paused, if
+/// asked — before it joins the mixer. The mixer sets up its format conversion
+/// from what the player reports at that moment, and an empty player reports a
+/// placeholder (one channel at 48 kHz) that the first 512 samples of the real
+/// source would be converted as: a garbled blip at every start, and a beat
+/// transition landing late. Paused before it joins, it cannot sound for a
+/// moment before the pause takes either.
+fn start_player(
+    mixer: &rodio::mixer::Mixer,
+    volume: f32,
+    paused: bool,
+    fill: impl FnOnce(&rodio::Player),
+) -> rodio::Player {
+    let (player, output) = rodio::Player::new();
+    player.set_volume(volume);
+    fill(&player);
+    if paused {
+        player.pause();
+    }
+    mixer.add(output);
+    player
+}
+
+/// The sleep fade's gain with `remaining` left until silence, for a fade
+/// `fade` long; None while it has not started yet.
+fn sleep_level(remaining: Duration, fade: Duration) -> Option<f32> {
+    (remaining <= fade).then(|| {
+        let full = fade.as_secs_f32();
+        if full > 0.0 {
+            (remaining.as_secs_f32() / full).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    })
+}
+
+/// What the sleep fade does to the playing source (`Worker::update_sleep_fade`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SleepFadeStep {
+    /// Leave the gain alone.
+    Keep,
+    /// Ramp to the fade's level by the time a resume's ramp would be done.
+    Rise { to: f32, over: Duration },
+    /// Ramp from wherever the gain is down to silence.
+    Fall { over: Duration },
+}
+
+/// The sleep fade's next step for the playing source. `armed`: the source
+/// carries the fade already. `resume_left`: a resume ramps the gain back up
+/// to the fade's level, done in this long (zero: done by now). `ramp`: where
+/// the fade stands, [`Worker::sleep_ramp`] — None outside it.
+///
+/// A fade handle runs one ramp at a time, so the fade waits for a resume's
+/// ramp and takes over from its end. When it was re-timed meanwhile (a seek,
+/// a timer or speed change took the mark), the gain rises to the new level
+/// instead, by the same moment — rather than swelling to full volume.
+fn sleep_fade_step(
+    armed: bool,
+    resume_left: Option<Duration>,
+    ramp: Option<(f32, Duration)>,
+) -> SleepFadeStep {
+    let Some((level, rest)) = ramp else {
+        return SleepFadeStep::Keep;
+    };
+    match resume_left {
+        Some(left) if !left.is_zero() => {
+            if armed {
+                SleepFadeStep::Keep
+            } else {
+                SleepFadeStep::Rise {
+                    to: level,
+                    over: left,
+                }
+            }
+        }
+        // The resume's ramp is done: the fade takes over from its end.
+        Some(_) => SleepFadeStep::Fall { over: rest },
+        None if armed => SleepFadeStep::Keep,
+        None => SleepFadeStep::Fall { over: rest },
+    }
+}
+
 /// Spawn the player thread. It owns the audio output for the whole app
 /// lifetime; the WebView never touches audio.
 pub fn spawn(
@@ -1013,6 +1951,7 @@ pub fn spawn(
     let (tx, rx) = mpsc::channel::<PlayerCommand>();
     let shared_state = Arc::new(Mutex::new(PlayerState::default()));
     let shared_queue = Arc::new(Mutex::new(QueueSnapshot {
+        revision: 0,
         tracks: Vec::new(),
         index: 0,
         order: Vec::new(),
@@ -1036,6 +1975,8 @@ pub fn spawn(
         tap: visualizer_tap.clone(),
         waveforms: waveforms.clone(),
         analyses: analyses.clone(),
+        play_requests: Arc::default(),
+        enqueue_turn: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     std::thread::Builder::new()
@@ -1050,9 +1991,10 @@ pub fn spawn(
             // Commands that arrive before the output exists are kept, not
             // dropped: `lib.rs` sends exactly one `RestoreQueue` right after
             // spawn, so discarding it would silently lose the user's queue
-            // whenever the audio device is late.
+            // whenever the audio device is late (see `defer_command`).
             let mut deferred: Vec<PlayerCommand> = Vec::new();
-            let mut reported_output_error = false;
+            // When the UI was last told that there is no output.
+            let mut reported_output_error: Option<Instant> = None;
             let mut worker = loop {
                 match Worker::new(
                     app.clone(),
@@ -1071,12 +2013,12 @@ pub fn spawn(
                     Ok(w) => break w,
                     Err(e) => {
                         tracing::error!("audio output init failed: {e}");
+                        let message = format!("audio output unavailable: {e}");
                         // Report once, not every 3 s — a missing device would
                         // otherwise flood the UI with the same banner.
-                        if deferred.is_empty() && !reported_output_error {
-                            reported_output_error = true;
-                            let _ =
-                                app.emit("player:error", format!("audio output unavailable: {e}"));
+                        if reported_output_error.is_none() {
+                            reported_output_error = Some(Instant::now());
+                            let _ = app.emit("player:error", message.clone());
                         }
                         // Collect commands while waiting, and honour a quit
                         // request immediately.
@@ -1092,11 +2034,20 @@ pub fn spawn(
                                     let _ = ack.send(());
                                 }
                                 Ok(cmd) => {
-                                    // Bound it: a long outage must not grow
-                                    // this without limit.
-                                    if deferred.len() < DEFERRED_COMMAND_LIMIT {
-                                        deferred.push(cmd);
+                                    // The report above goes out while the UI
+                                    // is still starting, and an event nobody
+                                    // listens to is gone: whoever asks for
+                                    // sound is told why there is none — at
+                                    // most every few seconds, a held key
+                                    // repeats.
+                                    if asks_for_playback(&cmd)
+                                        && reported_output_error
+                                            .is_none_or(|at| at.elapsed() >= OUTPUT_RETRY_DELAY)
+                                    {
+                                        reported_output_error = Some(Instant::now());
+                                        let _ = app.emit("player:error", message.clone());
                                     }
+                                    defer_command(&mut deferred, cmd);
                                 }
                                 Err(RecvTimeoutError::Timeout) => break,
                                 Err(RecvTimeoutError::Disconnected) => return,
@@ -1105,21 +2056,34 @@ pub fn spawn(
                     }
                 }
             };
+            // What the worker loaded (volume, shuffle, repeat, speed) has to
+            // reach the shared state now: the next emit may only come with
+            // the first command, and a UI reading the state back meanwhile
+            // would see the defaults and compute its toggles from them.
+            worker.emit();
             // Everything that arrived while there was no output device.
             for cmd in deferred.drain(..) {
                 worker.handle(cmd);
             }
+            let mut clock = TickClock::new(Instant::now());
             loop {
-                match rx.recv_timeout(worker.next_wake()) {
+                let wake_at = clock.wake_at(Instant::now(), worker.next_wake());
+                match rx.recv_timeout(wake_at.saturating_duration_since(Instant::now())) {
                     Ok(PlayerCommand::Shutdown { ack }) => {
                         worker.shutdown();
                         let _ = ack.send(());
                         break;
                     }
                     Ok(cmd) => worker.handle(cmd),
-                    Err(RecvTimeoutError::Timeout) => worker.tick(),
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
+                if clock.tick_due(Instant::now(), wake_at) {
+                    worker.tick();
+                }
+                // After the tick too: a track end it handled moves the
+                // generation on, and the opens that made stale stop now.
+                worker.stop_stale_opens();
             }
         })
         .expect("failed to spawn player thread");
@@ -1151,25 +2115,37 @@ struct Worker {
     shuffle_mode: ShuffleMode,
     /// Shuffle play order as physical queue indices (current-first permutation).
     /// Meaningful only while `shuffle`; empty otherwise (= linear order).
+    /// Changed through `order_mut`.
     order: Vec<usize>,
     /// Last track that seeded an Auto-DJ append (fires once per track).
     last_auto_dj_seed: Option<String>,
+    /// The seed whose mix last came back with nothing, and when it may ask
+    /// again.
+    auto_dj_retry: Option<AutoDjRetry>,
     /// Recently completed tracks excluded from new Auto-DJ mixes.
-    recent_tracks: std::collections::VecDeque<String>,
+    recent_tracks: std::collections::VecDeque<RecentTrack>,
     /// Exact state before the most recent removal/clear operation. It is not
     /// persisted and is invalidated by unrelated queue/order changes.
     queue_undo: Option<QueueUndo>,
     /// Wall-clock moment the sleep timer fires (None = not armed).
     sleep_at: Option<Instant>,
     sleep_end_of_track: bool,
-    /// "Stop after this track / album" and the entry it was armed on: the
-    /// item id, and the album that entry belongs to.
+    /// "Stop after this track / album": the entry the music ends after (see
+    /// `stop_after_due`), and for an album stop the album.
     stop_after: StopAfter,
-    stop_after_item: Option<String>,
+    stop_at: Option<EntryRef>,
+    /// The entries the stop was armed over, in play order: the row itself,
+    /// or the album's run from the armed row on (`album_run`). `stop_at` is
+    /// the last of them still queued, so removing the album's last track
+    /// ends it one track earlier instead of not at all.
+    stop_run: Vec<EntryRef>,
     stop_after_album: Option<String>,
     sleep_fade_duration: Duration,
     /// Item id whose source currently carries the sleep ramp.
     sleep_fade_item: Option<String>,
+    /// Until when the ramp of a resume runs. A sleep fade-out takes over
+    /// from its end: a fade handle runs one ramp at a time.
+    resume_ramp_until: Option<Instant>,
     sink: Option<rodio::Player>,
     /// Gain handle of the source in `sink`.
     current_fade: Option<FadeHandle>,
@@ -1189,10 +2165,22 @@ struct Worker {
     /// handles above.
     pending_play_session: Option<String>,
     /// Old sink still audible during a crossfade (kept steerable via its
-    /// fade handle), dropped after its ramp.
-    fading_out: Option<(rodio::Player, FadeHandle, Instant)>,
-    /// Debounces OutputFailed storms from a dying device.
+    /// fade handle), dropped after its ramp — with its download, which has to
+    /// keep running as long as the tail plays.
+    fading_out: Option<(
+        rodio::Player,
+        FadeHandle,
+        Instant,
+        Option<Arc<DownloadProgress>>,
+    )>,
+    /// Players taken off the output (a skip, a stop, a reopen), ramping to
+    /// silence until a tick drops them at the given moment.
+    draining: Vec<(rodio::Player, Instant)>,
+    /// Debounces OutputFailed storms from a dying device. Set by every
+    /// attempt, also one that failed and left the old stream playing.
     last_output_rebuild: Instant,
+    /// When the stream that plays now was opened (see `output_opened`).
+    stream_opened_at: Instant,
     /// An OutputFailed arrived inside the debounce window; retried on a tick.
     output_failed_pending: bool,
     /// False after the output died and could not be rebuilt; the next play
@@ -1202,15 +2190,29 @@ struct Worker {
     /// the queued OutputFailed. rodio waits for the audio callback to carry out
     /// a native seek, and a dead stream never calls back.
     output_dead: Arc<std::sync::atomic::AtomicBool>,
+    /// The device the output plays through (`audio_devices` has it for
+    /// everyone else), with the name older builds knew it by.
+    opened_output: Option<OutputEntry>,
+    /// When "system default" last looked at what the default is.
+    last_default_poll: Instant,
+    /// A new default device that did not open (yet): tried again a few
+    /// times, then not until the default changes once more.
+    default_output_failed: Option<FailedDefault>,
     queue: Vec<QueueTrack>,
-    /// Bumped by every change to `queue` (see `queue_mut`), so `sync_queue`
-    /// re-writes the track list only when it actually changed.
+    /// Bumped by every change to `queue` or to its play order (see
+    /// `queue_mut`, `order_mut`), so `sync_queue` re-writes and re-sends the
+    /// track list only when it actually changed.
     queue_revision: u64,
     /// What `sync_queue` last persisted.
     persisted_queue: Option<PersistedQueueMark>,
+    /// The revision `sync_queue` last sent in full, and its duplicate count.
+    synced_revision: Option<u64>,
+    duplicate_count: usize,
     index: usize,
     status: PlaybackStatus,
     volume: f32,
+    /// `volume` changed and is not saved yet (see `save_volume`).
+    volume_unsaved: bool,
     /// Invalidates in-flight background opens; bumped whenever "what should
     /// play" changes.
     generation: u64,
@@ -1219,8 +2221,19 @@ struct Worker {
     prefetch_generation: u64,
     /// Next track, opened and decoded, waiting to be appended.
     prefetched: Option<Prefetched>,
+    /// Opens in flight, so the ones `generation`/`prefetch_generation` have
+    /// made stale can be stopped (`stop_stale_opens`).
+    opens: source::OpenTracker,
     /// item_id of a prefetch open currently running on a background thread.
     prefetch_inflight: Option<String>,
+    /// item_id of a next track whose prefetch failed. Not opened ahead of
+    /// the boundary again; the boundary opens it as a plain Play, which is
+    /// the retry. Forgotten when the queue or the current track changes.
+    prefetch_failed: Option<String>,
+    /// The generation of a prefetch of the track now loading, still on its
+    /// way when the track before it ended (`handle_track_end`). It may land
+    /// before the fresh open of the same track and play instead.
+    adoptable_prefetch: Option<u64>,
     /// item_id of the next track already appended to the sink (gapless
     /// hand-off). Valid iff it still equals `queue[index + 1]` at transition
     /// time — that single invariant survives queue edits that shift indices
@@ -1243,7 +2256,8 @@ struct Worker {
     /// was opened (`spawn_open`). Taken when the track stops, so the same id
     /// is never reported started twice.
     play_session_id: Option<String>,
-    ticks_since_report: u32,
+    /// When the last progress report (or the start report) went out.
+    last_progress_report: Instant,
     /// Time actually listened to the current track (the ListenBrainz rule).
     listen: scrobble::ListenClock,
     cover_dir: PathBuf,
@@ -1281,13 +2295,13 @@ impl Worker {
                 })
             },
         };
-        let playback: PlaybackSettings = store
+        let mut playback: PlaybackSettings = store
             .get(keys::PLAYBACK)
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
         let mut extras: ExtrasSettings = store
             .get(keys::EXTRAS)
-            .and_then(|json| serde_json::from_str(&json).ok())
+            .and_then(|json| ExtrasSettings::from_stored_json(&json))
             .unwrap_or_default();
         // The token lives in the credential manager, not the store.
         if extras.listenbrainz_token.is_none() {
@@ -1299,10 +2313,16 @@ impl Worker {
             .unwrap_or_default();
         let speed = tempo::SpeedSetting::load(&store);
         let tempo = tempo::TempoHandle::new(speed.speed, speed.preserve_pitch);
+        tap.set_speed(tempo.speed());
+        let mut output_adopted = false;
+        let name = playback.output_device_name.clone();
         let (output, output_dead, output_device) =
-            match open_output(&playback.output_device, &tempo, tx.clone()) {
+            match open_output_named(&playback.output_device, name.as_deref(), &tempo, tx.clone()) {
                 Ok(opened) => {
                     crate::audio_devices::clear_fallback();
+                    if let (Some(_), Some(entry)) = (&playback.output_device, &opened.2) {
+                        output_adopted = adopt_output_device(&mut playback, &entry.device);
+                    }
                     opened
                 }
                 Err(e) => {
@@ -1312,7 +2332,12 @@ impl Worker {
                         crate::audio_devices::mark_fallback(requested_device.clone());
                         let _ = app.emit(
                             "audio:output-fallback",
-                            crate::audio_devices::AudioOutputFallbackEvent { requested_device },
+                            crate::audio_devices::AudioOutputFallbackEvent {
+                                requested_device: playback
+                                    .output_device_name
+                                    .clone()
+                                    .unwrap_or(requested_device),
+                            },
                         );
                     }
                     opened
@@ -1347,15 +2372,18 @@ impl Worker {
             shuffle_mode: play_mode.shuffle_mode,
             order: Vec::new(),
             last_auto_dj_seed: None,
+            auto_dj_retry: None,
             recent_tracks: std::collections::VecDeque::new(),
             queue_undo: None,
             sleep_at: None,
             sleep_end_of_track: false,
             stop_after: StopAfter::Off,
-            stop_after_item: None,
+            stop_at: None,
+            stop_run: Vec::new(),
             stop_after_album: None,
             sleep_fade_duration: Duration::from_secs(30),
             sleep_fade_item: None,
+            resume_ramp_until: None,
             sink: None,
             current_fade: None,
             pending_fade: None,
@@ -1365,43 +2393,80 @@ impl Worker {
             pending_download: None,
             pending_play_session: None,
             fading_out: None,
+            draining: Vec::new(),
             last_output_rebuild: Instant::now(),
+            stream_opened_at: Instant::now(),
             output_failed_pending: false,
             output_alive: true,
             output_dead,
+            opened_output: None,
+            last_default_poll: Instant::now(),
+            default_output_failed: None,
             queue: Vec::new(),
             queue_revision: 0,
             persisted_queue: None,
+            synced_revision: None,
+            duplicate_count: 0,
             index: 0,
             status: PlaybackStatus::Idle,
             volume,
+            volume_unsaved: false,
             generation: 0,
             prefetch_generation: 0,
             prefetched: None,
+            opens: source::OpenTracker::default(),
             prefetch_inflight: None,
+            prefetch_failed: None,
+            adoptable_prefetch: None,
             appended: None,
             pending_pause: false,
             queue_ended: false,
             position_offset_ms: 0,
             lead_until: None,
             play_session_id: None,
-            ticks_since_report: 0,
+            last_progress_report: Instant::now(),
             listen: scrobble::ListenClock::default(),
             cover_dir,
         };
+        if output_adopted {
+            worker.persist_playback();
+        }
         worker.output_opened(output_device);
         Ok(worker)
     }
 
-    /// The output now plays through `device`: with per-device profiles on,
+    /// The output now plays through `opened`: with per-device profiles on,
     /// its EQ/normalization and volume take over (see `audio_profiles.rs`).
-    fn output_opened(&mut self, device: Option<String>) {
-        crate::audio_devices::set_active_device(device.clone());
-        let Some(device) = device else {
+    fn output_opened(&mut self, opened: Option<OutputEntry>) {
+        // Called right after every new stream (start, rebuild, the reopen
+        // on Play), and only then.
+        self.stream_opened_at = Instant::now();
+        // A volume not saved yet was set on the device that played until now.
+        self.save_volume();
+        crate::audio_devices::set_active_device(opened.as_ref().map(|o| o.device.clone()));
+        self.opened_output = opened;
+        self.apply_output_profile();
+    }
+
+    /// Switch to the profile of the device playing now, if it has one that
+    /// differs from what plays.
+    fn apply_output_profile(&mut self) {
+        let Some(opened) = self.opened_output.clone() else {
             return;
         };
+        let device = opened.device;
         let current = self.dsp.params();
-        match crate::audio_profiles::on_device_opened(&self.store, &device, &current, self.volume) {
+        // A profile can follow the device from an id it had before, which
+        // only a device no longer listed gives away.
+        let listed = listed_output_ids();
+        match crate::audio_profiles::on_device_opened(
+            &self.store,
+            &device,
+            opened.legacy_name.as_deref(),
+            listed.as_deref(),
+            &current,
+            self.volume,
+        ) {
             Ok(Some(profile)) => {
                 self.dsp.update(profile.dsp.clone());
                 if let Ok(json) = serde_json::to_string(&profile.dsp) {
@@ -1412,15 +2477,18 @@ impl Worker {
                 }
                 let _ = self.app.emit(
                     "audio:profile-applied",
-                    crate::audio_profiles::ProfileAppliedEvent { device },
+                    crate::audio_profiles::ProfileAppliedEvent {
+                        device: device.name.clone(),
+                    },
                 );
                 self.emit();
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!("audio profile for '{device}' not applied: {e}"),
+            Err(e) => tracing::warn!("audio profile for '{}' not applied: {e}", device.name),
         }
     }
 
+    /// Set the volume live. Saving it waits for [`Self::save_volume`].
     fn apply_volume(&mut self, volume: f32) {
         if !volume.is_finite() {
             return;
@@ -1429,13 +2497,59 @@ impl Worker {
         if let Some(sink) = &self.sink {
             sink.set_volume(self.volume);
         }
-        if let Some((old, _, _)) = &self.fading_out {
+        if let Some((old, ..)) = &self.fading_out {
             old.set_volume(self.volume);
         }
+        self.volume_unsaved = true;
+    }
+
+    /// Save a changed volume, also as the volume of the device playing. Runs
+    /// on the tick, which waits for a pause in the commands: a volume drag
+    /// sends one command per input event, and each save is a database commit
+    /// or two.
+    fn save_volume(&mut self) {
+        if !self.volume_unsaved {
+            return;
+        }
+        self.volume_unsaved = false;
         let _ = self.store.set(keys::VOLUME, &self.volume.to_string());
+        if let Some(device) = crate::audio_devices::active_device() {
+            let current = self.dsp.params();
+            if let Err(e) =
+                crate::audio_profiles::remember_volume(&self.store, &device, self.volume, &current)
+            {
+                tracing::warn!("cannot save the device volume: {e}");
+            }
+        }
     }
 
     fn handle(&mut self, cmd: PlayerCommand) {
+        // A finished prefetch is stored before the boundary is resolved:
+        // landing just as the current track ran out, it is exactly what the
+        // boundary starts next. The other way round, the track would be opened
+        // a second time and the ready source thrown away.
+        let cmd = match cmd {
+            PlayerCommand::SourceReady {
+                generation,
+                prefetch_generation,
+                purpose: purpose @ OpenPurpose::Prefetch,
+                track,
+                play_session,
+                result,
+            } => {
+                self.source_ready(
+                    generation,
+                    prefetch_generation,
+                    purpose,
+                    *track,
+                    play_session,
+                    result,
+                );
+                self.maybe_transition();
+                return;
+            }
+            cmd => cmd,
+        };
         // The audio may have crossed a track boundary since the last tick;
         // resolve it first so every command operates on a consistent
         // index/position pair (otherwise Prev double-skips, Pause freezes the
@@ -1445,30 +2559,28 @@ impl Worker {
             PlayerCommand::PlayQueue {
                 tracks,
                 start_index,
+                in_order,
             } => {
                 self.queue_undo = None;
                 self.report_stopped_playing();
                 *self.queue_mut() = tracks;
                 self.index = start_index.min(self.queue.len().saturating_sub(1));
                 // A fresh playthrough re-arms Auto-DJ.
-                self.last_auto_dj_seed = None;
+                self.rearm_auto_dj();
                 if self.shuffle {
-                    self.rebuild_order();
+                    if in_order {
+                        // Shuffle stays on for what comes later; this queue's
+                        // order is what was asked for.
+                        let len = self.queue.len();
+                        *self.order_mut() = (0..len).collect();
+                    } else {
+                        self.rebuild_order();
+                    }
                 }
                 self.sync_queue();
                 self.start_current();
             }
-            PlayerCommand::RestoreQueue { tracks, index } => {
-                self.queue_undo = None;
-                *self.queue_mut() = tracks;
-                self.index = index.min(self.queue.len().saturating_sub(1));
-                self.status = PlaybackStatus::Idle;
-                if self.shuffle {
-                    self.rebuild_order();
-                }
-                self.sync_queue();
-                self.emit();
-            }
+            PlayerCommand::RestoreQueue(restored) => self.restore_queue(restored),
             PlayerCommand::PlayNext(tracks) => {
                 let at = if self.queue.is_empty() {
                     0
@@ -1483,18 +2595,19 @@ impl Worker {
                 if self.shuffle && n > 0 {
                     // Shift indices at/after the insertion up, then slot the new
                     // ones right after the current track in play order.
-                    for v in self.order.iter_mut() {
+                    let current = self.index;
+                    let order = self.order_mut();
+                    for v in order.iter_mut() {
                         if *v >= at {
                             *v += n;
                         }
                     }
-                    let pos = self
-                        .order
+                    let pos = order
                         .iter()
-                        .position(|&i| i == self.index)
+                        .position(|&i| i == current)
                         .map(|p| p + 1)
-                        .unwrap_or(self.order.len());
-                    self.order.splice(pos..pos, at..at + n);
+                        .unwrap_or(order.len());
+                    order.splice(pos..pos, at..at + n);
                 }
                 self.sync_queue();
                 self.emit();
@@ -1506,18 +2619,19 @@ impl Worker {
                 }
                 self.queue_mut().extend(tracks);
                 if self.shuffle {
-                    self.order.extend(start..self.queue.len());
+                    let end = self.queue.len();
+                    self.order_mut().extend(start..end);
                 }
                 self.sync_queue();
                 self.emit();
             }
-            PlayerCommand::RemoveAt { index, item_id } => self.remove_at(index, &item_id),
+            PlayerCommand::RemoveAt { index, entry } => self.remove_at(index, &entry),
             PlayerCommand::JumpTo(i) => {
                 if i < self.queue.len() {
                     self.queue_undo = None;
                     self.report_stopped_playing();
                     self.index = i;
-                    self.last_auto_dj_seed = None;
+                    self.rearm_auto_dj();
                     self.sync_queue();
                     self.start_current();
                 }
@@ -1536,11 +2650,14 @@ impl Worker {
                     if self.shuffle {
                         self.rebuild_order();
                     } else {
-                        self.order.clear();
+                        self.order_mut().clear();
                     }
                     self.persist_play_mode();
                     self.invalidate_next();
                     self.sync_queue();
+                    self.emit();
+                } else {
+                    // Asked from a stale state: the answer is the real one.
                     self.emit();
                 }
             }
@@ -1554,15 +2671,18 @@ impl Worker {
                         self.invalidate_next();
                     }
                     self.emit();
+                } else {
+                    // Asked from a stale state: the answer is the real one.
+                    self.emit();
                 }
             }
             PlayerCommand::Play => {
-                self.pending_pause = false;
+                self.set_pending_pause(false);
                 self.resume_or_start();
             }
             PlayerCommand::Pause => {
                 if self.status == PlaybackStatus::Loading {
-                    self.pending_pause = true;
+                    self.set_pending_pause(true);
                 } else {
                     self.pause();
                 }
@@ -1570,7 +2690,7 @@ impl Worker {
             PlayerCommand::Toggle => match self.status {
                 PlaybackStatus::Playing => self.pause(),
                 PlaybackStatus::Paused | PlaybackStatus::Idle => self.resume_or_start(),
-                PlaybackStatus::Loading => self.pending_pause = !self.pending_pause,
+                PlaybackStatus::Loading => self.set_pending_pause(!self.pending_pause),
             },
             PlayerCommand::Next => self.advance(1),
             PlayerCommand::Prev => {
@@ -1588,29 +2708,75 @@ impl Worker {
                     return;
                 }
                 self.apply_volume(volume);
-                if let Some(device) = crate::audio_devices::active_device() {
-                    let current = self.dsp.params();
-                    if let Err(e) = crate::audio_profiles::remember_volume(
-                        &self.store,
-                        &device,
-                        self.volume,
-                        &current,
-                    ) {
-                        tracing::warn!("cannot save the device volume: {e}");
-                    }
-                }
                 self.emit();
             }
-            PlayerCommand::SetPlaybackSettings(settings) => {
+            PlayerCommand::SetPlaybackSettings {
+                mut settings,
+                reply,
+            } => {
                 let old_device = self.playback.output_device.clone();
+                let old_name = self.playback.output_device_name.clone();
+                // A Settings page that loaded before the configured device
+                // turned up under a new id (or before its 0.6.0 name became
+                // an id) still sends what it loaded. That means the device
+                // playing now and is no switch: reopening it would only cut
+                // the music for a moment.
+                let stale = settings.output_device != old_device && self.means_playing(&settings);
+                if stale {
+                    settings.output_device = old_device.clone();
+                    settings.output_device_name = old_name.clone();
+                }
                 let device_changed = settings.output_device != old_device;
                 self.playback = settings;
+                if stale {
+                    // The command stored the request as it came.
+                    self.persist_playback();
+                }
                 if device_changed && !self.try_rebuild_output(self.playback.output_device.clone()) {
                     // Keep playing on the still-healthy old output and revert
                     // the persisted choice so config and reality agree.
                     self.playback.output_device = old_device;
+                    self.playback.output_device_name = old_name;
                     self.persist_playback();
                 }
+                if let Some(reply) = reply {
+                    let _ = reply.send(self.playback.clone());
+                }
+            }
+            PlayerCommand::RestoreOutput { ack } => {
+                // Only a fallback has a configured device to go back to. The
+                // user asked for it, so one that still fails says so.
+                if crate::audio_devices::fallback_device().is_some() {
+                    if let Some(device) = self.playback.output_device.clone() {
+                        self.try_rebuild_output(Some(device));
+                    }
+                }
+                let _ = ack.send(());
+            }
+            PlayerCommand::SoundImported { volume, profiles } => {
+                if let Some(volume) = volume {
+                    self.apply_volume(volume);
+                    // The import saved it already. Imported profiles may
+                    // override it; it must not be written into them first.
+                    self.volume_unsaved = !profiles;
+                }
+                if profiles {
+                    // The imported profiles decide what the device playing
+                    // now sounds like: its own profile, or the imported sound
+                    // becomes it.
+                    self.apply_output_profile();
+                } else if let Some(device) = crate::audio_devices::active_device() {
+                    // The imported sound now belongs to the device playing,
+                    // or its older profile would replace it at the next open.
+                    let current = self.dsp.params();
+                    if let Err(e) =
+                        crate::audio_profiles::remember_dsp(&self.store, &device, &current)
+                    {
+                        tracing::warn!("cannot save the imported sound profile: {e}");
+                    }
+                    self.save_volume();
+                }
+                self.emit();
             }
             PlayerCommand::SetSpeed(setting) => {
                 let old_speed = self.tempo.speed();
@@ -1619,13 +2785,14 @@ impl Worker {
                     .sample_at(Instant::now(), self.position_ms(), old_speed);
                 self.speed = setting.clamped();
                 self.tempo.set(self.speed.speed, self.speed.preserve_pitch);
+                self.tap.set_speed(self.tempo.speed());
                 // Deadlines on the clock that stand for track time (a
                 // crossfade tail, the silence before a beat transition) move
                 // with the speed.
                 let now = Instant::now();
                 let factor = old_speed / self.tempo.speed();
                 let rescale = |at: Instant| now + at.saturating_duration_since(now).mul_f32(factor);
-                if let Some((_, _, drop_at)) = &mut self.fading_out {
+                if let Some((_, _, drop_at, _)) = &mut self.fading_out {
                     *drop_at = rescale(*drop_at);
                 }
                 self.lead_until = self.lead_until.map(rescale);
@@ -1665,28 +2832,16 @@ impl Worker {
                     _ => 30,
                 }));
                 self.update_sleep_fade();
+                // Armed after the next track was appended: an end-of-track
+                // sleep now ends playback at that boundary.
+                self.arm_appended();
                 self.emit();
             }
-            PlayerCommand::SetStopAfter { mode, item_id } => {
-                let armed = item_id.or_else(|| {
-                    self.queue
-                        .get(self.index)
-                        .map(|track| track.item_id.clone())
-                });
-                let entry = armed
-                    .as_ref()
-                    .and_then(|id| self.queue.iter().find(|track| &track.item_id == id));
-                self.stop_after_album = entry.and_then(|track| track.album_id.clone());
-                // An album stop needs an album: a loose track has none, and
-                // arming it would be a stop that never comes.
-                self.stop_after = match mode {
-                    StopAfter::Album if self.stop_after_album.is_none() => StopAfter::Off,
-                    other => other,
-                };
-                self.stop_after_item = match self.stop_after {
-                    StopAfter::Off => None,
-                    _ => armed,
-                };
+            PlayerCommand::SetStopAfter { mode, entry } => {
+                self.arm_stop_after(mode, entry);
+                // Armed (or cleared) after the next track was appended: it
+                // must not start at that boundary (or may again).
+                self.arm_appended();
                 self.emit();
             }
             PlayerCommand::Stop => {
@@ -1702,9 +2857,17 @@ impl Worker {
             PlayerCommand::StopAck { ack } => {
                 // Sign-out: the session is torn down the moment this returns,
                 // so the report has to go out now rather than as a spawned
-                // task that would find no client left.
-                self.report_stopped_blocking(true);
+                // task that would find no client left. The music stops first:
+                // the report waits for the server, and sign-out does not.
+                // The installer hand-over comes this way too, and the process
+                // ends right after it: a volume still waiting for its tick is
+                // saved first, as shutdown does.
+                self.save_volume();
+                let report = self.take_final_report(true);
                 self.stop_internal();
+                if let Some(report) = report {
+                    self.send_final_report(report);
+                }
                 let _ = ack.send(());
             }
             PlayerCommand::RefreshSmtcArtwork { item_id } => {
@@ -1742,7 +2905,15 @@ impl Worker {
         result: AppResult<Box<OpenedSource>>,
     ) {
         if generation != self.generation {
-            return; // stale open from before a queue change
+            // A prefetch of the track that is loading anew may still play
+            // (handle_track_end); anything else is a stale open from before a
+            // queue change.
+            if matches!(purpose, OpenPurpose::Prefetch)
+                && self.adoptable_prefetch == Some(generation)
+            {
+                self.adopt_prefetch(track, play_session, result);
+            }
+            return;
         }
         match purpose {
             OpenPurpose::Play => {
@@ -1760,23 +2931,27 @@ impl Worker {
                             download,
                             ..
                         } = *opened;
-                        let sink = rodio::Player::connect_new(self.output.mixer());
-                        sink.set_volume(self.volume);
-                        sink.append(source);
                         // Honor a pause pressed while this source was loading.
-                        if self.pending_pause {
-                            self.pending_pause = false;
-                            sink.pause();
-                            self.status = PlaybackStatus::Paused;
+                        let paused = self.take_start_paused();
+                        self.arm_fresh(&fade, 0, paused);
+                        let sink =
+                            start_player(self.output.mixer(), self.volume, paused, |player| {
+                                player.append(source)
+                            });
+                        self.status = if paused {
+                            PlaybackStatus::Paused
                         } else {
-                            self.status = PlaybackStatus::Playing;
-                        }
+                            PlaybackStatus::Playing
+                        };
                         self.sink = Some(sink);
                         self.current_fade = Some(fade);
                         self.current_tap = Some(tap_enabled);
                         self.current_download = Some(download);
                         self.position_offset_ms = 0;
-                        self.ticks_since_report = 0;
+                        // This open came first; a prefetch of the same track
+                        // still on its way is dropped when it lands.
+                        self.adoptable_prefetch = None;
+                        self.last_progress_report = Instant::now();
                         self.report_start(&track, play_session);
                         if self.status == PlaybackStatus::Paused {
                             self.report_progress(true);
@@ -1803,32 +2978,47 @@ impl Worker {
                             download,
                             start_ms,
                         } = *opened;
-                        let sink = rodio::Player::connect_new(self.output.mixer());
-                        sink.set_volume(self.volume);
-                        sink.append(source);
                         // Paused before the reopen, as adjusted by Play/Pause
                         // pressed while it loaded (see restart_at).
-                        let paused = std::mem::take(&mut self.pending_pause);
-                        if paused {
-                            sink.pause();
-                            self.status = PlaybackStatus::Paused;
+                        let paused = self.take_start_paused();
+                        self.arm_fresh(&fade, start_ms, paused);
+                        let sink =
+                            start_player(self.output.mixer(), self.volume, paused, |player| {
+                                player.append(source)
+                            });
+                        self.status = if paused {
+                            PlaybackStatus::Paused
                         } else {
-                            self.status = PlaybackStatus::Playing;
-                        }
+                            PlaybackStatus::Playing
+                        };
                         self.sink = Some(sink);
                         self.current_fade = Some(fade);
                         self.current_tap = Some(tap_enabled);
                         self.current_download = Some(download);
                         self.position_offset_ms = start_ms;
                         self.listen.rebase(Instant::now(), start_ms);
-                        // Same play session continues — no new start report.
-                        self.report_progress(paused);
+                        if self.play_session_id.as_deref() == Some(play_session.as_str()) {
+                            // Same play session continues — no new start report.
+                            self.report_progress(paused);
+                        } else {
+                            // Opened at a position before it ever played (a
+                            // seek while it was starting, or while nothing
+                            // played): a new attempt, reported like any start.
+                            self.last_progress_report = Instant::now();
+                            self.report_start(&track, play_session);
+                            if paused {
+                                self.report_progress(true);
+                            }
+                            self.update_media_metadata(&track);
+                        }
                         self.update_media_playback();
                         self.emit();
                     }
                     Err(e) => {
-                        // This track's start was reported: close its session.
-                        self.report_stopped_playing();
+                        // A reopen's start was reported: close its session.
+                        if self.play_session_id.as_deref() == Some(play_session.as_str()) {
+                            self.report_stopped_playing();
+                        }
                         self.fail_start(&track, e);
                     }
                 }
@@ -1860,8 +3050,10 @@ impl Worker {
                     }
                     Err(e) => {
                         // Not fatal: the normal advance path retries as a
-                        // fresh Play open when the track actually starts.
+                        // fresh Play open when the track actually starts —
+                        // until then, the tick does not open it again.
                         tracing::warn!("prefetch failed: {e}");
+                        self.prefetch_failed = Some(track.item_id);
                     }
                 }
             }
@@ -1915,11 +3107,12 @@ impl Worker {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15)
             ^ self.generation.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        self.order = match self.shuffle_mode {
+        let order = match self.shuffle_mode {
             ShuffleMode::Off => Vec::new(),
             ShuffleMode::Tracks => build_shuffle_order(self.queue.len(), self.index, seed),
             ShuffleMode::Albums => build_album_shuffle_order(&self.queue, self.index, seed),
         };
+        *self.order_mut() = order;
     }
 
     /// Drop a not-yet-appended prefetch so the next boundary re-decides. An
@@ -1931,6 +3124,7 @@ impl Worker {
         self.prefetch_generation = self.prefetch_generation.wrapping_add(1);
         self.prefetched = None;
         self.prefetch_inflight = None;
+        self.prefetch_failed = None;
     }
 
     fn persist_play_mode(&self) {
@@ -1956,10 +3150,45 @@ impl Worker {
                 return true;
             }
         } else if sink_len == 0 {
-            self.handle_track_end();
+            if !self.resume_broken_stream() {
+                self.handle_track_end();
+            }
             return true;
         }
         false
+    }
+
+    /// The current source ran dry because its stream broke off — a live
+    /// transcode cut by a dropped connection, a download that gave up after
+    /// an outage (`source.rs`) — rather than at the end of its track: reopen
+    /// it where it stopped, as a seek would, instead of skipping the rest.
+    /// Not when it broke off before playing a second (a server that keeps
+    /// failing ends the track as before), or in the last seconds of it.
+    fn resume_broken_stream(&mut self) -> bool {
+        const RESUME_MIN_PLAYED: Duration = Duration::from_secs(1);
+        const RESUME_TAIL_MS: u64 = 2_000;
+        if !self
+            .current_download
+            .as_ref()
+            .is_some_and(|download| download.broke_off())
+        {
+            return false;
+        }
+        let played = self
+            .sink
+            .as_ref()
+            .map(|sink| sink.get_pos())
+            .unwrap_or_default();
+        let position_ms = self.position_ms();
+        let near_end = self.queue.get(self.index).is_none_or(|track| {
+            track.duration_ms == 0 || position_ms + RESUME_TAIL_MS >= track.duration_ms
+        });
+        if played < RESUME_MIN_PLAYED || near_end {
+            return false;
+        }
+        tracing::warn!("stream broke off at {position_ms} ms; reopening it there");
+        self.restart_at(position_ms);
+        true
     }
 
     /// Periodic tick while playing: position updates, throttled progress
@@ -1971,12 +3200,17 @@ impl Worker {
         {
             self.handle_output_failed();
         }
-        // Crossfade tails are dropped once their ramp is over.
-        if let Some((_, _, drop_at)) = &self.fading_out {
+        self.follow_default_output();
+        self.save_volume();
+        // Crossfade tails are dropped once their ramp is over, and so are
+        // players taken off the output.
+        if let Some((_, _, drop_at, _)) = &self.fading_out {
             if Instant::now() >= *drop_at {
                 self.fading_out = None;
             }
         }
+        let now = Instant::now();
+        self.draining.retain(|(_, drop_at)| now < *drop_at);
         // A timer that runs out during a pause has nothing left to do: the
         // music already stopped. Disarm it, so the next Play plays.
         if matches!(self.status, PlaybackStatus::Paused | PlaybackStatus::Idle)
@@ -2005,9 +3239,8 @@ impl Worker {
             return;
         }
 
-        self.ticks_since_report += 1;
-        if self.ticks_since_report >= REPORT_EVERY_TICKS {
-            self.ticks_since_report = 0;
+        if self.last_progress_report.elapsed() >= REPORT_EVERY {
+            self.last_progress_report = Instant::now();
             self.report_progress(false);
         }
 
@@ -2018,55 +3251,149 @@ impl Worker {
     }
 
     /// Start (or re-apply after pause/source change) the sample-time sleep
-    /// ramp. The sink's user volume is untouched, so cancelling can reliably
-    /// restore the FadeSource gain to one.
+    /// ramp on the playing source. It ramps down from wherever the gain is —
+    /// a crossfade fading in, a resume, a source that started at the fade's
+    /// level — rather than jumping to the fade's level first. The sink's user
+    /// volume is untouched, so cancelling can reliably restore the FadeSource
+    /// gain to one.
     fn update_sleep_fade(&mut self) {
-        if self.status != PlaybackStatus::Playing || self.sleep_fade_item.is_some() {
+        if self.status != PlaybackStatus::Playing {
             return;
         }
+        // A resume ramps back up to where the fade stands first
+        // (resume_or_start); the first call after that ramp hands over.
+        let resume_left = self
+            .resume_ramp_until
+            .map(|until| until.saturating_duration_since(Instant::now()));
+        if resume_left.is_some_and(|left| left.is_zero()) {
+            self.resume_ramp_until = None;
+        }
+        let current = self
+            .queue
+            .get(self.index)
+            .map(|track| track.item_id.as_str());
+        // Armed on the source playing now. A mark left by another source
+        // does not count: that one is gone.
+        let armed = current.is_some() && self.sleep_fade_item.as_deref() == current;
+        let step = sleep_fade_step(armed, resume_left, self.sleep_ramp(self.position_ms()));
+        let Some(fade) = &self.current_fade else {
+            return;
+        };
+        match step {
+            SleepFadeStep::Keep => return,
+            // `over` is on the clock, a ramp runs in track time.
+            SleepFadeStep::Rise { to, over } => fade.ramp_to(to, over.mul_f32(self.tempo.speed())),
+            SleepFadeStep::Fall { over } => fade.ramp_to(0.0, over),
+        }
+        self.sleep_fade_item = current.map(str::to_string);
+        // The next track, already appended, goes on at the fade's level.
+        self.arm_appended();
+    }
+
+    /// Where the sleep fade-out stands with the current track at
+    /// `position_ms`: the gain the music should have by now, and the rest of
+    /// the ramp down to silence (track time). None outside the fade.
+    fn sleep_ramp(&self, position_ms: u64) -> Option<(f32, Duration)> {
         let now = Instant::now();
         let remaining = if self.sleep_end_of_track {
             // A delayed end-of-track timer only starts fading once its wall
             // clock delay has elapsed.
             if self.sleep_at.is_some_and(|at| now < at) {
-                return;
+                return None;
             }
-            let Some(track) = self.queue.get(self.index) else {
-                return;
-            };
+            let track = self.queue.get(self.index)?;
             if track.duration_ms == 0 {
-                return;
+                return None;
             }
-            Duration::from_millis(track.duration_ms.saturating_sub(self.position_ms()))
+            Duration::from_millis(track.duration_ms.saturating_sub(position_ms))
         } else {
-            let Some(at) = self.sleep_at else {
-                return;
-            };
-            at.saturating_duration_since(now)
+            self.sleep_at?.saturating_duration_since(now)
         };
-        if remaining.is_zero() || remaining > self.sleep_fade_duration {
-            return;
+        if remaining.is_zero() {
+            return None;
         }
-        let Some(fade) = &self.current_fade else {
-            return;
-        };
-        let full = self.sleep_fade_duration.as_secs_f32();
-        let gain = if full > 0.0 {
-            (remaining.as_secs_f32() / full).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let gain = sleep_level(remaining, self.sleep_fade_duration)?;
         // The ramp runs in track time; a minutes timer counts on the clock.
         let ramp = if self.sleep_end_of_track {
             remaining
         } else {
             remaining.mul_f32(self.tempo.speed())
         };
-        fade.begin(gain, 0.0, ramp);
-        self.sleep_fade_item = self
-            .queue
-            .get(self.index)
-            .map(|track| track.item_id.clone());
+        Some((gain, ramp))
+    }
+
+    /// Whether a source about to start comes in paused: a pause pressed while
+    /// it loaded, or a minutes sleep timer that ran out meanwhile. The tick
+    /// pauses at the deadline only while something plays, so a source landing
+    /// after it would play at full volume until the next tick did. It starts
+    /// paused instead, and the timer is done, as at its deadline.
+    fn take_start_paused(&mut self) -> bool {
+        let paused = std::mem::take(&mut self.pending_pause);
+        if self.sleep_timer_due() {
+            self.sleep_at = None;
+            return true;
+        }
+        paused
+    }
+
+    /// Set the level a source starts at, before its first sample plays (a
+    /// FadeSource takes the latest ramp then). Opened paused, it stays silent
+    /// until the resume fades it in, like any other; during a sleep fade it
+    /// starts where the fade stands and carries on down. Otherwise it starts
+    /// at full gain, as every source does.
+    fn arm_fresh(&mut self, fade: &FadeHandle, position_ms: u64, paused: bool) {
+        self.sleep_fade_item = None;
+        if paused {
+            fade.begin(0.0, 0.0, Duration::ZERO);
+        } else if let Some((gain, ramp)) = self.sleep_ramp(position_ms) {
+            fade.begin(gain, 0.0, ramp);
+            self.sleep_fade_item = self
+                .queue
+                .get(self.index)
+                .map(|track| track.item_id.clone());
+        }
+    }
+
+    /// Set the level the gapless-appended next track starts at. It is set
+    /// ahead of time: the source takes the latest ramp at its first sample,
+    /// and nothing of it is heard before. Silent when the boundary ends
+    /// playback — an armed stop fires there, or an end-of-track sleep is due;
+    /// at the level a minutes sleep fade will have reached by then; otherwise
+    /// full.
+    fn arm_appended(&self) {
+        let Some(fade) = &self.pending_fade else {
+            return;
+        };
+        let ends_playback = (self.sleep_end_of_track
+            && self.sleep_at.is_none_or(|at| Instant::now() >= at))
+            || self
+                .queue
+                .get(self.index)
+                .is_some_and(|track| self.stop_after_fires(track));
+        if ends_playback {
+            fade.begin(0.0, 0.0, Duration::ZERO);
+            return;
+        }
+        // A minutes timer: by the boundary, the clock has moved on by what is
+        // left of the current track.
+        let at_boundary = match (self.sleep_at, self.queue.get(self.index)) {
+            (Some(at), Some(track)) if !self.sleep_end_of_track => {
+                let left = track.duration_ms.saturating_sub(self.position_ms());
+                Some(
+                    at.saturating_duration_since(Instant::now())
+                        .saturating_sub(self.tempo.wall(Duration::from_millis(left))),
+                )
+            }
+            _ => None,
+        };
+        match at_boundary.and_then(|remaining| {
+            sleep_level(remaining, self.sleep_fade_duration).map(|gain| (gain, remaining))
+        }) {
+            Some((gain, remaining)) => {
+                fade.begin(gain, 0.0, remaining.mul_f32(self.tempo.speed()));
+            }
+            None => fade.begin(1.0, 1.0, Duration::ZERO),
+        }
     }
 
     /// A minutes timer whose deadline has passed (an end-of-track timer
@@ -2085,30 +3412,61 @@ impl Worker {
             if let Some(fade) = &self.current_fade {
                 fade.ramp_to(1.0, Duration::from_millis(PAUSE_FADE_MS));
             }
+            // An appended next track was set to go on at the fade's level.
+            self.arm_appended();
         }
     }
 
-    /// Whether the armed stop fires when `finished` ends. `next` is looked up
-    /// through the play order, so shuffle and repeat are accounted for.
+    /// Whether the armed stop fires when `finished` ends.
     fn stop_after_fires(&self, finished: &QueueTrack) -> bool {
         // Repeat-One replays the same entry: an album that keeps restarting
         // never reaches an end, and a track stop would fire on its own repeat.
-        let next = self
-            .auto_next_index()
-            .and_then(|index| self.queue.get(index))
-            .filter(|_| self.repeat != RepeatMode::One);
-        self.stop_after_due_now(finished, next)
-    }
-
-    /// The rule with both tracks given: `finished`, and whatever follows it.
-    fn stop_after_due_now(&self, finished: &QueueTrack, next: Option<&QueueTrack>) -> bool {
         stop_after_due(
             self.stop_after,
-            self.stop_after_item.as_deref(),
+            self.stop_at.as_ref(),
             self.stop_after_album.as_deref(),
             finished,
-            next,
+            self.repeat == RepeatMode::One,
         )
+    }
+
+    /// Arm "stop after" on the entry named (`None`: what plays now), or clear
+    /// it. The stop is pinned to the entries it covers — the row itself, or
+    /// its album's run in play order as the queue stands now — and ends after
+    /// the last of them, so a track inserted later, a copy of the album
+    /// elsewhere in the queue or Repeat All do not move where it ends.
+    fn arm_stop_after(&mut self, mode: StopAfter, entry: Option<EntryRef>) {
+        self.clear_stop_after();
+        let armed = match entry {
+            Some(entry) => self.queue.iter().position(|track| entry.matches(track)),
+            None => (!self.queue.is_empty()).then_some(self.index),
+        };
+        let Some(armed) = armed else {
+            return;
+        };
+        let run = match mode {
+            StopAfter::Off => return,
+            StopAfter::Track => vec![armed],
+            StopAfter::Album => {
+                // An album stop needs an album: a loose track has none, and
+                // arming it would be a stop that never comes.
+                let Some(album) = self.queue[armed]
+                    .album_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                else {
+                    return;
+                };
+                self.stop_after_album = Some(album);
+                album_run(&self.queue, self.play_order(), armed)
+            }
+        };
+        self.stop_after = mode;
+        self.stop_run = run
+            .into_iter()
+            .map(|index| EntryRef::of(&self.queue[index]))
+            .collect();
+        self.stop_at = self.stop_run.last().cloned();
     }
 
     /// The normalization gain a source is opened with. Album mode prefers what
@@ -2137,49 +3495,76 @@ impl Worker {
 
     fn clear_stop_after(&mut self) {
         self.stop_after = StopAfter::Off;
-        self.stop_after_item = None;
+        self.stop_at = None;
+        self.stop_run.clear();
         self.stop_after_album = None;
     }
 
-    /// End-of-track sleep: fires at a boundary once the deadline (if any)
-    /// has passed. Returns true when playback was put to sleep.
-    fn sleep_at_boundary(&mut self) -> bool {
-        if !self.sleep_end_of_track {
-            return false;
-        }
-        let due = self.sleep_at.is_none_or(|at| Instant::now() >= at);
-        if due {
+    /// The gapless-appended next track took over at a boundary that is set
+    /// to end playback: an end-of-track sleep that is due (once its delay,
+    /// if any, has passed), or an armed stop — armed after the hand-off, so
+    /// the append guard could not hold the track back. That track was kept
+    /// silent for it (`arm_appended`); playback stops the way a plain track
+    /// end stops (`handle_track_end`), positioned at the next track so resume
+    /// continues naturally. Returns true when playback stopped.
+    fn stop_at_appended_boundary(&mut self) -> bool {
+        if self.sleep_end_of_track && self.sleep_at.is_none_or(|at| Instant::now() >= at) {
             self.sleep_at = None;
             self.sleep_end_of_track = false;
             self.sleep_fade_item = None;
-            self.pause();
+        } else if self
+            .queue
+            .get(self.index)
+            .is_some_and(|track| self.stop_after_fires(track))
+        {
+            self.clear_stop_after();
+        } else {
+            return false;
         }
-        due
+        // Not onto itself under Repeat-One.
+        if let Some(next) = self.next_index() {
+            self.index = next;
+        }
+        self.sync_queue();
+        self.stop_internal();
+        true
     }
 
-    /// Open the next track ahead of time and append it to the sink just
-    /// before the boundary.
-    fn schedule_prefetch(&mut self) {
+    /// Whether the coming boundary may be bridged at all: gapless-appended,
+    /// crossfaded or beat-mixed. `schedule_prefetch` does that, and
+    /// `next_wake` wakes up for it — both go by this.
+    fn may_overlap_boundary(&self) -> bool {
         // A pending end-of-track sleep must reach a real track end: no
         // gapless append, no crossfade. Same for an armed stop that fires at
-        // the coming boundary — the track has to end, not be overlapped.
-        if self.sleep_end_of_track || self.sleep_fade_item.is_some() {
-            return;
+        // the coming boundary — the track has to end, not be overlapped. A
+        // sleep fade in progress keeps the next track out of it, also once
+        // its window is open but nothing is marked as fading yet.
+        if self.sleep_end_of_track
+            || self.sleep_fade_item.is_some()
+            || self.sleep_ramp(self.position_ms()).is_some()
+        {
+            return false;
         }
         if self
             .queue
             .get(self.index)
             .is_some_and(|track| self.stop_after_fires(track))
         {
-            return;
+            return false;
         }
         // Repeat-One (and a single-track wrap) loops via handle_track_end, not a
         // gapless append of the same source — the identity guard can't
         // disambiguate a same-item_id "next".
-        let next_idx = self.auto_next_index();
-        if self.repeat == RepeatMode::One || next_idx == Some(self.index) {
+        self.repeat != RepeatMode::One && self.auto_next_index() != Some(self.index)
+    }
+
+    /// Open the next track ahead of time and append it to the sink just
+    /// before the boundary.
+    fn schedule_prefetch(&mut self) {
+        if !self.may_overlap_boundary() {
             return;
         }
+        let next_idx = self.auto_next_index();
         let Some(current) = self.queue.get(self.index).cloned() else {
             return;
         };
@@ -2210,6 +3595,7 @@ impl Worker {
         if should_start_prefetch(
             self.prefetched.is_some() || self.prefetch_inflight.is_some(),
             self.appended.as_deref(),
+            self.prefetch_failed.as_deref(),
             &next.item_id,
             duration,
             remaining,
@@ -2233,10 +3619,7 @@ impl Worker {
             // In time: a planned transition replaces the plain fade below
             // for as long as its moment has not passed.
             let position = self.position_ms();
-            if let Some(plan) = self
-                .transition_plan(&current, &next, effective_fade_ms)
-                .filter(|plan| position <= plan.start_at_ms + PLAN_LATE_MS)
-            {
+            if let Some(plan) = self.transition_plan(&current, &next, effective_fade_ms) {
                 if position + PLAN_LEAD_MS >= plan.start_at_ms {
                     if let Some(p) = self.prefetched.take() {
                         let lead = plan.start_at_ms.saturating_sub(position);
@@ -2282,7 +3665,10 @@ impl Worker {
     }
 
     /// The beat-aligned transition into the prefetched `next`, when the
-    /// setting is on and both tracks have been analysed (see analysis.rs).
+    /// setting is on and both tracks have been analysed (see analysis.rs) —
+    /// and only while it can still be started: a plan whose moment passed by
+    /// more than PLAN_LATE_MS is dropped for a plain crossfade, and nothing
+    /// may wait for it any more (`next_wake`).
     fn transition_plan(
         &self,
         current: &QueueTrack,
@@ -2302,13 +3688,21 @@ impl Worker {
             .waveform
             .analyses
             .get_matching(&next.item_id, next.duration_ms)?;
+        let position = self.position_ms();
         analysis::plan_transition(&a, &b, fade_ms)
+            .filter(|plan| position <= plan.start_at_ms + PLAN_LATE_MS)
     }
 
     /// How long the command loop may sleep: a tick, or less when a planned
-    /// transition is due before the next one.
+    /// transition is due before the next one. Only for a plan the tick will
+    /// start: one it never starts (a stop or a sleep ends this track, the
+    /// moment has passed) would keep the loop waking every millisecond until
+    /// the track ends.
     fn next_wake(&self) -> Duration {
-        if self.status != PlaybackStatus::Playing || !self.playback.beat_transitions {
+        if self.status != PlaybackStatus::Playing
+            || !self.playback.beat_transitions
+            || !self.may_overlap_boundary()
+        {
             return TICK;
         }
         let Some(current) = self.queue.get(self.index) else {
@@ -2344,10 +3738,14 @@ impl Worker {
     /// transition starts on the sample rather than on the thread wake-up.
     fn begin_crossfade(&mut self, p: Prefetched, fade_out_ms: u64, fade_in_ms: u64, lead_ms: u64) {
         let play_session = p.play_session;
-        if let Some(prev) = self.queue.get(self.index).cloned() {
-            let position_ms = self.position_ms();
-            self.report_stopped(&prev, position_ms);
-        }
+        // Where the outgoing track is let go. Its report waits until the next
+        // track is in the output: it writes the play history, and the lead of
+        // a planned transition was measured before this call.
+        let outgoing = self
+            .queue
+            .get(self.index)
+            .cloned()
+            .map(|track| (track, self.position_ms()));
         // The tail must stay steerable (pause/seek during the fade) and stop
         // feeding the visualizer — only one track drives the visuals.
         if let Some(tap) = self.current_tap.take() {
@@ -2360,6 +3758,7 @@ impl Worker {
                 old,
                 fade,
                 Instant::now() + self.tempo.wall(Duration::from_millis(fade_ms + 500)),
+                self.current_download.take(),
             ));
         }
         // A next source already gapless-appended to the old player (the queue
@@ -2374,27 +3773,31 @@ impl Worker {
         self.pending_download = None;
         self.pending_play_session = None;
 
-        let sink = rodio::Player::connect_new(self.output.mixer());
-        sink.set_volume(self.volume);
-        if lead_ms > 0 {
+        let lead = (lead_ms > 0).then(|| {
             // The player reports positions per source: the track's own
             // position starts at zero once the silence is through.
             self.lead_until =
                 Some(Instant::now() + self.tempo.wall(Duration::from_millis(lead_ms)));
             use rodio::Source as _;
-            sink.append(
-                rodio::source::Zero::new(p.source.channels(), p.source.sample_rate())
-                    .take_duration(Duration::from_millis(lead_ms)),
-            );
-        }
+            rodio::source::Zero::new(p.source.channels(), p.source.sample_rate())
+                .take_duration(Duration::from_millis(lead_ms))
+        });
         p.fade.begin(0.0, 1.0, Duration::from_millis(fade_in_ms));
-        sink.append(p.source);
+        let sink = start_player(self.output.mixer(), self.volume, false, |player| {
+            if let Some(silence) = lead {
+                player.append(silence);
+            }
+            player.append(p.source);
+        });
         self.sink = Some(sink);
         self.current_fade = Some(p.fade);
         self.sleep_fade_item = None;
         self.current_tap = Some(p.tap_enabled);
         self.current_download = Some(p.download);
         self.position_offset_ms = 0;
+        if let Some((prev, position_ms)) = outgoing {
+            self.report_stopped(&prev, position_ms);
+        }
         self.listen.restart(Instant::now(), 0);
         self.appended = None;
 
@@ -2402,7 +3805,7 @@ impl Worker {
         self.index = self.auto_next_index().unwrap_or(self.index);
         self.sync_queue();
         if let Some(track) = self.queue.get(self.index).cloned() {
-            self.ticks_since_report = 0;
+            self.last_progress_report = Instant::now();
             self.report_start(&track, play_session);
             self.update_media_metadata(&track);
         }
@@ -2416,11 +3819,17 @@ impl Worker {
     /// otherwise the queue order wins.
     fn handle_transition(&mut self, appended_item_id: &str) {
         self.appended = None;
+        // The appended source is what plays now, whatever follows: its fade
+        // is the one to steer (a stop or a cut-over below ramps it out).
+        self.current_fade = self.pending_fade.take();
         let finished = self.queue.get(self.index).cloned();
         if let Some(prev) = finished.as_ref() {
             self.report_stopped(prev, prev.duration_ms);
         }
         let invalidated_undo = self.queue_undo.take().is_some();
+        if self.stop_at_appended_boundary() {
+            return;
+        }
         let target = self.auto_next_index();
         let next_matches = target
             .and_then(|i| self.queue.get(i))
@@ -2430,13 +3839,19 @@ impl Worker {
             // The appended source plays its track from the very beginning.
             self.position_offset_ms = 0;
             self.listen.restart(Instant::now(), self.position_ms());
-            self.current_fade = self.pending_fade.take();
-            self.sleep_fade_item = None;
+            // A sleep fade that was running went over to the appended source
+            // (arm_appended): that is the one fading now.
+            if self.sleep_fade_item.is_some() {
+                self.sleep_fade_item = self
+                    .queue
+                    .get(self.index)
+                    .map(|track| track.item_id.clone());
+            }
             self.current_tap = self.pending_tap.take();
             self.current_download = self.pending_download.take();
             self.sync_queue();
             if let Some(track) = self.queue.get(self.index).cloned() {
-                self.ticks_since_report = 0;
+                self.last_progress_report = Instant::now();
                 let play_session = self
                     .pending_play_session
                     .take()
@@ -2446,27 +3861,18 @@ impl Worker {
             }
             self.update_media_playback();
             self.emit();
-            // "Sleep at end of track" armed while the next was already
-            // appended: pause right at the start of the new track. An armed
-            // stop that slipped past the append guard -- the queue changed
-            // after the hand-off -- lands the same way; here the track that is
-            // now playing *is* the one that follows the finished one.
-            let stop_due = finished
-                .as_ref()
-                .is_some_and(|track| self.stop_after_due_now(track, self.queue.get(self.index)));
-            if !self.sleep_at_boundary() && stop_due {
-                self.clear_stop_after();
-                self.pause();
-            }
         } else {
             // The queue was edited after the hand-off (next track removed,
             // moved, or something inserted before it): the appended audio no
             // longer matches the play order. The finished track is still at
-            // self.index, so cut over to whatever now follows it.
+            // self.index, so cut over to whatever now follows it — from its
+            // prefetch when that is ready already.
             if let Some(n) = self.auto_next_index() {
                 self.index = n;
                 self.sync_queue();
-                self.start_current();
+                if !self.start_from_prefetched() {
+                    self.start_current();
+                }
             } else {
                 if invalidated_undo {
                     self.sync_queue();
@@ -2480,8 +3886,30 @@ impl Worker {
     /// Current track finished with nothing appended (prefetch missed or was
     /// disabled): fall back to a regular start of the next track.
     fn handle_track_end(&mut self) {
+        // Where it really stopped. A decoder ends on any read error, so a
+        // stream that broke off ends the track early and looks like a natural
+        // end otherwise — reported at its full length, the server would count
+        // it as played through.
+        let stopped_at = self.position_ms();
+        let download = self
+            .current_download
+            .as_ref()
+            .and_then(|download| download.fraction());
         if let Some(prev) = self.queue.get(self.index).cloned() {
-            self.report_stopped(&prev, prev.duration_ms);
+            self.report_stopped(&prev, stopped_at);
+            if stream_broke_off(stopped_at, prev.duration_ms, download) {
+                // Not on to the next track as if nothing happened: stop on
+                // this one, where it broke off, so Play continues it there.
+                tracing::warn!("the stream broke off at {stopped_at} ms");
+                let _ = self.app.emit(
+                    "player:stream-broke-off",
+                    StreamBrokeOffEvent { name: &prev.name },
+                );
+                self.stop_internal();
+                self.position_offset_ms = stopped_at;
+                self.emit();
+                return;
+            }
         }
         let invalidated_undo = self.queue_undo.take().is_some();
         // Sleep timer with "finish the track": stop here, positioned at the
@@ -2522,7 +3950,17 @@ impl Worker {
             self.sync_queue();
             // Reuse a matching prefetched source to keep the gap minimal.
             if !self.start_from_prefetched() {
+                // Its prefetch may still be on the way, nearly done: the
+                // fresh open is the backup, and whichever lands first plays.
+                let in_flight = self
+                    .queue
+                    .get(n)
+                    .is_some_and(|track| self.prefetch_inflight.as_deref() == Some(&track.item_id));
+                let generation = self.generation;
                 self.start_current();
+                if in_flight {
+                    self.adoptable_prefetch = Some(generation);
+                }
             }
         } else {
             if invalidated_undo {
@@ -2531,6 +3969,44 @@ impl Worker {
             self.stop_internal();
             self.queue_ended = true;
         }
+    }
+
+    /// The prefetch that was still on its way when the track before it ended
+    /// landed before the fresh open of the same track (`handle_track_end`):
+    /// it plays, and the other open is dropped when it lands, the generation
+    /// having moved on. A failed one changes nothing — the fresh open is
+    /// still coming.
+    fn adopt_prefetch(
+        &mut self,
+        track: QueueTrack,
+        play_session: String,
+        result: AppResult<Box<OpenedSource>>,
+    ) {
+        let Ok(opened) = result else {
+            return;
+        };
+        if self.status != PlaybackStatus::Loading
+            || self.queue.get(self.index).map(|t| t.item_id.as_str())
+                != Some(track.item_id.as_str())
+        {
+            return;
+        }
+        let OpenedSource {
+            source,
+            fade,
+            tap_enabled,
+            download,
+            ..
+        } = *opened;
+        self.prefetched = Some(Prefetched {
+            item_id: track.item_id,
+            play_session,
+            source,
+            fade,
+            tap_enabled,
+            download,
+        });
+        self.start_from_prefetched();
     }
 
     /// Start the current queue track from an already-opened prefetched source.
@@ -2549,29 +4025,57 @@ impl Worker {
             return false;
         };
         self.generation = self.generation.wrapping_add(1);
+        // The old player may still sound: an appended track the queue has
+        // moved away from (handle_transition).
+        self.release_sink();
         self.prefetch_inflight = None;
+        self.prefetch_failed = None;
+        self.adoptable_prefetch = None;
         self.appended = None;
         self.pending_fade = None;
         self.pending_tap = None;
         self.pending_download = None;
         self.pending_play_session = None;
-        self.fading_out = None;
-        let sink = rodio::Player::connect_new(self.output.mixer());
-        sink.set_volume(self.volume);
-        sink.append(p.source);
+        // Started out of a load (adopt_prefetch), a pause pressed meanwhile
+        // holds; at a track end there is none, but a sleep timer may have
+        // run out.
+        let paused = self.take_start_paused();
+        self.arm_fresh(&p.fade, 0, paused);
+        let sink = start_player(self.output.mixer(), self.volume, paused, |player| {
+            player.append(p.source)
+        });
         self.sink = Some(sink);
         self.current_fade = Some(p.fade);
         self.current_tap = Some(p.tap_enabled);
         self.current_download = Some(p.download);
         self.position_offset_ms = 0;
         self.listen.restart(Instant::now(), 0);
-        self.status = PlaybackStatus::Playing;
-        self.ticks_since_report = 0;
+        self.status = if paused {
+            PlaybackStatus::Paused
+        } else {
+            PlaybackStatus::Playing
+        };
+        self.last_progress_report = Instant::now();
         self.report_start(&track, p.play_session);
+        if paused {
+            self.report_progress(true);
+        }
         self.update_media_metadata(&track);
         self.update_media_playback();
         self.emit();
         true
+    }
+
+    /// Whether the loading source arrives paused (Play/Pause pressed while it
+    /// loads). Shown at once, so the button says what the arrival will do.
+    fn set_pending_pause(&mut self, paused: bool) {
+        if self.pending_pause == paused {
+            return;
+        }
+        self.pending_pause = paused;
+        // The media overlay too: it still shows what it did before the load.
+        self.update_media_playback();
+        self.emit();
     }
 
     fn pause(&mut self) {
@@ -2586,10 +4090,14 @@ impl Worker {
             if let Some(fade) = &self.current_fade {
                 fade.ramp_to(0.0, Duration::from_millis(PAUSE_FADE_MS));
             }
+            // Not started yet (a crossed boundary was resolved before this):
+            // it starts silent should the boundary come during the sleep. A
+            // ramp would start it at full level, and the pause would then cut
+            // it off mid-ramp.
             if let Some(fade) = &self.pending_fade {
-                fade.ramp_to(0.0, Duration::from_millis(PAUSE_FADE_MS));
+                fade.begin(0.0, 0.0, Duration::ZERO);
             }
-            if let Some((_, fade, _)) = &self.fading_out {
+            if let Some((_, fade, ..)) = &self.fading_out {
                 fade.ramp_to(0.0, Duration::from_millis(PAUSE_FADE_MS));
             }
             std::thread::sleep(self.tempo.wall(Duration::from_millis(PAUSE_FADE_MS + 20)));
@@ -2600,7 +4108,7 @@ impl Worker {
                 PlaybackStatus::Playing => {}
                 PlaybackStatus::Loading => {
                     // Transition cut over to a fresh open: pause it on arrival.
-                    self.pending_pause = true;
+                    self.set_pending_pause(true);
                     return;
                 }
                 _ => return,
@@ -2627,28 +4135,44 @@ impl Worker {
                 if let Some(sink) = &self.sink {
                     sink.play();
                 }
+                // Up from silence, said so rather than ramped from the current
+                // gain: pause() left it at zero, but a source that was opened
+                // paused has never been pulled, so it has taken no ramp yet
+                // and would still start at full gain. pause() also replaced a
+                // sleep ramp with its own: come back to where the fade stands
+                // by now, not to full volume. The fade takes over from there
+                // once this ramp is done (update_sleep_fade, on a later tick).
+                let sleep = self.sleep_ramp(self.position_ms());
+                let level = sleep.map_or(1.0, |(gain, _)| gain);
                 if let Some(fade) = &self.current_fade {
-                    fade.ramp_to(1.0, Duration::from_millis(PAUSE_FADE_MS));
+                    fade.begin(0.0, level, Duration::from_millis(PAUSE_FADE_MS));
                 }
+                // Brought back below full by the sleep fade, it carries the
+                // fade already: cancelling it brings the gain back up.
+                self.sleep_fade_item = sleep
+                    .and_then(|_| self.queue.get(self.index))
+                    .map(|track| track.item_id.clone());
+                self.resume_ramp_until = Some(
+                    Instant::now() + self.tempo.wall(Duration::from_millis(PAUSE_FADE_MS + 50)),
+                );
                 // The appended next source was muted by pause() too.
-                if let Some(fade) = &self.pending_fade {
-                    fade.ramp_to(1.0, Duration::from_millis(PAUSE_FADE_MS));
-                }
+                self.arm_appended();
                 self.status = PlaybackStatus::Playing;
-                // pause() temporarily replaced the sleep ramp with its
-                // click-free pause ramp. Recompute the right gain/remaining
-                // time from the timer instead of resuming at full volume.
-                self.sleep_fade_item = None;
-                self.update_sleep_fade();
                 self.report_progress(false);
                 self.update_media_playback();
                 self.emit();
             }
             PlaybackStatus::Idle => {
+                // Ran out while nothing played: as above. Left armed, it would
+                // pause the track the moment it lands (take_start_paused).
+                if self.sleep_timer_due() {
+                    self.disarm_sleep_timer();
+                }
                 // Nothing loaded in the sink yet — start the current queue
-                // position (e.g. after a restored session).
+                // position (e.g. after a restored session), where a seek made
+                // meanwhile put it (seek_ms).
                 if !self.queue.is_empty() {
-                    self.start_current();
+                    self.start_current_at(self.position_offset_ms);
                 }
             }
             PlaybackStatus::Playing | PlaybackStatus::Loading => {}
@@ -2671,8 +4195,8 @@ impl Worker {
         self.start_current();
     }
 
-    fn remove_at(&mut self, i: usize, item_id: &str) {
-        if self.queue.get(i).map(|t| t.item_id.as_str()) != Some(item_id) {
+    fn remove_at(&mut self, i: usize, entry: &EntryRef) {
+        if !self.queue.get(i).is_some_and(|track| entry.matches(track)) {
             return;
         }
         self.remember_queue_undo();
@@ -2680,20 +4204,29 @@ impl Worker {
         let removing_current = i == self.index;
         // Where playback continues if we remove the current track: the play-
         // order successor (under shuffle that's not the physical neighbor),
-        // captured before the mutation reindexes everything.
-        let successor = if removing_current && self.status == PlaybackStatus::Playing {
-            self.next_index()
+        // captured before the mutation reindexes everything — and only if it
+        // was going on.
+        let landing = if removing_current {
+            landing_after_removal(
+                self.queue.len(),
+                i,
+                self.play_order(),
+                self.repeat == RepeatMode::All,
+            )
         } else {
             None
         };
+        let resume = landing.is_some_and(|(_, onward)| onward)
+            && plays_on_after_removal(self.status, self.pending_pause);
+        // Its player goes when playback continues or stops below.
         if removing_current {
             self.report_stopped_playing();
-            self.sink = None;
         }
         self.queue_mut().remove(i);
         if self.shuffle {
-            self.order.retain(|&v| v != i);
-            for v in self.order.iter_mut() {
+            let order = self.order_mut();
+            order.retain(|&v| v != i);
+            for v in order.iter_mut() {
                 if *v > i {
                     *v -= 1;
                 }
@@ -2704,16 +4237,17 @@ impl Worker {
         }
         self.index = self.index.min(self.queue.len().saturating_sub(1));
         if removing_current {
-            // Remap the successor through the removal shift and continue there,
-            // instead of whatever physical slot clamping landed on.
-            if let Some(t) = successor.filter(|_| !self.queue.is_empty()) {
-                self.index = if t > i { t - 1 } else { t };
+            if let Some((landing, _)) = landing {
+                self.index = landing;
+            }
+            if resume {
                 self.sync_queue();
                 self.start_current();
                 return;
             }
-            self.status = PlaybackStatus::Idle;
-            self.update_media_playback();
+            // Everything of the removed track goes with it: its position and
+            // buffered range would show on the entry that took its slot.
+            self.stop_internal();
         }
         self.sync_queue();
         self.emit();
@@ -2730,8 +4264,9 @@ impl Worker {
         }
         self.queue_undo = None;
         if self.shuffle && self.order.len() == len {
-            let entry = self.order.remove(from);
-            self.order.insert(to, entry);
+            let order = self.order_mut();
+            let entry = order.remove(from);
+            order.insert(to, entry);
             self.sync_queue();
             self.emit();
             return;
@@ -2740,7 +4275,7 @@ impl Worker {
         let track = queue.remove(from);
         queue.insert(to, track);
         if self.shuffle {
-            for v in self.order.iter_mut() {
+            for v in self.order_mut().iter_mut() {
                 *v = remap_move(*v, from, to);
             }
         }
@@ -2772,10 +4307,11 @@ impl Worker {
         self.stop_internal();
         self.queue_mut().clear();
         self.index = 0;
-        self.order.clear();
-        self.last_auto_dj_seed = None;
+        self.order_mut().clear();
+        self.rearm_auto_dj();
         self.queue_undo = None;
         self.recent_tracks.clear();
+        self.clear_media_metadata();
         self.sync_queue();
         self.emit();
     }
@@ -2789,8 +4325,9 @@ impl Worker {
         self.stop_internal();
         self.queue_mut().clear();
         self.index = 0;
-        self.order.clear();
-        self.last_auto_dj_seed = None;
+        self.order_mut().clear();
+        self.rearm_auto_dj();
+        self.clear_media_metadata();
         self.sync_queue();
         self.emit();
     }
@@ -2826,7 +4363,8 @@ impl Worker {
             .filter_map(|(index, track)| (!removed.contains(&index)).then_some(track))
             .collect();
         if self.shuffle {
-            self.order = remap_order_after_removals(&self.order, &indices);
+            let order = remap_order_after_removals(&self.order, &indices);
+            *self.order_mut() = order;
         }
         self.index = remap_after_removals(self.index, &indices).unwrap_or(0);
         self.sync_queue();
@@ -2860,7 +4398,7 @@ impl Worker {
         }
         *self.queue_mut() = undo.tracks;
         self.index = undo.index.min(self.queue.len().saturating_sub(1));
-        self.order = if self.shuffle { undo.order } else { Vec::new() };
+        *self.order_mut() = if self.shuffle { undo.order } else { Vec::new() };
         self.last_auto_dj_seed = undo.last_auto_dj_seed;
         self.invalidate_next();
         self.sync_queue();
@@ -2870,7 +4408,7 @@ impl Worker {
                 PlaybackStatus::Playing | PlaybackStatus::Loading => self.start_current(),
                 PlaybackStatus::Paused => {
                     self.start_current();
-                    self.pending_pause = true;
+                    self.set_pending_pause(true);
                 }
                 PlaybackStatus::Idle => {
                     self.status = PlaybackStatus::Idle;
@@ -2885,9 +4423,25 @@ impl Worker {
     /// Stop current playback and asynchronously open the track at the current
     /// queue index. Never blocks the command loop.
     fn start_current(&mut self) {
+        self.start_current_at(0);
+    }
+
+    /// [`Self::start_current`], `position_ms` into the track: where a seek
+    /// made while nothing played has put it.
+    fn start_current_at(&mut self, position_ms: u64) {
+        // The installer is about to end the process (`updater::hand_over`,
+        // which sends the final reports): a track started now would be cut
+        // off at once. The queue keeps what was asked for.
+        if crate::updater::handing_over() {
+            self.emit();
+            return;
+        }
         self.generation = self.generation.wrapping_add(1);
+        self.release_sink();
         self.prefetched = None;
         self.prefetch_inflight = None;
+        self.prefetch_failed = None;
+        self.adoptable_prefetch = None;
         self.appended = None;
         self.pending_pause = false;
         self.queue_ended = false;
@@ -2898,10 +4452,10 @@ impl Worker {
         self.current_tap = None;
         self.pending_download = None;
         self.current_download = None;
-        self.fading_out = None;
-        self.position_offset_ms = 0;
-        self.listen.restart(Instant::now(), 0);
-        self.sink = None;
+        self.position_offset_ms = position_ms;
+        self.listen.restart(Instant::now(), position_ms);
+        // A new attempt: the callers report the previous one stopped first.
+        self.play_session_id = None;
         // The output may have died while idle; bring it back before playing.
         if !self.output_alive {
             // Once a requested device has failed, stay on the default output
@@ -2938,13 +4492,23 @@ impl Worker {
         };
         self.status = PlaybackStatus::Loading;
         self.emit();
-        self.spawn_open(OpenPurpose::Play, track);
+        // Started at a position, the open is positioned like a reopen; it is
+        // still a new attempt (source_ready reports its start).
+        let purpose = if position_ms > 0 {
+            OpenPurpose::SeekRestart { position_ms }
+        } else {
+            OpenPurpose::Play
+        };
+        self.spawn_open(purpose, track);
     }
 
     fn stop_internal(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.release_sink();
         self.prefetched = None;
         self.prefetch_inflight = None;
+        self.prefetch_failed = None;
+        self.adoptable_prefetch = None;
         self.appended = None;
         self.pending_pause = false;
         self.queue_ended = false;
@@ -2954,14 +4518,44 @@ impl Worker {
         self.current_tap = None;
         self.pending_download = None;
         self.current_download = None;
-        self.fading_out = None;
         self.position_offset_ms = 0;
         // Every stop path reports first, so nothing measured is lost here.
         self.listen = scrobble::ListenClock::default();
-        self.sink = None;
         self.status = PlaybackStatus::Idle;
         self.update_media_playback();
         self.emit();
+    }
+
+    /// Take the current player off the output without a click. Dropping a
+    /// player cuts its sound off mid-waveform, so it ramps to silence and a
+    /// later tick drops it; an appended next source in it must not start
+    /// meanwhile, and a crossfade tail goes the same way. Paused or played
+    /// out, it is silent already and goes at once.
+    fn release_sink(&mut self) {
+        let ramp = Duration::from_millis(RELEASE_FADE_MS);
+        let drop_at = Instant::now()
+            + self
+                .tempo
+                .wall(Duration::from_millis(RELEASE_FADE_MS + 100));
+        if let Some(sink) = self.sink.take() {
+            if !sink.is_paused() && !sink.empty() {
+                if let Some(fade) = &self.current_fade {
+                    fade.ramp_to(0.0, ramp);
+                }
+                if let Some(fade) = &self.pending_fade {
+                    fade.begin(0.0, 0.0, Duration::ZERO);
+                }
+                // Only one track drives the visuals, and that is the next.
+                for tap in [&self.current_tap, &self.pending_tap].into_iter().flatten() {
+                    tap.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.draining.push((sink, drop_at));
+            }
+        }
+        if let Some((tail, fade, _, _)) = self.fading_out.take() {
+            fade.ramp_to(0.0, ramp);
+            self.draining.push((tail, drop_at));
+        }
     }
 
     fn fail_start(&mut self, track: &QueueTrack, e: AppError) {
@@ -2972,17 +4566,31 @@ impl Worker {
             "player:error",
             format!("Cannot play \"{}\": {e}", track.name),
         );
-        self.sink = None;
-        self.status = PlaybackStatus::Idle;
-        self.update_media_playback();
-        self.emit();
+        // Nothing plays: what the failed attempt left behind goes, like on
+        // any stop. Where it was to start stays, as the target an idle
+        // player starts at (seek_ms): Play tries there again, the seek bar
+        // keeps showing it, and Prev or a seek move it.
+        let start_at = self.position_offset_ms;
+        self.stop_internal();
+        if start_at > 0 {
+            self.position_offset_ms = start_at;
+            self.emit();
+        }
     }
 
     /// Open a track's stream + decoder on a short-lived background thread and
     /// deliver the result back through the command channel.
     fn spawn_open(&mut self, purpose: OpenPurpose, track: QueueTrack) {
         let Some(client) = self.session_client() else {
-            if matches!(purpose, OpenPurpose::Play) {
+            // Nothing will answer, and a reopen has dropped its player
+            // already (restart_at): left alone it would wait in Loading for
+            // good. A reopen's start was reported, so its session is closed
+            // first, as for a reopen that fails.
+            if matches!(purpose, OpenPurpose::SeekRestart { .. }) && self.play_session_id.is_some()
+            {
+                self.report_stopped_playing();
+            }
+            if !matches!(purpose, OpenPurpose::Prefetch) {
                 self.fail_start(&track, AppError::NotConnected);
             }
             return;
@@ -3016,6 +4624,10 @@ impl Worker {
         let waveform = self.waveform.clone();
         let generation = self.generation;
         let prefetch_generation = self.prefetch_generation;
+        let ticket = self.opens.start(
+            generation,
+            matches!(purpose, OpenPurpose::Prefetch).then_some(prefetch_generation),
+        );
         let tx = self.tx.clone();
         let session = play_session.clone();
         let spawned = std::thread::Builder::new()
@@ -3032,6 +4644,7 @@ impl Worker {
                             play_session: &session,
                             gain_db,
                             start_ms,
+                            stop: ticket.stop_token(),
                         },
                         dsp,
                         tap,
@@ -3040,6 +4653,7 @@ impl Worker {
                 }))
                 .unwrap_or_else(|_| Err(AppError::Audio("the decoder crashed".into())))
                 .map(Box::new);
+                ticket.delivered();
                 let _ = tx.send(PlayerCommand::SourceReady {
                     generation,
                     prefetch_generation,
@@ -3055,6 +4669,10 @@ impl Worker {
             // failure instead.
             tracing::error!("failed to spawn open thread");
             self.prefetch_inflight = None;
+            if matches!(purpose, OpenPurpose::SeekRestart { .. }) && self.play_session_id.is_some()
+            {
+                self.report_stopped_playing();
+            }
             if matches!(purpose, OpenPurpose::Play | OpenPurpose::SeekRestart { .. }) {
                 let track = self.queue.get(self.index).cloned();
                 if let Some(track) = track {
@@ -3062,6 +4680,17 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Stop the downloads of opens whose result `source_ready` would now
+    /// throw away. Their threads may be waiting for a stalled server, and
+    /// would otherwise keep downloading what nobody plays.
+    fn stop_stale_opens(&mut self) {
+        self.opens.stop_stale(
+            self.generation,
+            self.prefetch_generation,
+            self.adoptable_prefetch,
+        );
     }
 
     fn session_client(&self) -> Option<Arc<JellyfinClient>> {
@@ -3073,11 +4702,33 @@ impl Worker {
     /// but the one-shot error of a freshly rebuilt stream must not be lost —
     /// it is deferred to a tick instead of dropped.
     fn handle_output_failed(&mut self) {
+        // The error of a stream that has been replaced since (a device
+        // switch, an earlier rebuild) is no reason to leave the one playing.
+        if !self.output_dead.load(std::sync::atomic::Ordering::Relaxed) {
+            self.output_failed_pending = false;
+            return;
+        }
         if self.last_output_rebuild.elapsed() <= Duration::from_secs(2) {
             self.output_failed_pending = true;
             return;
         }
         self.output_failed_pending = false;
+        let requested = self.playback.output_device.clone();
+        // How long the failed stream ran: a switch or a "switch back" that
+        // did not open left it playing, and does not make it any younger.
+        if reopen_configured_first(
+            requested.is_some(),
+            crate::audio_devices::fallback_device().is_some(),
+            self.stream_opened_at.elapsed(),
+        ) {
+            match self.rebuild_output(requested) {
+                Ok(()) => {
+                    tracing::warn!("audio output failed; reopened the configured device");
+                    return;
+                }
+                Err(e) => tracing::warn!("the configured output did not reopen: {e}"),
+            }
+        }
         tracing::warn!("audio output failed; falling back to the default device");
         if self.try_rebuild_output(None) {
             if let Some(requested_device) = self.playback.output_device.clone() {
@@ -3086,7 +4737,13 @@ impl Worker {
                 crate::audio_devices::mark_fallback(requested_device.clone());
                 let _ = self.app.emit(
                     "audio:output-fallback",
-                    crate::audio_devices::AudioOutputFallbackEvent { requested_device },
+                    crate::audio_devices::AudioOutputFallbackEvent {
+                        requested_device: self
+                            .playback
+                            .output_device_name
+                            .clone()
+                            .unwrap_or(requested_device),
+                    },
                 );
             }
         } else {
@@ -3106,34 +4763,8 @@ impl Worker {
     /// Swap the audio output and pick playback back up. Returns false (and
     /// keeps the previous output untouched) when the new device cannot open.
     fn try_rebuild_output(&mut self, device: Option<String>) -> bool {
-        self.last_output_rebuild = Instant::now();
-        match open_output(&device, &self.tempo, self.tx.clone()) {
-            Ok((output, dead, device)) => {
-                crate::audio_devices::clear_fallback();
-                let position_ms = self.position_ms();
-                self.output = output;
-                self.output_dead = dead;
-                self.output_alive = true;
-                self.output_opened(device);
-                match self.status {
-                    PlaybackStatus::Idle => {
-                        self.sink = None;
-                        self.current_fade = None;
-                        self.pending_fade = None;
-                        self.current_download = None;
-                        self.pending_download = None;
-                        self.fading_out = None;
-                    }
-                    // An in-flight open belongs to the old output; restart the
-                    // track cleanly (loses a pending seek target, but keeps
-                    // reporting correct).
-                    PlaybackStatus::Loading => self.start_current(),
-                    PlaybackStatus::Playing | PlaybackStatus::Paused => {
-                        self.restart_at(position_ms)
-                    }
-                }
-                true
-            }
+        match self.rebuild_output(device) {
+            Ok(()) => true,
             Err(e) => {
                 tracing::error!("cannot open audio output: {e}");
                 let _ = self
@@ -3142,6 +4773,141 @@ impl Worker {
                 false
             }
         }
+    }
+
+    /// [`Self::try_rebuild_output`] without reporting a failure, for a caller
+    /// that still has another way out.
+    fn rebuild_output(&mut self, device: Option<String>) -> AppResult<()> {
+        // A gapless boundary crossed since the last tick is settled first
+        // (the tick follows the default device before it looks): the
+        // position read below must belong to the track `index` names, not to
+        // the one appended after it.
+        self.maybe_transition();
+        self.last_output_rebuild = Instant::now();
+        // The configured device is also found by its name, should Windows
+        // list it under a new id.
+        let name = self
+            .playback
+            .output_device_name
+            .clone()
+            .filter(|_| device.is_some() && device == self.playback.output_device);
+        let (output, dead, opened) =
+            open_output_named(&device, name.as_deref(), &self.tempo, self.tx.clone())?;
+        crate::audio_devices::clear_fallback();
+        let position_ms = self.position_ms();
+        // Dropping the old stream waits for its callback to return, which one
+        // stuck reading a stalled download never does: stop the downloads
+        // first. Every branch below lets go of these sources anyway.
+        self.current_download = None;
+        self.pending_download = None;
+        self.fading_out = None;
+        self.output = output;
+        self.output_dead = dead;
+        self.output_alive = true;
+        if let (Some(_), Some(entry)) = (&device, &opened) {
+            if adopt_output_device(&mut self.playback, &entry.device) {
+                self.persist_playback();
+            }
+        }
+        self.output_opened(opened);
+        match self.status {
+            PlaybackStatus::Idle => {
+                self.sink = None;
+                self.current_fade = None;
+                self.pending_fade = None;
+                self.current_download = None;
+                self.pending_download = None;
+                self.fading_out = None;
+            }
+            // An open in flight is tied to no output: its player joins
+            // whichever one is there when it lands (source_ready).
+            // Restarting it would lose a seek target, a pause pressed
+            // while it loads and the play session a reopen continues.
+            PlaybackStatus::Loading => {}
+            PlaybackStatus::Playing | PlaybackStatus::Paused => self.restart_at(position_ms),
+        }
+        Ok(())
+    }
+
+    /// "System default" follows the system: when the default device changes
+    /// (headphones that connect, a pick in the volume flyout), the output
+    /// moves to the new one. A fallback plays on the system default as well,
+    /// so it follows too. Polled: cpal reports no such change, and asking
+    /// for the default is cheap.
+    fn follow_default_output(&mut self) {
+        if self.last_default_poll.elapsed() < DEFAULT_OUTPUT_POLL {
+            return;
+        }
+        self.last_default_poll = Instant::now();
+        let fallback = crate::audio_devices::fallback_device();
+        if (self.playback.output_device.is_some() && fallback.is_none())
+            || !self.output_alive
+            || self.output_failed_pending
+            || self.last_output_rebuild.elapsed() < DEFAULT_OUTPUT_POLL
+        {
+            return;
+        }
+        let Some(default) = default_output_id() else {
+            return;
+        };
+        let active = self.opened_output.as_ref().map(|o| o.device.id.as_str());
+        if active == Some(default.as_str()) {
+            // On the default again: a later change is worth a try anew.
+            self.default_output_failed = None;
+        }
+        let standing_in_for = fallback
+            .as_ref()
+            .and(self.playback.output_device.as_deref());
+        if !should_follow_default(
+            &default,
+            active,
+            self.default_output_failed.as_ref(),
+            standing_in_for,
+        ) {
+            return;
+        }
+        tracing::info!("the system default output changed; following it");
+        // Quietly: nobody asked for this switch, and the music goes on
+        // where it plays if the new default does not open.
+        match self.rebuild_output(None) {
+            Ok(()) => {
+                self.default_output_failed = None;
+                if let Some(requested) = fallback {
+                    // Still standing in for the configured device.
+                    crate::audio_devices::mark_fallback(requested);
+                }
+            }
+            Err(e) => {
+                let failed = FailedDefault::after(self.default_output_failed.take(), default);
+                tracing::warn!(
+                    "the new default output did not open (attempt {} of {DEFAULT_OUTPUT_ATTEMPTS}): {e}",
+                    failed.attempts
+                );
+                self.default_output_failed = Some(failed);
+            }
+        }
+    }
+
+    /// Whether `settings` ask for the configured device that plays now,
+    /// maybe under an id or name it had before (see [`names_output`]). Never
+    /// during a fallback: the configured device is not what plays then.
+    fn means_playing(&self, settings: &PlaybackSettings) -> bool {
+        let (Some(requested), Some(_), Some(playing)) = (
+            settings.output_device.as_deref(),
+            &self.playback.output_device,
+            &self.opened_output,
+        ) else {
+            return false;
+        };
+        crate::audio_devices::fallback_device().is_none()
+            && list_outputs().is_ok_and(|outputs| {
+                names_output(
+                    requested,
+                    settings.output_device_name.as_deref(),
+                    &playing.device,
+                    outputs.iter().map(|(_, entry)| entry),
+                )
+            })
     }
 
     fn persist_playback(&self) {
@@ -3197,19 +4963,24 @@ impl Worker {
         // the listen rule then goes by time listened, not by that position.
         self.listen
             .sample_at(Instant::now(), position_ms, self.tempo.speed());
-        let listened_ms = self.listen.take();
-        if self.recent_tracks.back() != Some(&track.item_id) {
-            self.recent_tracks.push_back(track.item_id.clone());
+        let listen = self.listen.take();
+        if self
+            .recent_tracks
+            .back()
+            .map(|recent| recent.item_id.as_str())
+            != Some(track.item_id.as_str())
+        {
+            self.recent_tracks.push_back(RecentTrack::of(track));
         }
         let keep = self.extras.auto_dj_recent_tracks.clamp(1, 500) as usize;
         while self.recent_tracks.len() > keep {
             self.recent_tracks.pop_front();
         }
-        if scrobble::should_scrobble(listened_ms, track.duration_ms) {
+        if scrobble::should_scrobble(listen.listened_ms, track.duration_ms) {
             if let Some(token) = self.extras.listenbrainz_token.clone() {
-                scrobble::submit_listen(token, track.clone());
+                scrobble::submit_listen(token, track.clone(), listen.started_at);
             }
-            if self.record_history(track, listened_ms) {
+            if self.record_history(track, &listen) {
                 let _ = self.app.emit("history:changed", ());
             }
         }
@@ -3237,75 +5008,112 @@ impl Worker {
     /// session (and its transcode job) alive until the server times it out,
     /// and dropping the ListenBrainz listen for the track being played.
     fn shutdown(&mut self) {
-        self.report_stopped_blocking(false);
+        self.save_volume();
+        let report = self.take_final_report(false);
         // Deliberately NOT stop_internal(): that ends in `emit()`, which
         // updates the tray, and the tray menu has to be touched on the main
         // thread. The main thread is at this very moment blocked waiting for
         // our acknowledgement (`quit()` -> `PlayerHandle::shutdown`), so going
         // through it would stall the whole quit until the 2.5 s timeout.
         // Nobody is watching the UI during shutdown anyway; just release the
-        // audio device.
+        // audio device — before the report, which waits for the network.
         self.generation = self.generation.wrapping_add(1);
         self.prefetched = None;
         self.prefetch_inflight = None;
         self.appended = None;
         self.current_fade = None;
         self.fading_out = None;
+        self.draining.clear();
         self.sink = None;
+        // Stopped before the output goes with the worker: its drop waits for
+        // a callback that may be waiting for one of these.
+        self.current_download = None;
+        self.pending_download = None;
         self.status = PlaybackStatus::Idle;
+        if let Some(report) = report {
+            self.send_final_report(report);
+        }
     }
 
-    /// Like [`Self::report_stopped_playing`], but waits for the requests
-    /// instead of spawning them — for the moments where the runtime or the
-    /// session is about to disappear (quit, sign-out).
+    /// Settle the current track for its final report while it still plays —
+    /// for the moments where the runtime or the session is about to disappear
+    /// (quit, sign-out): where it is, what of it was heard, the play session
+    /// it went out under. The audio can stop right after; the report is sent
+    /// by [`Self::send_final_report`].
     ///
     /// `resolve_boundary` settles a crossed track boundary first. Quit passes
     /// false: resolving it emits state, which updates the tray on the main
     /// thread — and that thread is blocked in `quit()` waiting for us.
-    fn report_stopped_blocking(&mut self, resolve_boundary: bool) {
+    fn take_final_report(&mut self, resolve_boundary: bool) -> Option<FinalReport> {
         if resolve_boundary {
             self.maybe_transition();
         }
         let position_ms = self.position_ms();
-        let Some(track) = self.queue.get(self.index).cloned() else {
-            return;
-        };
+        let track = self.queue.get(self.index).cloned()?;
         self.listen
             .sample_at(Instant::now(), position_ms, self.tempo.speed());
-        let listened_ms = self.listen.take();
-        // Jellyfin first: the caller waits only briefly, and a slow
-        // ListenBrainz must not use up the time the session report needs.
-        if let (Some(session_id), Some(client)) =
-            (self.play_session_id.take(), self.session_client())
-        {
+        Some(FinalReport {
+            listen: self.listen.take(),
+            session_id: self.play_session_id.take(),
+            track,
+            position_ms,
+        })
+    }
+
+    /// Like [`Self::report_stopped`], but waits for the requests instead of
+    /// spawning them. The play history goes first: it is a local write, and
+    /// the process may be gone before a slow server answers. Then Jellyfin:
+    /// the caller waits only briefly, and a slow ListenBrainz must not use up
+    /// the time the session report needs.
+    fn send_final_report(&self, report: FinalReport) {
+        let FinalReport {
+            track,
+            position_ms,
+            listen,
+            session_id,
+        } = report;
+        let counts = scrobble::should_scrobble(listen.listened_ms, track.duration_ms);
+        if counts {
+            // No event: nobody is looking at the timeline while the session
+            // goes away.
+            self.record_history(&track, &listen);
+        }
+        if let (Some(session_id), Some(client)) = (session_id, self.session_client()) {
             let item_id = track.item_id.clone();
             tauri::async_runtime::block_on(async move {
-                if let Err(e) = client
-                    .report_stopped(&item_id, &session_id, position_ms)
-                    .await
-                {
-                    tracing::debug!("final report stopped failed: {e}");
+                let report = client.report_stopped(&item_id, &session_id, position_ms);
+                match tokio::time::timeout(FINAL_REPORT_TIMEOUT, report).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("final report stopped failed: {e}"),
+                    Err(_) => tracing::debug!("final report stopped got no answer in time"),
                 }
             });
         }
-        if scrobble::should_scrobble(listened_ms, track.duration_ms) {
-            // Before ListenBrainz, which may take its time; no event, nobody
-            // is looking at the timeline while the app goes away.
-            self.record_history(&track, listened_ms);
+        if counts {
             if let Some(token) = self.extras.listenbrainz_token.clone() {
-                scrobble::submit_listen_blocking(token, track);
+                scrobble::submit_listen_blocking(
+                    token,
+                    track,
+                    listen.started_at,
+                    FINAL_REPORT_TIMEOUT,
+                );
             }
         }
     }
 
-    /// One row in the play history for a listen that counts. A failed write
-    /// costs that row and nothing else; playback does not wait on it beyond
-    /// one local insert.
-    fn record_history(&self, track: &QueueTrack, listened_ms: u64) -> bool {
+    /// One row in the play history for a listen that counts, dated when the
+    /// listening ended — a track paused overnight and reported stopped the
+    /// next morning was heard the night before. A failed write costs that row
+    /// and nothing else; playback does not wait on it beyond one local insert.
+    fn record_history(&self, track: &QueueTrack, listen: &scrobble::Listen) -> bool {
         if !self.extras.record_history {
             return false;
         }
-        match crate::history::record(&self.store, track, listened_ms) {
+        let played_at = listen
+            .ended_at
+            .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_millis() as i64);
+        match crate::history::record(&self.store, track, listen.listened_ms, played_at) {
             Ok(written) => written,
             Err(e) => {
                 tracing::warn!("play history not written: {e}");
@@ -3326,9 +5134,13 @@ impl Worker {
     // --- Windows SMTC (media overlay + hardware media keys) ---
 
     fn update_media_metadata(&mut self, track: &QueueTrack) {
-        let cover = self.cover_file_url(track);
+        let mut cover = self.cover_file_url(track);
         if cover.is_none() {
             self.fetch_smtc_artwork(track);
+            // souvlaki leaves the thumbnail alone without a cover, so the
+            // overlay would show the previous track's: a neutral one stands
+            // in until (or unless) the real one lands.
+            cover = self.placeholder_cover_url();
         }
         let Some(controls) = self.media.as_mut() else {
             return;
@@ -3340,6 +5152,42 @@ impl Worker {
             duration: Some(Duration::from_millis(track.duration_ms)),
             cover_url: cover.as_deref(),
         });
+    }
+
+    /// The queue is gone (cleared, or the account signed out): nothing of the
+    /// last track may linger in the media overlay. souvlaki only overwrites
+    /// what it is given, so it gets empty fields and the neutral cover.
+    fn clear_media_metadata(&mut self) {
+        let cover = self.placeholder_cover_url();
+        let Some(controls) = self.media.as_mut() else {
+            return;
+        };
+        let _ = controls.set_metadata(souvlaki::MediaMetadata {
+            title: Some(""),
+            artist: Some(""),
+            album: Some(""),
+            duration: None,
+            cover_url: cover.as_deref(),
+        });
+    }
+
+    /// The media overlay's stand-in cover — the app icon — as souvlaki wants
+    /// it (see `cover_file_url`). Written into the cover directory on first
+    /// use, and again whenever the cache has cleared or evicted it.
+    fn placeholder_cover_url(&self) -> Option<String> {
+        const ICON: &[u8] = include_bytes!("../../icons/128x128.png");
+        // No overlay, no picture to put in it.
+        self.media.as_ref()?;
+        // Not a name the jfimg cache uses (`cache::cover_file_name`).
+        let path = self.cover_dir.join("smtc-placeholder.png");
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(&self.cover_dir);
+            if let Err(e) = crate::cache::write_file_atomic(&path, ICON) {
+                tracing::debug!("smtc placeholder cover not written: {e}");
+                return None;
+            }
+        }
+        Some(format!("file://{}", path.display()))
     }
 
     /// The cover is not in the jfimg disk cache yet (e.g. the album was never
@@ -3388,25 +5236,18 @@ impl Worker {
     }
 
     fn update_media_playback(&mut self) {
-        let position = souvlaki::MediaPosition(Duration::from_millis(self.position_ms()));
+        let position = Duration::from_millis(self.position_ms());
+        let playback = media_playback(self.status, self.pending_pause, position);
         let Some(controls) = self.media.as_mut() else {
             return;
-        };
-        let playback = match self.status {
-            PlaybackStatus::Playing | PlaybackStatus::Loading => souvlaki::MediaPlayback::Playing {
-                progress: Some(position),
-            },
-            PlaybackStatus::Paused => souvlaki::MediaPlayback::Paused {
-                progress: Some(position),
-            },
-            PlaybackStatus::Idle => souvlaki::MediaPlayback::Stopped,
         };
         let _ = controls.set_playback(playback);
     }
 
     /// Queue is on its last track and Auto-DJ is on: append a server mix
     /// seeded by it (once per track; the latch is released on failure so a
-    /// transient error is retried on a later tick).
+    /// transient error is retried on a later tick — after a pause, and only a
+    /// few times, see [`AutoDjRetry`]).
     fn maybe_auto_dj(&mut self) {
         if !self.extras.auto_dj_enabled
             || self.sleep_end_of_track // playback is about to stop on purpose
@@ -3426,6 +5267,13 @@ impl Worker {
         if self.last_auto_dj_seed.as_deref() == Some(current.item_id.as_str()) {
             return;
         }
+        if self
+            .auto_dj_retry
+            .as_ref()
+            .is_some_and(|retry| retry.holds(&current.item_id, Instant::now()))
+        {
+            return;
+        }
         self.last_auto_dj_seed = Some(current.item_id.clone());
         let Some(client) = self.session_client() else {
             return;
@@ -3435,75 +5283,80 @@ impl Worker {
         let max_tracks = self.extras.auto_dj_max_tracks.clamp(5, 100) as usize;
         let mut existing: std::collections::HashSet<String> =
             self.queue.iter().map(|t| t.item_id.clone()).collect();
-        existing.extend(self.recent_tracks.iter().cloned());
+        existing.extend(self.recent_tracks.iter().map(|t| t.item_id.clone()));
+        // The same, by recording: another file of a track that is queued or
+        // was just heard is that song again — and to the sonic continuation
+        // the closest match of all.
+        let mut heard_recordings = crate::commands_sonic::Recordings::default();
+        for track in &self.queue {
+            heard_recordings.insert(&track.artist, &track.name, track.duration_ms);
+        }
+        for track in &self.recent_tracks {
+            heard_recordings.insert(&track.artist, &track.name, track.duration_ms);
+        }
         // What was just heard, oldest first, ending with the current track:
         // the sonic continuation follows where the set has gone.
-        let mut heard: Vec<String> = self.recent_tracks.iter().cloned().collect();
+        let mut heard: Vec<String> = self
+            .recent_tracks
+            .iter()
+            .map(|t| t.item_id.clone())
+            .collect();
         heard.retain(|id| id != &request_track);
         heard.push(request_track.clone());
         let sonic = (reason.kind == AutoDjSeedMode::Sonic).then(|| self.store.clone());
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
-            let (reason, sonic_ids) = match sonic {
-                Some(store) => {
-                    let exclude = existing.clone();
-                    let ids = tokio::task::spawn_blocking(move || {
-                        crate::sonic::index(&store).continuation(&heard, max_tracks, &exclude)
-                    })
+            let mut reason = reason;
+            let mut tracks = Vec::new();
+            if let Some(store) = sonic {
+                let exclude = existing.clone();
+                let ids = tokio::task::spawn_blocking(move || {
+                    crate::sonic::index(&store).continuation(&heard, max_tracks, &exclude)
+                })
+                .await
+                .unwrap_or_default();
+                if ids.len() >= 3 {
+                    match client.tracks_by_ids(&ids).await {
+                        Ok(mut found) => {
+                            let position =
+                                |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
+                            found.sort_by_key(|t| position(&t.id));
+                            tracks = fresh_mix(found, &existing, &heard_recordings, max_tracks);
+                        }
+                        Err(e) => tracing::warn!("auto-dj sonic tracks failed: {e}"),
+                    }
+                }
+                // A handful is not a set; let the server mix it instead. Told
+                // after the fetch: ids the server no longer has, or this
+                // account cannot see, are no set either.
+                if tracks.len() < 3 {
+                    tracks.clear();
+                    reason = AutoDjReason {
+                        kind: AutoDjSeedMode::Track,
+                        label: reason.label,
+                    };
+                }
+            }
+            if tracks.is_empty() {
+                match client
+                    .instant_mix(&seed, (max_tracks as u32).saturating_mul(3))
                     .await
-                    .unwrap_or_default();
-                    // A handful is not a set; let the server mix it instead.
-                    if ids.len() >= 3 {
-                        (reason, Some(ids))
-                    } else {
-                        let fallback = AutoDjReason {
-                            kind: AutoDjSeedMode::Track,
-                            label: reason.label,
-                        };
-                        (fallback, None)
-                    }
+                {
+                    Ok(mix) => tracks = fresh_mix(mix, &existing, &heard_recordings, max_tracks),
+                    Err(e) => tracing::warn!("auto-dj mix failed: {e}"),
                 }
-                None => (reason, None),
-            };
-            let fetched = match sonic_ids {
-                Some(ids) => client.tracks_by_ids(&ids).await.map(|mut tracks| {
-                    let position =
-                        |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
-                    tracks.sort_by_key(|t| position(&t.id));
-                    crate::commands_sonic::without_copies(tracks)
-                }),
-                None => {
-                    client
-                        .instant_mix(&seed, (max_tracks as u32).saturating_mul(3))
-                        .await
-                }
-            };
-            let tracks = match fetched {
-                Ok(tracks) => {
-                    let fresh: Vec<_> = tracks
-                        .into_iter()
-                        .filter(|t| !existing.contains(&t.id))
-                        .take(max_tracks)
-                        .collect();
-                    let mut queue = crate::commands::to_queue_tracks(&client, fresh)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("auto-dj queue build failed: {e}");
-                            Vec::new()
-                        });
-                    for track in &mut queue {
-                        track.auto_dj_reason = Some(reason.clone());
-                    }
-                    queue
-                }
-                Err(e) => {
-                    tracing::warn!("auto-dj mix failed: {e}");
-                    Vec::new()
-                }
-            };
+            }
+            let mut queue = crate::commands::to_queue_tracks(&client, tracks).unwrap_or_else(|e| {
+                tracing::warn!("auto-dj queue build failed: {e}");
+                Vec::new()
+            });
+            for track in &mut queue {
+                track.auto_dj_reason = Some(reason.clone());
+            }
             let _ = tx.send(PlayerCommand::AutoDjResult {
                 request_track,
                 reason,
-                tracks,
+                tracks: queue,
             });
         });
     }
@@ -3512,6 +5365,29 @@ impl Worker {
         if self.last_auto_dj_seed.as_deref() == Some(request_track) {
             self.last_auto_dj_seed = None;
         }
+    }
+
+    /// The mix for `request_track` brought nothing (a failure, or nothing
+    /// that is not queued or heard already): the track may ask again, but
+    /// not on the next tick.
+    fn auto_dj_came_back_empty(&mut self, request_track: &str) {
+        self.release_auto_dj_latch(request_track);
+        let attempts = match &self.auto_dj_retry {
+            Some(retry) if retry.seed == request_track => retry.attempts + 1,
+            _ => 1,
+        };
+        self.auto_dj_retry = Some(AutoDjRetry {
+            seed: request_track.to_string(),
+            attempts,
+            not_before: Instant::now() + AUTO_DJ_RETRY_AFTER,
+        });
+    }
+
+    /// A fresh playthrough: Auto-DJ may fire again, and a seed that came back
+    /// empty before gets its attempts back.
+    fn rearm_auto_dj(&mut self) {
+        self.last_auto_dj_seed = None;
+        self.auto_dj_retry = None;
     }
 
     /// The Auto-DJ fetch came back. Append the mix — and if the seeding track
@@ -3523,12 +5399,15 @@ impl Worker {
         _reason: AutoDjReason,
         tracks: Vec<QueueTrack>,
     ) {
+        // Switched off while the mix was on its way: it was asked for by a
+        // setting that is no longer on, and a queue that ran out must not
+        // start again over it.
+        if !self.extras.auto_dj_enabled {
+            self.release_auto_dj_latch(&request_track);
+            return;
+        }
         if tracks.is_empty() {
-            // Failure or nothing new: release the latch so a later tick of the
-            // same track can retry.
-            if self.last_auto_dj_seed.as_deref() == Some(request_track.as_str()) {
-                self.last_auto_dj_seed = None;
-            }
+            self.auto_dj_came_back_empty(&request_track);
             return;
         }
         // The queue may have changed while the fetch ran: only append when the
@@ -3552,9 +5431,10 @@ impl Worker {
             .filter(|t| !existing.contains(t.item_id.as_str()))
             .collect();
         if fresh.is_empty() {
-            self.release_auto_dj_latch(&request_track);
+            self.auto_dj_came_back_empty(&request_track);
             return;
         }
+        self.auto_dj_retry = None;
         // Only a queue that ran out on its own resumes into the mix — not a
         // Stop, a sleep timer or a lost output in the meantime.
         let ended = self.queue_ended
@@ -3565,7 +5445,8 @@ impl Worker {
         self.queue_undo = None;
         self.queue_mut().extend(fresh);
         if self.shuffle {
-            self.order.extend(start..self.queue.len());
+            let end = self.queue.len();
+            self.order_mut().extend(start..end);
         }
         self.sync_queue();
         if ended {
@@ -3617,7 +5498,7 @@ impl Worker {
     fn seek_ms(&mut self, position_ms: u64) {
         // A crossfade tail playing across a seek would be confusing: fade it
         // out quickly instead of hard-cutting (pop).
-        if let Some((_, fade, drop_at)) = &mut self.fading_out {
+        if let Some((_, fade, drop_at, _)) = &mut self.fading_out {
             fade.ramp_to(0.0, Duration::from_millis(50));
             *drop_at = Instant::now() + self.tempo.wall(Duration::from_millis(150));
         }
@@ -3625,6 +5506,24 @@ impl Worker {
         self.listen
             .sample_at(Instant::now(), self.position_ms(), self.tempo.speed());
         let Some(sink) = &self.sink else {
+            // Nothing to move yet. An open in flight starts over at the new
+            // target (a pause pressed meanwhile still holds); with nothing
+            // loaded, the target is where the track starts once it plays
+            // (resume_or_start) — and what the seek bar shows until then.
+            match self.status {
+                PlaybackStatus::Loading => {
+                    let paused = self.pending_pause;
+                    self.restart_at(position_ms);
+                    // restart_at reported the load as one that plays; a
+                    // pause pressed meanwhile still holds, and says so.
+                    self.set_pending_pause(paused);
+                }
+                PlaybackStatus::Idle if self.index < self.queue.len() => {
+                    self.position_offset_ms = position_ms;
+                    self.emit();
+                }
+                _ => {}
+            }
             return;
         };
         // Seek natively only when the whole file is on disk. rodio carries out
@@ -3686,8 +5585,11 @@ impl Worker {
             .sample_at(Instant::now(), self.position_ms(), self.tempo.speed());
         self.listen.rebase(Instant::now(), position_ms);
         self.generation = self.generation.wrapping_add(1);
+        self.release_sink();
         self.prefetched = None;
         self.prefetch_inflight = None;
+        // A prefetch from the start would ignore the position.
+        self.adoptable_prefetch = None;
         self.appended = None;
         self.pending_fade = None;
         self.current_fade = None;
@@ -3695,9 +5597,7 @@ impl Worker {
         self.current_tap = None;
         self.pending_download = None;
         self.current_download = None;
-        self.fading_out = None;
-        self.sink = None;
-        // The fresh source carries no sleep ramp yet; the next tick re-arms it.
+        // The fresh source takes the sleep ramp when it lands (arm_fresh).
         self.sleep_fade_item = None;
         // Arrive paused when it was paused; Play/Pause pressed while loading
         // adjusts this like for any other open.
@@ -3716,28 +5616,101 @@ impl Worker {
         &mut self.queue
     }
 
+    /// The shuffle order for changing it, like [`Self::queue_mut`]: the order
+    /// is persisted and shown with the track list, so a change to it alone
+    /// (a drag under shuffle, shuffle switched on) is a change to the list.
+    fn order_mut(&mut self) -> &mut Vec<usize> {
+        self.queue_revision = self.queue_revision.wrapping_add(1);
+        &mut self.order
+    }
+
     /// Persist the queue, refresh the shared mirror, notify the UI.
+    ///
+    /// The whole snapshot goes out only when the track list or its order
+    /// changed. A track change moves the index alone, and then the UI gets
+    /// `player:queue-index` and keeps the list it has: nothing on the way
+    /// from one track to the next clones or sends the whole queue.
     fn sync_queue(&mut self) {
-        // The entry a stop was armed on can be removed, or the whole queue
-        // replaced. Then the stop would never fire and the marker would sit in
-        // the list forever, so it goes with the entry.
-        if let Some(armed) = self.stop_after_item.as_deref() {
-            if !self.queue.iter().any(|track| track.item_id == armed) {
-                self.clear_stop_after();
+        let order = if self.shuffle { &self.order[..] } else { &[] };
+        let played = played_count(self.queue.len(), self.index, order);
+        let can_undo = self.queue_undo.is_some();
+        if self.synced_revision == Some(self.queue_revision) {
+            {
+                let mut shared = self.shared_queue.lock().unwrap();
+                shared.index = self.index;
+                shared.can_undo = can_undo;
+                shared.played_count = played;
+            }
+            self.persist_queue();
+            let position = QueuePosition {
+                revision: self.queue_revision,
+                index: self.index,
+                can_undo,
+                played_count: played,
+                duplicate_count: self.duplicate_count,
+            };
+            let _ = self.app.emit("player:queue-index", position);
+            return;
+        }
+        let order = order.to_vec();
+        // The entries a stop was armed over can be removed, or the whole
+        // queue replaced. It moves to the last of them still queued; with
+        // none left it would never fire and the marker would sit in the list
+        // forever, so it goes with them.
+        if !self.stop_run.is_empty() {
+            match stop_entry(&self.stop_run, &self.queue) {
+                Some(at) => {
+                    if self.stop_at.as_ref() != Some(at) {
+                        self.stop_at = Some(at.clone());
+                    }
+                }
+                None => self.clear_stop_after(),
             }
         }
-        let order = if self.shuffle { &self.order[..] } else { &[] };
-        let queue_snapshot = QueueSnapshot {
+        self.duplicate_count = duplicate_count(&self.queue);
+        let snapshot = QueueSnapshot {
+            revision: self.queue_revision,
             tracks: self.queue.clone(),
             index: self.index,
-            order: order.to_vec(),
-            can_undo: self.queue_undo.is_some(),
-            played_count: played_indices(self.queue.len(), self.index, order).len(),
-            duplicate_count: duplicate_indices(&self.queue, self.index).len(),
+            order,
+            can_undo,
+            played_count: played,
+            duplicate_count: self.duplicate_count,
         };
-        *self.shared_queue.lock().unwrap() = queue_snapshot.clone();
         self.persist_queue();
-        let _ = self.app.emit("player:queue", queue_snapshot);
+        let _ = self.app.emit("player:queue", &snapshot);
+        *self.shared_queue.lock().unwrap() = snapshot;
+        self.synced_revision = Some(self.queue_revision);
+    }
+
+    /// Load a queue read back from the store, without starting playback.
+    fn restore_queue(&mut self, restored: RestoredQueue) {
+        let RestoredQueue {
+            mut tracks,
+            index,
+            order,
+        } = restored;
+        // Lines persisted before entry ids existed get one now, so from here
+        // on two copies of a track can be told apart (stop after, remove).
+        for track in &mut tracks {
+            if track.entry_id.is_empty() {
+                track.entry_id = uuid::Uuid::new_v4().to_string();
+            }
+        }
+        self.queue_undo = None;
+        *self.queue_mut() = tracks;
+        self.index = index.min(self.queue.len().saturating_sub(1));
+        self.status = PlaybackStatus::Idle;
+        if self.shuffle {
+            // The order it was playing in: what was heard stays heard, and
+            // what was put next stays next.
+            match restored_order(order, self.shuffle_mode, self.queue.len()) {
+                Some(order) => *self.order_mut() = order,
+                None => self.rebuild_order(),
+            }
+        }
+        self.sync_queue();
+        self.emit();
     }
 
     /// Write the queue to the store. The track list can run to thousands of
@@ -3775,6 +5748,10 @@ impl Worker {
                     server_url: self.store.get(keys::SERVER_URL),
                     user_id: self.store.get(keys::USER_ID),
                     snapshot_id: Some(snapshot_id.clone()),
+                    order: self.shuffle.then(|| PersistedOrder {
+                        mode: self.shuffle_mode,
+                        order: self.order.clone(),
+                    }),
                 };
                 if let Ok(json) = serde_json::to_string(&persisted) {
                     if self.store.set(keys::QUEUE, &json).is_ok() {
@@ -3798,18 +5775,17 @@ impl Worker {
             self.sleep_at
                 .map(|at| at.saturating_duration_since(Instant::now()).as_millis() as u64)
         };
-        // A seek-by-restart source starts mid-track and has no known length;
-        // only a source that plays its track from the start maps bytes to time.
-        let buffered_ms = if self.position_offset_ms == 0 {
-            buffered_range_ms(
-                self.current_download.as_ref().and_then(|d| d.fraction()),
-                duration_ms,
-            )
-        } else {
-            None
-        };
+        // Bytes map to time when the stream is the whole file: direct play,
+        // reopened at a position or not (Jellyfin ignores startTimeTicks there
+        // and sends the file from its start). A live transcode — the only
+        // stream that starts mid-track — has no length, so no fraction.
+        let buffered_ms = buffered_range_ms(
+            self.current_download.as_ref().and_then(|d| d.fraction()),
+            duration_ms,
+        );
         let state = PlayerState {
             status: self.status,
+            pending_pause: arrives_paused(self.status, self.pending_pause),
             current,
             index: self.index,
             queue_len: self.queue.len(),
@@ -3821,7 +5797,12 @@ impl Worker {
             repeat: self.repeat,
             sleep_remaining_ms,
             stop_after: self.stop_after,
-            stop_after_item: self.stop_after_item.clone(),
+            stop_after_entry: self
+                .stop_at
+                .as_ref()
+                .map(|at| at.entry_id.clone())
+                .filter(|id| !id.is_empty()),
+            stop_after_item: self.stop_at.as_ref().map(|at| at.item_id.clone()),
             buffered_ms,
             speed: self.speed.speed,
             preserve_pitch: self.speed.preserve_pitch,
@@ -3832,40 +5813,66 @@ impl Worker {
     }
 }
 
-/// Open an output stream on the named device (None = system default) with an
-/// error callback that reports device death back to the player loop.
-/// cpal's `name()` is deprecated in favor of id()/description(), but the
-/// human-readable name is exactly what the settings dropdown shows.
-#[allow(deprecated)]
+/// An output device as the player knows it.
+#[derive(Debug, Clone, PartialEq)]
+struct OutputEntry {
+    device: OutputDevice,
+    /// cpal's bare endpoint name ("Speakers"): what builds before 0.6.1
+    /// stored for the device, as the output setting and as a profile key.
+    legacy_name: Option<String>,
+}
+
+/// What [`open_output`] returns: the output, the flag its error callback
+/// sets, and the device it opened.
+type OpenedOutput = (
+    Output,
+    Arc<std::sync::atomic::AtomicBool>,
+    Option<OutputEntry>,
+);
+
+/// Open an output stream on the stored device (its id, or a name from before
+/// 0.6.1; None = system default) with an error callback that reports device
+/// death back to the player loop. Also returns the device it opened.
 fn open_output(
-    device_name: &Option<String>,
+    device: &Option<String>,
     tempo: &tempo::TempoHandle,
     tx: Sender<PlayerCommand>,
-) -> AppResult<(Output, Arc<std::sync::atomic::AtomicBool>, Option<String>)> {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+) -> AppResult<OpenedOutput> {
+    open_output_named(device, None, tempo, tx)
+}
 
-    // The device is resolved once and opened as such, so the name the
+/// [`open_output`] for the configured device, which `name` (as last seen)
+/// finds again when Windows lists it under a new id.
+fn open_output_named(
+    device: &Option<String>,
+    name: Option<&str>,
+    tempo: &tempo::TempoHandle,
+    tx: Sender<PlayerCommand>,
+) -> AppResult<OpenedOutput> {
+    use rodio::cpal::traits::HostTrait;
+
+    // The device is resolved once and opened as such, so the id the
     // per-device profiles key on is the device that actually plays.
-    #[allow(deprecated)]
-    let (builder, resolved) = match device_name {
-        Some(name) => {
-            let device = rodio::cpal::default_host()
-                .output_devices()
-                .map_err(|e| AppError::Audio(format!("cannot list output devices: {e}")))?
-                .find(|d| d.name().map(|n| &n == name).unwrap_or(false))
-                .ok_or_else(|| AppError::Audio(format!("output device '{name}' not found")))?;
+    let (builder, opened) = match device {
+        Some(stored) => {
+            let mut outputs = list_outputs()?;
+            let index = resolve_output(stored, name, outputs.iter().map(|(_, entry)| entry))
+                .ok_or_else(|| {
+                    AppError::Audio("the selected output device is not connected".into())
+                })?;
+            let (device, entry) = outputs.swap_remove(index);
             let builder = rodio::stream::DeviceSinkBuilder::from_device(device)
                 .map_err(|e| AppError::Audio(format!("cannot use output device: {e}")))?;
-            (builder, Some(name.clone()))
+            (builder, Some(entry))
         }
         None => {
             let device = rodio::cpal::default_host()
                 .default_output_device()
                 .ok_or_else(|| AppError::Audio("no default output device".into()))?;
-            let name = device.name().ok();
+            let entry = describe_output(&device);
             let builder = rodio::stream::DeviceSinkBuilder::from_device(device)
                 .map_err(|e| AppError::Audio(format!("cannot open default output: {e}")))?;
-            (builder, name)
+            (builder, entry)
         }
     };
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3879,17 +5886,18 @@ fn open_output(
         .open_stream()
         .map_err(|e| AppError::Audio(format!("cannot open audio output: {e}")))?;
     // The players mix into a mixer of their own, at the device's format,
-    // which reaches the device through the tempo stage.
+    // which reaches the device through the tempo stage and the limiter: the
+    // last stage keeps whatever the mix adds up to under full scale.
     let (mixer, mixed) =
         rodio::mixer::mixer(sink.config().channel_count(), sink.config().sample_rate());
-    sink.mixer().add(tempo::wrap(mixed, tempo));
+    sink.mixer().add(limiter::wrap(tempo::wrap(mixed, tempo)));
     Ok((
         Output {
             mixer,
             _device: sink,
         },
         dead,
-        resolved,
+        opened,
     ))
 }
 
@@ -3905,14 +5913,520 @@ impl Output {
     }
 }
 
-/// Output device names for the settings UI.
-#[allow(deprecated)]
-pub fn output_device_names() -> Vec<String> {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait};
-    rodio::cpal::default_host()
-        .output_devices()
-        .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
+/// Output devices for the settings UI.
+pub fn output_devices() -> Vec<OutputDevice> {
+    list_outputs()
+        .map(|outputs| outputs.into_iter().map(|(_, entry)| entry.device).collect())
         .unwrap_or_default()
+}
+
+/// Every output device cpal lists, except one without an id: that could
+/// neither be stored nor found again.
+fn list_outputs() -> AppResult<Vec<(rodio::cpal::Device, OutputEntry)>> {
+    use rodio::cpal::traits::HostTrait;
+    let devices = rodio::cpal::default_host()
+        .output_devices()
+        .map_err(|e| AppError::Audio(format!("cannot list output devices: {e}")))?;
+    Ok(devices
+        .filter_map(|device| describe_output(&device).map(|entry| (device, entry)))
+        .collect())
+}
+
+/// cpal's deprecated `name()` is read on purpose: it is what builds before
+/// 0.6.1 stored, and what their choices are found by.
+#[allow(deprecated)]
+fn describe_output(device: &rodio::cpal::Device) -> Option<OutputEntry> {
+    use rodio::cpal::traits::DeviceTrait;
+    let id = device.id().ok()?.to_string();
+    let name = device
+        .description()
+        .ok()
+        .map(|description| display_name(&description))
+        .unwrap_or_else(|| id.clone());
+    Some(OutputEntry {
+        device: OutputDevice { id, name },
+        legacy_name: device.name().ok(),
+    })
+}
+
+/// The name the system's sound settings show. cpal's name is only the
+/// endpoint's own line ("Speakers"); on Windows the full name with the
+/// adapter ("Speakers (Realtek(R) Audio)") is the first extended line.
+fn display_name(description: &rodio::cpal::DeviceDescription) -> String {
+    description
+        .extended()
+        .first()
+        .filter(|line| !line.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| description.name().to_string())
+}
+
+/// Which listed output a stored choice means: the one with that id; for a
+/// choice from before 0.6.1 (cpal's bare endpoint name), the first output of
+/// that name — the one those builds opened; else the only output called
+/// `name`, the device's full name as last seen. Windows lists a device under
+/// a new id now and then (see `OutputDevice::id`), mostly with the name it
+/// had; a name two outputs share finds neither.
+fn resolve_output<'a>(
+    stored: &str,
+    name: Option<&str>,
+    outputs: impl Iterator<Item = &'a OutputEntry> + Clone,
+) -> Option<usize> {
+    outputs
+        .clone()
+        .position(|entry| entry.device.id == stored)
+        .or_else(|| {
+            outputs
+                .clone()
+                .position(|entry| entry.legacy_name.as_deref() == Some(stored))
+        })
+        .or_else(|| {
+            let name = name?;
+            let mut named = outputs
+                .enumerate()
+                .filter(|(_, entry)| entry.device.name == name)
+                .map(|(index, _)| index);
+            match (named.next(), named.next()) {
+                (Some(index), None) => Some(index),
+                _ => None,
+            }
+        })
+}
+
+/// The configured device opened: store its id (a choice from before 0.6.1
+/// held its bare endpoint name) and the name Settings shows while it is
+/// away. Returns whether anything changed.
+fn adopt_output_device(playback: &mut PlaybackSettings, device: &OutputDevice) -> bool {
+    let changed = playback.output_device.as_deref() != Some(device.id.as_str())
+        || playback.output_device_name.as_deref() != Some(device.name.as_str());
+    if changed {
+        playback.output_device = Some(device.id.clone());
+        playback.output_device_name = Some(device.name.clone());
+    }
+    changed
+}
+
+/// Whether a stored choice (`requested`, with the name as last seen) means
+/// `device` among the listed outputs.
+fn names_output<'a>(
+    requested: &str,
+    name: Option<&str>,
+    device: &OutputDevice,
+    mut outputs: impl Iterator<Item = &'a OutputEntry> + Clone,
+) -> bool {
+    resolve_output(requested, name, outputs.clone())
+        .and_then(|index| outputs.nth(index))
+        .is_some_and(|entry| entry.device.id == device.id)
+}
+
+/// Ids of the output devices listed now; None when they cannot be listed.
+fn listed_output_ids() -> Option<Vec<String>> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let devices = rodio::cpal::default_host().output_devices().ok()?;
+    Some(
+        devices
+            .filter_map(|device| device.id().ok().map(|id| id.to_string()))
+            .collect(),
+    )
+}
+
+/// Id of the system's default output device right now.
+fn default_output_id() -> Option<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let device = rodio::cpal::default_host().default_output_device()?;
+    device.id().ok().map(|id| id.to_string())
+}
+
+/// Whether a failed output gets its configured device back before the
+/// fallback to the default. A stream that ran for a while and then died was
+/// most often reconfigured under us (a format or spatial-sound change, a
+/// driver reset after resume) while its device stayed. One that dies right
+/// after opening is on its way out, and a fallback already in place stays
+/// on the default.
+fn reopen_configured_first(configured: bool, fallback_active: bool, ran_for: Duration) -> bool {
+    configured && !fallback_active && ran_for >= OUTPUT_SETTLED
+}
+
+/// A default device that did not open when "system default" followed it.
+#[derive(Debug, Clone, PartialEq)]
+struct FailedDefault {
+    id: String,
+    /// Failed attempts on it so far.
+    attempts: u32,
+    at: Instant,
+}
+
+impl FailedDefault {
+    /// One more failed attempt on `id`, counted on from `before` if that
+    /// was the same device.
+    fn after(before: Option<FailedDefault>, id: String) -> Self {
+        let attempts = before
+            .filter(|failed| failed.id == id)
+            .map_or(1, |failed| failed.attempts + 1);
+        Self {
+            id,
+            attempts,
+            at: Instant::now(),
+        }
+    }
+
+    /// Whether `default` gets another attempt: a few, a moment apart.
+    fn retry(&self, default: &str) -> bool {
+        self.id != default
+            || (self.attempts < DEFAULT_OUTPUT_ATTEMPTS
+                && self.at.elapsed() >= DEFAULT_OUTPUT_RETRY)
+    }
+}
+
+/// Whether "system default" moves to `default`: it is not what plays, not a
+/// default that failed to open a moment ago or too often, and not the
+/// configured device a fallback stands in for. That one coming back, even as
+/// the new default, does not take playback back by itself; Settings offers
+/// to switch back.
+fn should_follow_default(
+    default: &str,
+    active: Option<&str>,
+    failed: Option<&FailedDefault>,
+    standing_in_for: Option<&str>,
+) -> bool {
+    active != Some(default)
+        && failed.is_none_or(|failed| failed.retry(default))
+        && standing_in_for != Some(default)
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    fn entry(id: &str, name: &str, legacy: &str) -> OutputEntry {
+        OutputEntry {
+            device: OutputDevice {
+                id: id.to_string(),
+                name: name.to_string(),
+            },
+            legacy_name: Some(legacy.to_string()),
+        }
+    }
+
+    /// Onboard audio and a USB headset: Windows calls both "Speakers".
+    fn twins() -> Vec<OutputEntry> {
+        vec![
+            entry(
+                "wasapi:{onboard}",
+                "Speakers (Realtek(R) Audio)",
+                "Speakers",
+            ),
+            entry("wasapi:{usb}", "Speakers (USB Audio Device)", "Speakers"),
+        ]
+    }
+
+    #[test]
+    fn a_device_is_found_by_its_id_even_when_its_name_is_shared() {
+        let outputs = twins();
+        let usb_name = Some("Speakers (USB Audio Device)");
+        assert_eq!(
+            resolve_output("wasapi:{usb}", None, outputs.iter()),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_output("wasapi:{onboard}", usb_name, outputs.iter()),
+            Some(0)
+        );
+        assert_eq!(resolve_output("wasapi:{gone}", None, outputs.iter()), None);
+    }
+
+    #[test]
+    fn a_device_listed_under_a_new_id_is_found_by_its_name() {
+        // Windows made a new endpoint for the same device: a Focusrite
+        // interface switched to 48 kHz (one endpoint per rate), a re-paired
+        // Bluetooth headset, a USB headset without a serial number in
+        // another port. New id, same name.
+        let name = "Speakers (Focusrite USB Audio)";
+        let outputs = [
+            entry(
+                "wasapi:{onboard}",
+                "Speakers (Realtek(R) Audio)",
+                "Speakers",
+            ),
+            entry("wasapi:{48k}", name, "Speakers"),
+        ];
+        assert_eq!(
+            resolve_output("wasapi:{44k}", Some(name), outputs.iter()),
+            Some(1)
+        );
+        // Without the name as last seen (a choice that never opened), or
+        // under a name nothing has: not there.
+        assert_eq!(resolve_output("wasapi:{44k}", None, outputs.iter()), None);
+        assert_eq!(
+            resolve_output(
+                "wasapi:{44k}",
+                Some("Speakers (Scarlett Solo USB)"),
+                outputs.iter()
+            ),
+            None
+        );
+
+        let mut playback = PlaybackSettings {
+            output_device: Some("wasapi:{44k}".to_string()),
+            output_device_name: Some(name.to_string()),
+            ..PlaybackSettings::default()
+        };
+        assert!(adopt_output_device(&mut playback, &outputs[1].device));
+        assert_eq!(playback.output_device.as_deref(), Some("wasapi:{48k}"));
+    }
+
+    #[test]
+    fn a_name_two_devices_share_finds_neither() {
+        // Two identical headsets plugged in, the chosen one's id gone:
+        // which one it was is anyone's guess, so the fallback decides.
+        let name = "Headphones (USB Audio Device)";
+        let outputs = [
+            entry("wasapi:{left}", name, "Headphones"),
+            entry("wasapi:{right}", name, "Headphones"),
+        ];
+        assert_eq!(
+            resolve_output("wasapi:{gone}", Some(name), outputs.iter()),
+            None
+        );
+        // By id, each is still its own.
+        assert_eq!(
+            resolve_output("wasapi:{right}", Some(name), outputs.iter()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_stale_choice_of_the_device_playing_is_no_switch() {
+        let name = "Speakers (Focusrite USB Audio)";
+        let outputs = [
+            entry(
+                "wasapi:{onboard}",
+                "Speakers (Realtek(R) Audio)",
+                "Speakers",
+            ),
+            entry("wasapi:{48k}", name, "Speakers"),
+        ];
+        let playing = &outputs[1].device;
+        // A page loaded while the device still had its old id.
+        assert!(names_output(
+            "wasapi:{44k}",
+            Some(name),
+            playing,
+            outputs.iter()
+        ));
+        assert!(names_output(
+            "wasapi:{48k}",
+            Some(name),
+            playing,
+            outputs.iter()
+        ));
+        // A real pick of another device is one.
+        let onboard = Some("Speakers (Realtek(R) Audio)");
+        assert!(!names_output(
+            "wasapi:{onboard}",
+            onboard,
+            playing,
+            outputs.iter()
+        ));
+        // So is a device that is not there at all.
+        assert!(!names_output(
+            "wasapi:{gone}",
+            None,
+            playing,
+            outputs.iter()
+        ));
+    }
+
+    #[test]
+    fn a_choice_saved_by_name_means_the_device_older_builds_opened() {
+        // 0.6.0 stored "Speakers" and opened the first device of that name.
+        let outputs = twins();
+        let index = resolve_output("Speakers", None, outputs.iter()).unwrap();
+        assert_eq!(index, 0);
+
+        let mut playback: PlaybackSettings = serde_json::from_str(
+            r#"{"crossfadeMode":"smart","crossfadeSeconds":4,"outputDevice":"Speakers"}"#,
+        )
+        .unwrap();
+        assert_eq!(playback.output_device_name, None);
+        assert!(adopt_output_device(&mut playback, &outputs[index].device));
+        assert_eq!(playback.output_device.as_deref(), Some("wasapi:{onboard}"));
+        assert_eq!(
+            playback.output_device_name.as_deref(),
+            Some("Speakers (Realtek(R) Audio)")
+        );
+        // The rest of the settings is untouched, and adopting again is a no-op.
+        assert_eq!(playback.crossfade_mode, CrossfadeMode::Smart);
+        assert!(!adopt_output_device(&mut playback, &outputs[index].device));
+    }
+
+    #[test]
+    fn the_settings_page_shows_the_full_device_name() {
+        use rodio::cpal::DeviceDescriptionBuilder;
+        let windows = DeviceDescriptionBuilder::new("Speakers")
+            .add_extended_line("Speakers (Realtek(R) Audio)")
+            .build();
+        assert_eq!(display_name(&windows), "Speakers (Realtek(R) Audio)");
+        let plain = DeviceDescriptionBuilder::new("Built-in Output").build();
+        assert_eq!(display_name(&plain), "Built-in Output");
+    }
+
+    /// `attempts` failed attempts on `id`, the last one `ago`.
+    fn failed(id: &str, attempts: u32, ago: Duration) -> FailedDefault {
+        FailedDefault {
+            id: id.to_string(),
+            attempts,
+            at: Instant::now().checked_sub(ago).unwrap(),
+        }
+    }
+
+    #[test]
+    fn system_default_follows_a_new_default() {
+        let (bt, speakers) = ("wasapi:{bt}", "wasapi:{speakers}");
+        // The default moved: follow it.
+        assert!(should_follow_default(bt, Some(speakers), None, None));
+        // Already there.
+        assert!(!should_follow_default(bt, Some(bt), None, None));
+        // Nothing opened yet: any default is worth a try.
+        assert!(should_follow_default(bt, None, None, None));
+    }
+
+    #[test]
+    fn a_default_that_did_not_open_gets_a_few_more_tries() {
+        // Bluetooth headphones become the default a moment before they can
+        // play: the first attempt can fail.
+        let (bt, speakers) = ("wasapi:{bt}", "wasapi:{speakers}");
+        let just_now = failed(bt, 1, Duration::ZERO);
+        assert!(!should_follow_default(
+            bt,
+            Some(speakers),
+            Some(&just_now),
+            None
+        ));
+        let a_moment_ago = failed(bt, 1, DEFAULT_OUTPUT_RETRY);
+        assert!(should_follow_default(
+            bt,
+            Some(speakers),
+            Some(&a_moment_ago),
+            None
+        ));
+        // Then it is left alone until the default changes again.
+        let too_often = failed(bt, DEFAULT_OUTPUT_ATTEMPTS, DEFAULT_OUTPUT_RETRY * 2);
+        assert!(!should_follow_default(
+            bt,
+            Some(speakers),
+            Some(&too_often),
+            None
+        ));
+        // What failed on another device holds a new default back in no way.
+        let other = failed("wasapi:{usb}", DEFAULT_OUTPUT_ATTEMPTS, Duration::ZERO);
+        assert!(should_follow_default(
+            bt,
+            Some(speakers),
+            Some(&other),
+            None
+        ));
+
+        // Attempts count on for one device and start over for the next.
+        let second = FailedDefault::after(Some(failed(bt, 1, Duration::ZERO)), bt.to_string());
+        assert_eq!(second.attempts, 2);
+        let fresh = FailedDefault::after(Some(second), "wasapi:{usb}".to_string());
+        assert_eq!(fresh.attempts, 1);
+        assert_eq!(FailedDefault::after(None, bt.to_string()).attempts, 1);
+    }
+
+    #[test]
+    fn a_settled_stream_gets_its_device_back_before_the_default() {
+        let long = OUTPUT_SETTLED + Duration::from_secs(1);
+        // Reconfigured under us after playing for a while: reopen it.
+        assert!(reopen_configured_first(true, false, long));
+        // Died right after opening: on its way out.
+        assert!(!reopen_configured_first(
+            true,
+            false,
+            Duration::from_secs(3)
+        ));
+        // "System default", or already standing in for the device.
+        assert!(!reopen_configured_first(false, false, long));
+        assert!(!reopen_configured_first(true, true, long));
+    }
+
+    fn handle() -> (PlayerHandle, mpsc::Receiver<PlayerCommand>) {
+        let (tx, rx) = mpsc::channel();
+        let handle = PlayerHandle {
+            tx,
+            state: Arc::new(Mutex::new(PlayerState::default())),
+            queue: Arc::new(Mutex::new(QueueSnapshot {
+                tracks: Vec::new(),
+                index: 0,
+                order: Vec::new(),
+                can_undo: false,
+                played_count: 0,
+                duplicate_count: 0,
+                revision: 0,
+            })),
+            dsp: Arc::new(AudioDsp::new(DspParams::default())),
+            tap: Arc::new(tap::VisualizerTap::new()),
+            waveforms: Arc::new(waveform::WaveformCache::default()),
+            analyses: Arc::new(analysis::AnalysisCache::new(None)),
+            play_requests: Default::default(),
+            enqueue_turn: Default::default(),
+        };
+        (handle, rx)
+    }
+
+    fn asking_for(device: &str) -> PlaybackSettings {
+        PlaybackSettings {
+            output_device: Some(device.to_string()),
+            output_device_name: Some("Busy DAC".to_string()),
+            ..PlaybackSettings::default()
+        }
+    }
+
+    #[test]
+    fn settings_answer_with_the_output_that_stayed() {
+        // The worker could not open the device and kept the system default:
+        // that, not the request, is what Settings has to show.
+        let (handle, rx) = handle();
+        let worker = std::thread::spawn(move || {
+            if let Ok(PlayerCommand::SetPlaybackSettings {
+                mut settings,
+                reply,
+            }) = rx.recv()
+            {
+                settings.output_device = None;
+                settings.output_device_name = None;
+                reply.expect("a reply channel").send(settings).unwrap();
+            }
+        });
+        let applied = handle
+            .set_playback_settings(asking_for("wasapi:{busy}"), Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(applied.output_device, None);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn settings_without_an_answer_are_what_was_asked() {
+        // No output at all yet: the worker applies them once it has one.
+        let (handle, _rx) = handle();
+        let asked = asking_for("wasapi:{dac}");
+        let applied = handle
+            .set_playback_settings(asked.clone(), Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(applied, asked);
+    }
+
+    #[test]
+    fn a_fallback_follows_the_default_but_not_back_to_its_device() {
+        let (dac, bt, speakers) = ("wasapi:{dac}", "wasapi:{bt}", "wasapi:{speakers}");
+        // Standing in for the DAC on the speakers: headphones that become
+        // the default take over.
+        assert!(should_follow_default(bt, Some(speakers), None, Some(dac)));
+        // The DAC itself coming back as the default does not: switching
+        // back stays the user's call.
+        assert!(!should_follow_default(dac, Some(speakers), None, Some(dac)));
+    }
 }
 
 fn init_media_controls(
@@ -3967,7 +6481,7 @@ fn init_media_controls(
 /// before this field existed carry no server and are dropped.
 ///
 /// The index may have been saved after the track list (`Worker::persist_queue`).
-pub fn load_persisted_queue(store: &Store) -> Option<(Vec<QueueTrack>, usize)> {
+pub fn load_persisted_queue(store: &Store) -> Option<RestoredQueue> {
     let json = store.get(keys::QUEUE)?;
     let snapshot: PersistedQueue = serde_json::from_str(&json).ok()?;
     let server = store.get(keys::SERVER_URL)?;
@@ -3981,22 +6495,32 @@ pub fn load_persisted_queue(store: &Store) -> Option<(Vec<QueueTrack>, usize)> {
         return None;
     }
     let index = restored_index(&snapshot, store.get(keys::QUEUE_INDEX).as_deref());
-    Some((snapshot.tracks, index))
+    Some(RestoredQueue {
+        tracks: snapshot.tracks,
+        index,
+        order: snapshot.order,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        album_gain_from_queue, buffered_range_ms, build_album_shuffle_order, build_shuffle_order,
-        choose_auto_dj_seed, duplicate_indices, load_persisted_queue, order_next, order_prev,
-        played_indices, queue_write, remap_after_removals, remap_move, remap_order_after_removals,
-        restored_index, should_crossfade, should_start_prefetch, stop_after_due, AutoDjSeedMode,
-        CrossfadeMode, PersistedQueue, PersistedQueueMark, PlayMode, QueueTrack, QueueWrite,
-        ShuffleMode, StopAfter,
+        album_gain_from_queue, album_run, buffered_range_ms, build_album_shuffle_order,
+        build_shuffle_order, choose_auto_dj_seed, defer_command, duplicate_count,
+        duplicate_indices, fresh_mix, landing_after_removal, load_persisted_queue, order_next,
+        order_prev, played_count, played_indices, plays_on_after_removal, queue_write,
+        remap_after_removals, remap_move, remap_order_after_removals, restored_index,
+        restored_order, should_crossfade, should_start_prefetch, sleep_level, start_player,
+        stop_after_due, stop_entry, AutoDjReason, AutoDjRetry, AutoDjSeedMode, CrossfadeMode,
+        EntryRef, ExtrasSettings, PersistedOrder, PersistedQueue, PersistedQueueMark, PlayMode,
+        PlaybackStatus, PlayerCommand, QueueTrack, QueueWrite, ShuffleMode, StopAfter, TickClock,
+        AUTO_DJ_ATTEMPTS, AUTO_DJ_RETRY_AFTER, TICK,
     };
+    use super::{sleep_fade_step, stream_broke_off, SleepFadeStep};
     use crate::store::{keys, Store};
     use proptest::prelude::*;
     use rodio::buffer::SamplesBuffer;
+    use std::time::Duration;
 
     #[test]
     fn buffered_range_maps_byte_fractions_onto_the_timeline() {
@@ -4011,6 +6535,65 @@ mod tests {
         // Unknown length or unknown duration: nothing to draw.
         assert_eq!(buffered_range_ms(None, 200_000), None);
         assert_eq!(buffered_range_ms(Some((0.0, 0.5)), 0), None);
+    }
+
+    #[test]
+    fn the_state_tells_the_ui_when_a_load_arrives_paused() {
+        // TransportControls and the mini player read `pendingPause` to offer
+        // Play instead of Pause while such a load runs (types.ts PlayerState).
+        let state = super::PlayerState {
+            status: super::PlaybackStatus::Loading,
+            pending_pause: true,
+            ..super::PlayerState::default()
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["status"], "loading");
+        assert_eq!(json["pendingPause"], true);
+        let idle = serde_json::to_value(super::PlayerState::default()).unwrap();
+        assert_eq!(idle["pendingPause"], false);
+    }
+
+    #[test]
+    fn the_media_overlay_shows_what_a_load_will_do() {
+        use super::{arrives_paused, media_playback, PlaybackStatus};
+        use souvlaki::{MediaPlayback, MediaPosition};
+        use std::time::Duration;
+
+        let at = Duration::from_secs(42);
+        let progress = Some(MediaPosition(at));
+        // Pause pressed during the load, or a paused track reopened: like the
+        // window's button, the overlay offers Play, and its Play/Pause buttons
+        // (souvlaki sends Play or Pause on Windows, never Toggle) do what they show.
+        assert_eq!(
+            media_playback(PlaybackStatus::Loading, true, at),
+            MediaPlayback::Paused { progress }
+        );
+        assert_eq!(
+            media_playback(PlaybackStatus::Loading, false, at),
+            MediaPlayback::Playing { progress }
+        );
+        assert_eq!(
+            media_playback(PlaybackStatus::Playing, false, at),
+            MediaPlayback::Playing { progress }
+        );
+        assert_eq!(
+            media_playback(PlaybackStatus::Paused, false, at),
+            MediaPlayback::Paused { progress }
+        );
+        // Only a load arrives paused; a flag left over from an open that
+        // failed means nothing, on the overlay or in the state the UI gets.
+        assert_eq!(
+            media_playback(PlaybackStatus::Idle, true, at),
+            MediaPlayback::Stopped
+        );
+        assert_eq!(
+            media_playback(PlaybackStatus::Playing, true, at),
+            MediaPlayback::Playing { progress }
+        );
+        assert!(arrives_paused(PlaybackStatus::Loading, true));
+        assert!(!arrives_paused(PlaybackStatus::Loading, false));
+        assert!(!arrives_paused(PlaybackStatus::Idle, true));
+        assert!(!arrives_paused(PlaybackStatus::Paused, true));
     }
 
     // Property tests: the pure queue-index helpers must hold their invariants
@@ -4073,6 +6656,55 @@ mod tests {
                 .map(|&i| remap_after_removals(i, &removed).unwrap())
                 .collect();
             prop_assert_eq!(remapped, expected);
+        }
+
+        /// The count the queue panel shows is the list "remove played" takes.
+        #[test]
+        fn prop_played_count_is_the_played_list(
+            len in 0usize..48,
+            current_raw in 0usize..48,
+            seed in any::<u64>(),
+            shuffled in any::<bool>(),
+        ) {
+            let current = if len == 0 { 0 } else { current_raw % len };
+            let order = if shuffled && len > 0 {
+                build_shuffle_order(len, (seed as usize) % len, seed)
+            } else {
+                Vec::new()
+            };
+            prop_assert_eq!(
+                played_count(len, current, &order),
+                played_indices(len, current, &order).len()
+            );
+        }
+
+        /// Removing the current entry lands on an entry of the shortened
+        /// queue, and with a successor on exactly that successor.
+        #[test]
+        fn prop_removal_lands_on_the_successor(
+            len in 2usize..40,
+            removed_raw in 0usize..40,
+            seed in any::<u64>(),
+            repeat_all in any::<bool>(),
+        ) {
+            let removed = removed_raw % len;
+            let order = build_shuffle_order(len, (seed as usize) % len, seed);
+            let (landing, onward) = landing_after_removal(len, removed, &order, repeat_all)
+                .expect("a queue of two or more keeps an entry");
+            prop_assert!(landing < len - 1);
+            let after: Vec<usize> = order
+                .iter()
+                .filter(|&&i| i != removed)
+                .map(|&i| if i > removed { i - 1 } else { i })
+                .collect();
+            let next = order_next(len, removed, &order, repeat_all);
+            if onward {
+                let next = next.unwrap();
+                prop_assert_eq!(landing, if next > removed { next - 1 } else { next });
+            } else {
+                prop_assert!(next.is_none());
+                prop_assert_eq!(after.last().copied(), Some(landing));
+            }
         }
     }
 
@@ -4186,61 +6818,270 @@ mod tests {
         }
     }
 
+    /// A queue line with its own entry id, as `to_queue_tracks` builds it.
+    fn entry(item_id: &str, entry_id: &str) -> QueueTrack {
+        QueueTrack {
+            entry_id: entry_id.into(),
+            ..queue_track(item_id)
+        }
+    }
+
+    fn album_entry(entry_id: &str, album_id: &str) -> QueueTrack {
+        QueueTrack {
+            album_id: Some(album_id.into()),
+            ..entry(entry_id, entry_id)
+        }
+    }
+
     #[test]
     fn stop_after_track_fires_on_the_entry_it_was_armed_on() {
         let a = album_track("a", "album-1");
         let b = album_track("b", "album-1");
+        let at = EntryRef::of(&a);
         let armed = |finished: &QueueTrack| {
-            stop_after_due(StopAfter::Track, Some("a"), None, finished, Some(&b))
+            stop_after_due(StopAfter::Track, Some(&at), None, finished, false)
         };
         assert!(armed(&a));
         // Another track of the same album ends: not the one that was armed.
         assert!(!armed(&b));
+        assert!(!stop_after_due(StopAfter::Off, Some(&at), None, &a, false));
+    }
+
+    #[test]
+    fn stop_after_a_second_copy_does_not_fire_on_the_first() {
+        // The same track queued twice: armed on the later copy.
+        let first = entry("x", "e1");
+        let second = entry("x", "e2");
+        let at = EntryRef::of(&second);
         assert!(!stop_after_due(
-            StopAfter::Off,
-            Some("a"),
+            StopAfter::Track,
+            Some(&at),
             None,
-            &a,
-            Some(&b)
+            &first,
+            false
+        ));
+        assert!(stop_after_due(
+            StopAfter::Track,
+            Some(&at),
+            None,
+            &second,
+            false
         ));
     }
 
     #[test]
-    fn stop_after_album_fires_where_the_album_ends() {
-        let first = album_track("a", "album-1");
-        let last = album_track("b", "album-1");
-        let other = album_track("c", "album-2");
-        let due = |finished: &QueueTrack, next: Option<&QueueTrack>| {
-            stop_after_due(StopAfter::Album, Some("a"), Some("album-1"), finished, next)
+    fn an_entry_from_before_entry_ids_is_matched_by_its_item() {
+        let legacy = queue_track("x");
+        let named = entry("x", "e1");
+        let by_item = EntryRef {
+            entry_id: String::new(),
+            item_id: "x".into(),
         };
-        // Inside the album nothing happens; at its last track it fires,
-        // whether another album follows or the queue simply runs out.
-        assert!(!due(&first, Some(&last)));
-        assert!(due(&last, Some(&other)));
-        assert!(due(&last, None));
-        // A track from somewhere else ending is not this album ending, even
-        // when what follows is not the armed album either.
-        assert!(!due(&other, Some(&first)));
+        assert!(by_item.matches(&legacy));
+        assert!(by_item.matches(&named));
+        assert!(EntryRef::of(&named).matches(&legacy));
+        assert!(!EntryRef::of(&named).matches(&entry("x", "e2")));
+        assert!(!by_item.matches(&entry("y", "e1")));
+    }
+
+    #[test]
+    fn an_album_stop_ends_with_the_last_track_of_the_run_it_was_armed_in() {
+        // B1, then a single X put "next", then the rest of B.
+        let queue = vec![
+            album_entry("b1", "B"),
+            album_entry("x", "X"),
+            album_entry("b2", "B"),
+            album_entry("b3", "B"),
+            album_entry("b4", "B"),
+            album_entry("c1", "C"),
+        ];
+        // Armed on the last row of B: that row, not the end of B1's run.
+        assert_eq!(album_run_end(&queue, &[], 4), 4);
+        assert_eq!(album_run_end(&queue, &[], 2), 4);
+        // Armed on B1 itself: X follows, so that run is B1 alone.
+        assert_eq!(album_run_end(&queue, &[], 0), 0);
+        let at = EntryRef::of(&queue[4]);
+        let due = |finished: &QueueTrack| {
+            stop_after_due(StopAfter::Album, Some(&at), Some("B"), finished, false)
+        };
+        assert!(!due(&queue[0]), "B1 ending with X next is not the stop");
+        assert!(!due(&queue[3]));
+        assert!(due(&queue[4]));
+    }
+
+    #[test]
+    fn an_album_stop_has_an_end_under_repeat_all() {
+        // One album, Repeat All: after the last track the queue wraps to the
+        // first of the same album — the run still ends at the last one.
+        let queue = vec![
+            album_entry("a1", "A"),
+            album_entry("a2", "A"),
+            album_entry("a3", "A"),
+        ];
+        assert_eq!(album_run_end(&queue, &[], 0), 2);
+        assert_eq!(album_run_end(&queue, &[1, 2, 0], 1), 0);
+    }
+
+    #[test]
+    fn an_album_stop_on_a_second_copy_of_the_album_ends_that_copy() {
+        let copy = |item_id: &str, entry_id: &str, album_id: &str| QueueTrack {
+            album_id: Some(album_id.into()),
+            ..entry(item_id, entry_id)
+        };
+        let queue = vec![
+            copy("a1", "e1", "A"),
+            copy("a2", "e2", "A"),
+            copy("c1", "e3", "C"),
+            copy("a1", "e4", "A"),
+            copy("a2", "e5", "A"),
+        ];
+        assert_eq!(album_run_end(&queue, &[], 3), 4);
+        assert_eq!(album_run_end(&queue, &[], 0), 1);
+        // In shuffle order the run follows the order, not the stored list.
+        assert_eq!(album_run_end(&queue, &[4, 2, 0, 1, 3], 0), 1);
+        // Where the album starts over, the run ends: the next copy is not
+        // this one.
+        assert_eq!(album_run_end(&queue, &[0, 3, 4, 1, 2], 0), 0);
+        let back_to_back = vec![
+            copy("a1", "e1", "A"),
+            copy("a2", "e2", "A"),
+            copy("a1", "e3", "A"),
+            copy("a2", "e4", "A"),
+        ];
+        assert_eq!(album_run_end(&back_to_back, &[], 0), 1);
+        assert_eq!(album_run_end(&back_to_back, &[], 2), 3);
+    }
+
+    /// Where an album stop armed on `armed` ends (the last entry it covers).
+    fn album_run_end(tracks: &[QueueTrack], order: &[usize], armed: usize) -> usize {
+        *album_run(tracks, order, armed).last().unwrap()
+    }
+
+    fn copy_of(item_id: &str, entry_id: &str) -> QueueTrack {
+        QueueTrack {
+            album_id: Some("A".into()),
+            ..entry(item_id, entry_id)
+        }
+    }
+
+    #[test]
+    fn an_album_stop_armed_in_the_middle_of_a_copy_ends_with_that_copy() {
+        // A1-A3 queued twice back to back, armed on A2 or A3 of the first.
+        let back_to_back: Vec<QueueTrack> = ["a1", "a2", "a3", "a1", "a2", "a3"]
+            .iter()
+            .enumerate()
+            .map(|(i, item)| copy_of(item, &format!("e{i}")))
+            .collect();
+        assert_eq!(album_run(&back_to_back, &[], 1), [1, 2]);
+        assert_eq!(album_run_end(&back_to_back, &[], 2), 2);
+        // Armed in the second copy, it ends with that one.
+        assert_eq!(album_run(&back_to_back, &[], 4), [4, 5]);
+        assert_eq!(album_run_end(&back_to_back, &[], 3), 5);
+        // The album, then A1 queued again on its own.
+        let requeued: Vec<QueueTrack> = ["a1", "a2", "a3", "a1"]
+            .iter()
+            .enumerate()
+            .map(|(i, item)| copy_of(item, &format!("e{i}")))
+            .collect();
+        assert_eq!(album_run_end(&requeued, &[], 1), 2);
+        assert_eq!(album_run_end(&requeued, &[], 3), 3);
+        // Album shuffle: the two copies as blocks next to each other, the
+        // first one started at its second track.
+        assert_eq!(album_run(&back_to_back, &[4, 5, 3, 0, 1, 2], 4), [4, 5, 3]);
+        assert_eq!(album_run_end(&back_to_back, &[4, 5, 3, 0, 1, 2], 1), 2);
+    }
+
+    #[test]
+    fn an_album_stop_ends_with_the_last_of_its_tracks_still_queued() {
+        let queue: Vec<QueueTrack> = ["b1", "b2", "b3", "b4"]
+            .iter()
+            .map(|item| copy_of(item, item))
+            .collect();
+        // Armed on B2: it covers B2 to B4.
+        let run: Vec<EntryRef> = album_run(&queue, &[], 1)
+            .into_iter()
+            .map(|index| EntryRef::of(&queue[index]))
+            .collect();
+        assert_eq!(stop_entry(&run, &queue), Some(&run[2]));
+        // B4 removed: the album ends after B3 now.
+        let without_b4 = &queue[..3];
+        assert_eq!(stop_entry(&run, without_b4).unwrap().entry_id, "b3");
+        // Removing the armed row itself changes nothing about the end.
+        let without_b2 = [queue[0].clone(), queue[2].clone(), queue[3].clone()];
+        assert_eq!(stop_entry(&run, &without_b2).unwrap().entry_id, "b4");
+        // Undone, B4 is back, and so is the stop after it.
+        assert_eq!(stop_entry(&run, &queue).unwrap().entry_id, "b4");
+        // Nothing of it left (the queue replaced): no stop at all.
+        assert_eq!(stop_entry(&run, &queue[..1]), None);
+        assert_eq!(stop_entry(&[], &queue), None);
+        // A queue line from before entry ids goes by its item.
+        let legacy = [queue_track("b3")];
+        assert_eq!(stop_entry(&run, &legacy).unwrap().entry_id, "b3");
+    }
+
+    #[test]
+    fn a_load_waiting_to_pause_stays_paused_when_its_track_is_removed() {
+        assert!(plays_on_after_removal(PlaybackStatus::Playing, false));
+        assert!(plays_on_after_removal(PlaybackStatus::Loading, false));
+        // Pause pressed while it loaded, or a seek made while paused.
+        assert!(!plays_on_after_removal(PlaybackStatus::Loading, true));
+        assert!(!plays_on_after_removal(PlaybackStatus::Paused, false));
+        assert!(!plays_on_after_removal(PlaybackStatus::Idle, false));
+    }
+
+    #[test]
+    fn under_repeat_one_an_album_ends_with_the_track_that_plays() {
+        let a1 = album_entry("a1", "A");
+        let a3 = album_entry("a3", "A");
+        let other = album_entry("c1", "C");
+        let at = EntryRef::of(&a3);
+        let due = |finished: &QueueTrack| {
+            stop_after_due(StopAfter::Album, Some(&at), Some("A"), finished, true)
+        };
+        assert!(due(&a1), "the album never reaches its end otherwise");
+        assert!(!due(&other));
     }
 
     #[test]
     fn a_track_without_an_album_never_ends_an_album() {
         let loose = queue_track("a");
+        let at = EntryRef::of(&loose);
+        assert_eq!(album_run_end(&[loose.clone(), queue_track("b")], &[], 0), 0);
+        // Armed with no album at all: a loose track ends nothing.
         assert!(!stop_after_due(
             StopAfter::Album,
-            Some("a"),
-            Some("album-1"),
-            &loose,
-            None
-        ));
-        // Armed with no album at all: a loose track ends nothing either.
-        assert!(!stop_after_due(
-            StopAfter::Album,
-            Some("a"),
+            Some(&at),
             None,
             &loose,
-            None
+            false
         ));
+        assert!(!stop_after_due(
+            StopAfter::Album,
+            Some(&at),
+            None,
+            &loose,
+            true
+        ));
+    }
+
+    #[test]
+    fn removing_the_current_track_lands_on_its_successor_in_play_order() {
+        // Shuffled: 57 plays, followed by 3 and 120 in play order (here:
+        // index 2, followed by 0, then 4).
+        let order = [1, 2, 0, 4, 3];
+        // Removing index 2: its successor 0 stays 0 after the shift.
+        assert_eq!(landing_after_removal(5, 2, &order, false), Some((0, true)));
+        // Removing the last in play order, repeat off: back to its predecessor
+        // (4, which is 3 after the shift), and no playback goes on there.
+        assert_eq!(landing_after_removal(5, 3, &order, false), Some((3, false)));
+        // With Repeat All the order wraps to its head.
+        assert_eq!(landing_after_removal(5, 3, &order, true), Some((1, true)));
+        // Linear: the next one slides into the removed slot.
+        assert_eq!(landing_after_removal(3, 1, &[], false), Some((1, true)));
+        assert_eq!(landing_after_removal(3, 2, &[], false), Some((1, false)));
+        // The last track left: nowhere to go.
+        assert_eq!(landing_after_removal(1, 0, &[], true), None);
+        assert_eq!(landing_after_removal(1, 0, &[0], false), None);
     }
 
     fn queue_track(item_id: &str) -> QueueTrack {
@@ -4250,6 +7091,7 @@ mod tests {
             artist: String::new(),
             album: String::new(),
             album_id: None,
+            album_artist: None,
             track_number: None,
             disc_number: None,
             duration_ms: 1,
@@ -4327,6 +7169,238 @@ mod tests {
     }
 
     #[test]
+    fn smart_crossfade_leaves_an_album_without_disc_numbers_alone() {
+        let track = |id: &str, disc: Option<i32>, number: i32| {
+            let mut t = album_track(id, "album");
+            t.disc_number = disc;
+            t.track_number = Some(number);
+            t.duration_ms = 180_000;
+            t
+        };
+        // A rip without disc tags: the tracks follow each other on disc 1.
+        assert!(!should_crossfade(
+            CrossfadeMode::Smart,
+            6_000,
+            &track("a1", None, 1),
+            &track("a2", None, 2)
+        ));
+        // A missing disc is disc 1, also next to a tagged one.
+        assert!(!should_crossfade(
+            CrossfadeMode::Smart,
+            6_000,
+            &track("a9", None, 9),
+            &track("b1", Some(2), 1)
+        ));
+        // Out of order is still not a sequence.
+        assert!(should_crossfade(
+            CrossfadeMode::Smart,
+            6_000,
+            &track("a1", None, 1),
+            &track("a3", None, 3)
+        ));
+        // Without track numbers there is no order to keep.
+        let mut loose = track("x", None, 1);
+        loose.track_number = None;
+        assert!(should_crossfade(
+            CrossfadeMode::Smart,
+            6_000,
+            &loose,
+            &track("a2", None, 2)
+        ));
+    }
+
+    #[test]
+    fn deferred_commands_keep_the_latest_setting_and_every_new_queue() {
+        let mut deferred = Vec::new();
+        // The session restore, then a volume drag long enough to fill the
+        // buffer many times over, then a sign-out and another account's play.
+        defer_command(
+            &mut deferred,
+            PlayerCommand::RestoreQueue(super::RestoredQueue {
+                tracks: vec![queue_track("old")],
+                index: 0,
+                order: None,
+            }),
+        );
+        for step in 0..=1_000 {
+            defer_command(
+                &mut deferred,
+                PlayerCommand::SetVolume {
+                    volume: step as f32 / 1_000.0,
+                },
+            );
+        }
+        defer_command(&mut deferred, PlayerCommand::Toggle);
+        defer_command(&mut deferred, PlayerCommand::ResetQueue);
+        // The old queue and what was meant for it are moot now.
+        assert_eq!(deferred.len(), 2);
+        assert!(matches!(deferred[0], PlayerCommand::SetVolume { volume } if volume == 1.0));
+        assert!(matches!(deferred[1], PlayerCommand::ResetQueue));
+        defer_command(
+            &mut deferred,
+            PlayerCommand::PlayQueue {
+                tracks: vec![queue_track("new")],
+                start_index: 0,
+                in_order: false,
+            },
+        );
+        assert_eq!(deferred.len(), 2);
+        assert!(matches!(
+            &deferred[1],
+            PlayerCommand::PlayQueue { tracks, .. } if tracks[0].item_id == "new"
+        ));
+    }
+
+    #[test]
+    fn a_full_deferred_buffer_still_takes_a_new_queue() {
+        let mut deferred = Vec::new();
+        for _ in 0..super::DEFERRED_COMMAND_LIMIT + 10 {
+            defer_command(
+                &mut deferred,
+                PlayerCommand::SetStopAfter {
+                    mode: StopAfter::Off,
+                    entry: None,
+                },
+            );
+        }
+        assert_eq!(deferred.len(), super::DEFERRED_COMMAND_LIMIT, "bounded");
+        defer_command(&mut deferred, PlayerCommand::ResetQueue);
+        assert!(matches!(deferred.last(), Some(PlayerCommand::ResetQueue)));
+    }
+
+    #[test]
+    fn ticks_keep_their_cadence_under_a_stream_of_commands() {
+        let start = std::time::Instant::now();
+        let mut clock = TickClock::new(start);
+        // A volume drag: a command every 50 ms for two seconds. The loop
+        // waits until the next command or the wake-up moment, whichever
+        // comes first.
+        let command_every = Duration::from_millis(50);
+        let mut now = start;
+        let mut next_command = start + command_every;
+        let mut ticks = Vec::new();
+        while now < start + Duration::from_secs(2) {
+            let wake_at = clock.wake_at(now, TICK);
+            now = next_command.min(wake_at);
+            if now == next_command {
+                next_command += command_every;
+            }
+            if clock.tick_due(now, wake_at) {
+                ticks.push(now - start);
+            }
+        }
+        assert_eq!(ticks.len(), 5, "{ticks:?}");
+        assert!(ticks.windows(2).all(|pair| pair[1] - pair[0] == TICK));
+
+        // A planned transition wants it sooner: the next wake-up comes then.
+        let early = clock.wake_at(now, Duration::from_millis(20));
+        assert_eq!(early, now + Duration::from_millis(20));
+        assert!(clock.tick_due(early, early));
+    }
+
+    /// A new player starts in the real format of its first source: a stereo
+    /// track comes out as stereo from its very first sample — not folded to
+    /// mono and stretched, as with the placeholder an empty player reports.
+    #[test]
+    fn a_new_player_plays_its_first_samples_in_their_own_format() {
+        let rate = rodio::SampleRate::new(48_000).unwrap();
+        let stereo = rodio::ChannelCount::new(2).unwrap();
+        let (mixer, mixed) = rodio::mixer::mixer(stereo, rate);
+        // Left and right apart, so a channel mix-up shows.
+        let frames: Vec<f32> = (0..2_000).flat_map(|_| [0.5, -0.5]).collect();
+        let _player = start_player(&mixer, 1.0, false, |player| {
+            player.append(SamplesBuffer::new(stereo, rate, frames))
+        });
+        let out: Vec<f32> = mixed.take(2_000).collect();
+        assert_eq!(out.len(), 2_000);
+        assert!(
+            out.chunks(2).all(|frame| frame == [0.5, -0.5]),
+            "first samples converted in the wrong format: {:?}",
+            &out[..16]
+        );
+    }
+
+    #[test]
+    fn a_player_started_paused_is_silent_from_its_first_sample() {
+        let rate = rodio::SampleRate::new(48_000).unwrap();
+        let mono = rodio::ChannelCount::new(1).unwrap();
+        let (mixer, mixed) = rodio::mixer::mixer(mono, rate);
+        let _player = start_player(&mixer, 1.0, true, |player| {
+            player.append(SamplesBuffer::new(mono, rate, vec![0.5; 4_000]))
+        });
+        assert!(mixed.take(2_000).all(|sample| sample == 0.0));
+    }
+
+    #[test]
+    fn the_sleep_fade_runs_down_to_silence_over_its_length() {
+        let fade = Duration::from_secs(30);
+        assert_eq!(sleep_level(Duration::from_secs(31), fade), None, "not yet");
+        assert_eq!(sleep_level(fade, fade), Some(1.0));
+        assert_eq!(sleep_level(Duration::from_secs(15), fade), Some(0.5));
+        assert_eq!(sleep_level(Duration::ZERO, fade), Some(0.0));
+    }
+
+    #[test]
+    fn a_resume_hands_over_to_the_sleep_fade_once_its_ramp_is_done() {
+        let fade = Some((0.3, Duration::from_secs(9)));
+        let ramping = Some(Duration::from_millis(120));
+        let done = Some(Duration::ZERO);
+        let fall = SleepFadeStep::Fall {
+            over: Duration::from_secs(9),
+        };
+        // Coming back to the fade's level: left alone until that is done,
+        // then the fade carries on down from there.
+        assert_eq!(sleep_fade_step(true, ramping, fade), SleepFadeStep::Keep);
+        assert_eq!(sleep_fade_step(true, done, fade), fall);
+        // Re-timed meanwhile (a seek, a timer or speed change took the mark):
+        // up to the new level by the same moment, not a swell to full volume.
+        assert_eq!(
+            sleep_fade_step(false, ramping, fade),
+            SleepFadeStep::Rise {
+                to: 0.3,
+                over: Duration::from_millis(120),
+            }
+        );
+        // No resume: armed stays armed, anything else is armed now.
+        assert_eq!(sleep_fade_step(true, None, fade), SleepFadeStep::Keep);
+        assert_eq!(sleep_fade_step(false, None, fade), fall);
+        // No fade (cancelled, moved out of its window): nothing to do, also
+        // during or after a resume.
+        for resume in [None, ramping, done] {
+            for armed in [false, true] {
+                assert_eq!(sleep_fade_step(armed, resume, None), SleepFadeStep::Keep);
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_short_stop_with_the_download_unfinished_is_a_broken_stream() {
+        let four_minutes = 240_000;
+        // Played through, all downloaded.
+        assert!(!stream_broke_off(240_000, four_minutes, Some((0.0, 1.0))));
+        // The connection died at 40 %: the download stopped there, and so
+        // did the music.
+        assert!(stream_broke_off(96_000, four_minutes, Some((0.0, 0.45))));
+        // Same after a reopen at 2:00, which downloads from there on.
+        assert!(stream_broke_off(150_000, four_minutes, Some((0.5, 0.65))));
+        // Reopened at 3:55 (a seek, a device switch, Play after an error):
+        // the rest of the file came first and played out, while the part
+        // before 3:55 is still being filled in. That is a natural end.
+        assert!(!stream_broke_off(240_000, four_minutes, Some((0.0, 0.3))));
+        // A stated length a little off makes no difference either.
+        assert!(!stream_broke_off(237_000, four_minutes, Some((0.0, 0.3))));
+        assert!(!stream_broke_off(235_000, four_minutes, Some((0.0, 0.3))));
+        assert!(stream_broke_off(234_999, four_minutes, Some((0.0, 0.3))));
+        // Stopped short with the whole file on disk: a damaged frame, not
+        // the stream.
+        assert!(!stream_broke_off(96_000, four_minutes, Some((0.0, 1.0))));
+        // A live transcode has no length to tell by; nor has a track
+        // without a duration.
+        assert!(!stream_broke_off(96_000, four_minutes, None));
+        assert!(!stream_broke_off(96_000, 0, Some((0.0, 0.45))));
+    }
+
+    #[test]
     fn album_shuffle_keeps_blocks_sorted_and_is_a_permutation() {
         let mut a2 = queue_track("a2");
         a2.album_id = Some("a".into());
@@ -4389,19 +7463,385 @@ mod tests {
     }
 
     #[test]
+    fn album_shuffle_plays_an_album_queued_twice_as_two_blocks() {
+        let track = |id: &str, album: &str, number: i32| {
+            let mut t = queue_track(id);
+            t.album_id = Some(album.into());
+            t.track_number = Some(number);
+            t
+        };
+        // Album x, a single y, then album x again (the same three tracks).
+        let tracks = vec![
+            track("x1", "x", 1),
+            track("x2", "x", 2),
+            track("x3", "x", 3),
+            track("y1", "y", 1),
+            track("x1", "x", 1),
+            track("x2", "x", 2),
+            track("x3", "x", 3),
+        ];
+        for seed in 0..32 {
+            let order = build_album_shuffle_order(&tracks, 0, seed);
+            assert_eq!(&order[..3], &[0, 1, 2], "the first copy, in track order");
+            let second = order.iter().position(|&index| index == 4).unwrap();
+            assert_eq!(
+                &order[second..second + 3],
+                &[4, 5, 6],
+                "the second copy is a block of its own, not 1,1,2,2,3,3"
+            );
+            let mut sorted = order;
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..tracks.len()).collect::<Vec<_>>());
+        }
+        // Started on the second copy: that copy plays on from there.
+        let order = build_album_shuffle_order(&tracks, 5, 7);
+        assert_eq!(&order[..3], &[5, 6, 4]);
+    }
+
+    #[test]
+    fn the_counts_the_queue_shows_match_what_cleanup_removes() {
+        let tracks = ["a", "b", "a", "a", "c", "b"].map(queue_track);
+        for current in 0..tracks.len() {
+            assert_eq!(
+                duplicate_count(&tracks),
+                duplicate_indices(&tracks, current).len()
+            );
+        }
+        assert_eq!(played_count(5, 3, &[2, 0, 3, 1, 4]), 2);
+        assert_eq!(played_count(5, 2, &[]), 2);
+        assert_eq!(played_count(0, 0, &[]), 0);
+    }
+
+    #[test]
+    fn a_seed_this_build_does_not_know_reads_as_the_track_seed() {
+        let mode: AutoDjSeedMode = serde_json::from_str(r#""mood""#).unwrap();
+        assert_eq!(mode, AutoDjSeedMode::Track);
+        let mode: AutoDjSeedMode = serde_json::from_str(r#""artist""#).unwrap();
+        assert_eq!(mode, AutoDjSeedMode::Artist);
+        assert_eq!(
+            serde_json::to_string(&AutoDjSeedMode::Track).unwrap(),
+            r#""track""#
+        );
+    }
+
+    /// The seed list as 0.6.0 knows it, without the sound seed and without
+    /// any stand-in for unknown values.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum OlderSeed {
+        Track,
+        Artist,
+        Genre,
+        Album,
+        Playlist,
+    }
+
+    #[test]
+    fn a_sound_reason_in_the_queue_still_reads_in_older_builds() {
+        #[derive(serde::Deserialize)]
+        struct OlderReason {
+            kind: OlderSeed,
+            label: String,
+        }
+        let reason = AutoDjReason {
+            kind: AutoDjSeedMode::Sonic,
+            label: "Song".into(),
+        };
+        let json = serde_json::to_string(&reason).unwrap();
+        let older: OlderReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (older.kind, older.label.as_str()),
+            (OlderSeed::Track, "Song")
+        );
+        // Read back here, it is the sound seed again.
+        assert_eq!(serde_json::from_str::<AutoDjReason>(&json).unwrap(), reason);
+        // As builds before this one wrote it.
+        let dev: AutoDjReason = serde_json::from_str(r#"{"kind":"sonic","label":"Song"}"#).unwrap();
+        assert_eq!(dev.kind, AutoDjSeedMode::Sonic);
+        // Any other seed is written as before, without the flag.
+        let artist = AutoDjReason {
+            kind: AutoDjSeedMode::Artist,
+            label: "A".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&artist).unwrap(),
+            r#"{"kind":"artist","label":"A"}"#
+        );
+    }
+
+    #[test]
+    fn stored_extras_with_the_sound_seed_still_read_in_older_builds() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OlderExtras {
+            auto_dj_enabled: bool,
+            auto_dj_seed_mode: OlderSeed,
+            auto_dj_max_tracks: u32,
+        }
+        let settings = ExtrasSettings {
+            auto_dj_enabled: true,
+            auto_dj_seed_mode: AutoDjSeedMode::Sonic,
+            auto_dj_max_tracks: 40,
+            ..ExtrasSettings::default()
+        };
+        let stored = settings.to_stored_json().unwrap();
+        let older: OlderExtras = serde_json::from_str(&stored).unwrap();
+        assert!(older.auto_dj_enabled);
+        assert_eq!(older.auto_dj_seed_mode, OlderSeed::Track);
+        assert_eq!(older.auto_dj_max_tracks, 40);
+        assert_eq!(ExtrasSettings::from_stored_json(&stored), Some(settings));
+        // A blob from before: "sonic" spelled out, or a plain seed.
+        let dev = ExtrasSettings::from_stored_json(r#"{"autoDjSeedMode":"sonic"}"#).unwrap();
+        assert_eq!(dev.auto_dj_seed_mode, AutoDjSeedMode::Sonic);
+        let plain = ExtrasSettings::from_stored_json(r#"{"autoDjSeedMode":"genre"}"#).unwrap();
+        assert_eq!(plain.auto_dj_seed_mode, AutoDjSeedMode::Genre);
+        // The UI still gets the seed as it is.
+        let ui = serde_json::to_value(ExtrasSettings {
+            auto_dj_seed_mode: AutoDjSeedMode::Sonic,
+            ..ExtrasSettings::default()
+        })
+        .unwrap();
+        assert_eq!(ui["autoDjSeedMode"], "sonic");
+    }
+
+    /// A handle on a plain channel, without a player thread behind it.
+    fn bare_handle() -> (
+        super::PlayerHandle,
+        std::sync::mpsc::Receiver<super::PlayerCommand>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = super::PlayerHandle {
+            tx,
+            state: Default::default(),
+            queue: Arc::new(Mutex::new(super::QueueSnapshot {
+                revision: 0,
+                tracks: Vec::new(),
+                index: 0,
+                order: Vec::new(),
+                can_undo: false,
+                played_count: 0,
+                duplicate_count: 0,
+            })),
+            dsp: Arc::new(super::AudioDsp::new(Default::default())),
+            tap: Arc::new(super::tap::VisualizerTap::new()),
+            waveforms: Default::default(),
+            analyses: Arc::new(super::analysis::AnalysisCache::new(None)),
+            play_requests: Default::default(),
+            enqueue_turn: Default::default(),
+        };
+        (handle, rx)
+    }
+
+    /// What reached the player, in order, by the first track of each.
+    fn sent(rx: &std::sync::mpsc::Receiver<super::PlayerCommand>) -> Vec<String> {
+        rx.try_iter()
+            .filter_map(|cmd| match cmd {
+                super::PlayerCommand::PlayQueue {
+                    tracks, in_order, ..
+                } => Some(format!(
+                    "{} {}",
+                    if in_order { "in order" } else { "play" },
+                    tracks[0].item_id
+                )),
+                super::PlayerCommand::PlayNext(tracks) => {
+                    Some(format!("next {}", tracks[0].item_id))
+                }
+                super::PlayerCommand::PlayLast(tracks) => {
+                    Some(format!("last {}", tracks[0].item_id))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Let the spawned requests run as far as they get.
+    async fn let_run() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_play_request_overtaken_by_a_newer_one_replaces_nothing() {
+        let (player, rx) = bare_handle();
+        // A slow instant mix, then an album clicked while it is fetched.
+        let mix = player.play_ticket();
+        let album = player.play_ticket();
+        player
+            .play_queue(album, vec![queue_track("album")], 0)
+            .await
+            .unwrap();
+        // The mix comes back last: overtaken, it must not replace the album.
+        player
+            .play_queue(mix, vec![queue_track("mix")], 0)
+            .await
+            .unwrap();
+        assert_eq!(sent(&rx), ["play album"]);
+        // A sonic radio goes out to be played in its own order.
+        let radio = player.play_ticket();
+        player
+            .play_in_order(radio, vec![queue_track("seed")])
+            .await
+            .unwrap();
+        assert_eq!(sent(&rx), ["in order seed"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_gives_way_to_an_older_one_still_fetching() {
+        let (player, rx) = bare_handle();
+        // A big genre is shuffled, then a sonic radio is refused (too few
+        // tracks analysed): the genre still plays when it is fetched.
+        let genre = player.play_ticket();
+        let radio = player.play_ticket();
+        drop(radio);
+        player
+            .play_queue(genre, vec![queue_track("genre")], 0)
+            .await
+            .unwrap();
+        assert_eq!(sent(&rx), ["play genre"]);
+    }
+
+    #[tokio::test]
+    async fn an_older_request_waits_for_a_newer_one_still_fetching() {
+        let (player, rx) = bare_handle();
+        let album = player.play_ticket();
+        let radio = player.play_ticket();
+        // The album is back first, while the radio still loads its index.
+        let waiting = tokio::spawn({
+            let player = player.clone();
+            async move {
+                player
+                    .play_queue(album, vec![queue_track("album")], 0)
+                    .await
+            }
+        });
+        let_run().await;
+        assert!(sent(&rx).is_empty(), "the radio may still play");
+        // The radio is refused: the album plays after all.
+        drop(radio);
+        waiting.await.unwrap().unwrap();
+        assert_eq!(sent(&rx), ["play album"]);
+
+        // This time the newer one plays, and the older one is dropped.
+        let album = player.play_ticket();
+        let mix = player.play_ticket();
+        let waiting = tokio::spawn({
+            let player = player.clone();
+            async move {
+                player
+                    .play_queue(album, vec![queue_track("album")], 0)
+                    .await
+            }
+        });
+        let_run().await;
+        player
+            .play_queue(mix, vec![queue_track("mix")], 0)
+            .await
+            .unwrap();
+        waiting.await.unwrap().unwrap();
+        assert_eq!(sent(&rx), ["play mix"]);
+    }
+
+    #[tokio::test]
+    async fn an_addition_lands_behind_the_play_asked_for_before_it() {
+        let (player, rx) = bare_handle();
+        // A big genre is shuffled, then an album added while it loads.
+        let genre = player.play_ticket();
+        let turn = player.enqueue_turn().await;
+        let adding = tokio::spawn({
+            let player = player.clone();
+            async move { player.enqueue(turn, vec![queue_track("b")], false).await }
+        });
+        let_run().await;
+        assert!(sent(&rx).is_empty(), "the album waits for the genre");
+        player
+            .play_queue(genre, vec![queue_track("genre")], 0)
+            .await
+            .unwrap();
+        adding.await.unwrap().unwrap();
+        assert_eq!(sent(&rx), ["play genre", "last b"]);
+
+        // A play that fails lets the addition go to the queue there is.
+        let failed = player.play_ticket();
+        let turn = player.enqueue_turn().await;
+        let adding = tokio::spawn({
+            let player = player.clone();
+            async move { player.enqueue(turn, vec![queue_track("c")], true).await }
+        });
+        let_run().await;
+        drop(failed);
+        adding.await.unwrap().unwrap();
+        assert_eq!(sent(&rx), ["next c"]);
+
+        // A play asked for after the addition does not hold it up.
+        let turn = player.enqueue_turn().await;
+        let _later = player.play_ticket();
+        player
+            .enqueue(turn, vec![queue_track("d")], false)
+            .await
+            .unwrap();
+        assert_eq!(sent(&rx), ["last d"]);
+    }
+
+    #[test]
+    fn an_empty_auto_dj_answer_waits_before_the_seed_asks_again() {
+        let now = std::time::Instant::now();
+        let retry = AutoDjRetry {
+            seed: "a".into(),
+            attempts: 1,
+            not_before: now + AUTO_DJ_RETRY_AFTER,
+        };
+        assert!(retry.holds("a", now), "not on the next tick");
+        assert!(!retry.holds("a", now + AUTO_DJ_RETRY_AFTER));
+        assert!(!retry.holds("b", now), "another seed asks at once");
+        let spent = AutoDjRetry {
+            attempts: AUTO_DJ_ATTEMPTS,
+            ..retry
+        };
+        assert!(spent.holds("a", now + AUTO_DJ_RETRY_AFTER * 10));
+    }
+
+    #[test]
+    fn an_auto_dj_mix_leaves_out_what_was_heard_by_item_and_by_recording() {
+        let dto = |id: &str, artist: &str, name: &str| crate::api::types::TrackDto {
+            id: id.into(),
+            artist: artist.into(),
+            name: name.into(),
+            duration_ms: 200_000,
+            ..Default::default()
+        };
+        let existing = std::collections::HashSet::from(["queued".to_string()]);
+        let mut heard = crate::commands_sonic::Recordings::default();
+        heard.insert("Band", "Hit", 200_500);
+        let mix = vec![
+            dto("copy", "band", "Hit"),
+            dto("queued", "Other", "Queued"),
+            dto("n1", "New", "One"),
+            dto("n2", "New", "Two"),
+            dto("n3", "New", "Three"),
+        ];
+        let fresh = fresh_mix(mix, &existing, &heard, 2);
+        let ids: Vec<&str> = fresh.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["n1", "n2"]);
+    }
+
+    #[test]
     fn prefetch_opens_the_next_track_only_once() {
         const W: u64 = super::PREFETCH_OPEN_REMAINING_MS;
-        assert!(should_start_prefetch(false, None, "b", 200_000, 15_000, W));
+        assert!(should_start_prefetch(
+            false, None, None, "b", 200_000, 15_000, W
+        ));
         assert!(
-            !should_start_prefetch(false, None, "b", 200_000, 60_000, W),
+            !should_start_prefetch(false, None, None, "b", 200_000, 60_000, W),
             "too early"
         );
         assert!(
-            should_start_prefetch(false, None, "b", 0, 0, W),
+            should_start_prefetch(false, None, None, "b", 0, 0, W),
             "unknown length opens at once"
         );
         assert!(
-            !should_start_prefetch(true, None, "b", 200_000, 15_000, W),
+            !should_start_prefetch(true, None, None, "b", 200_000, 15_000, W),
             "already open or opening"
         );
         // The gapless hand-off took the prefetched source: both slots are
@@ -4409,6 +7849,7 @@ mod tests {
         assert!(!should_start_prefetch(
             false,
             Some("b"),
+            None,
             "b",
             200_000,
             2_000,
@@ -4418,6 +7859,7 @@ mod tests {
         assert!(should_start_prefetch(
             false,
             Some("b"),
+            None,
             "c",
             200_000,
             2_000,
@@ -4427,10 +7869,40 @@ mod tests {
         assert!(should_start_prefetch(
             false,
             None,
+            None,
             "b",
             200_000,
             45_000,
             super::PREFETCH_OPEN_BEAT_MS
+        ));
+    }
+
+    #[test]
+    fn a_failed_prefetch_is_not_retried_on_every_tick() {
+        const W: u64 = super::PREFETCH_OPEN_REMAINING_MS;
+        // Both slots are empty again after the failure; without the memo
+        // the next tick would open the same track again.
+        assert!(!should_start_prefetch(
+            false,
+            None,
+            Some("b"),
+            "b",
+            200_000,
+            15_000,
+            W
+        ));
+        // Nor for a track of unknown length, which would retry it for the
+        // whole of the current one.
+        assert!(!should_start_prefetch(false, None, Some("b"), "b", 0, 0, W));
+        // A different next track (the queue changed) is opened as usual.
+        assert!(should_start_prefetch(
+            false,
+            None,
+            Some("b"),
+            "c",
+            200_000,
+            15_000,
+            W
         ));
     }
 
@@ -4475,6 +7947,7 @@ mod tests {
             server_url: None,
             user_id: None,
             snapshot_id: Some("a".into()),
+            order: None,
         })
         .unwrap();
         let current: PersistedQueue = serde_json::from_str(&json).unwrap();
@@ -4511,6 +7984,10 @@ mod tests {
             server_url: Some("https://music.home".into()),
             user_id: Some("u1".into()),
             snapshot_id: Some("s1".into()),
+            order: Some(PersistedOrder {
+                mode: ShuffleMode::Tracks,
+                order: vec![2, 0, 1],
+            }),
         };
         store
             .set(keys::QUEUE, &serde_json::to_string(&snapshot).unwrap())
@@ -4518,13 +7995,114 @@ mod tests {
         store
             .set(keys::QUEUE_INDEX, r#"{"snapshot_id":"s1","index":2}"#)
             .unwrap();
-        let (tracks, index) = load_persisted_queue(&store).expect("same account");
-        assert_eq!((tracks.len(), index), (3, 2));
+        let restored = load_persisted_queue(&store).expect("same account");
+        assert_eq!((restored.tracks.len(), restored.index), (3, 2));
+        assert_eq!(
+            restored_order(restored.order, ShuffleMode::Tracks, 3),
+            Some(vec![2, 0, 1]),
+            "the shuffle order comes back with it"
+        );
 
         store.set(keys::USER_ID, "u2").unwrap();
         assert!(load_persisted_queue(&store).is_none(), "another account");
         assert!(store.get(keys::QUEUE).is_none());
         assert!(store.get(keys::QUEUE_INDEX).is_none());
+    }
+
+    #[test]
+    fn a_shuffle_order_is_restored_only_where_it_still_fits() {
+        let saved = |mode, order: &[usize]| {
+            Some(PersistedOrder {
+                mode,
+                order: order.to_vec(),
+            })
+        };
+        assert_eq!(
+            restored_order(
+                saved(ShuffleMode::Albums, &[1, 2, 0]),
+                ShuffleMode::Albums,
+                3
+            ),
+            Some(vec![1, 2, 0])
+        );
+        // Built for track shuffle; album shuffle is on now.
+        assert_eq!(
+            restored_order(
+                saved(ShuffleMode::Tracks, &[1, 2, 0]),
+                ShuffleMode::Albums,
+                3
+            ),
+            None
+        );
+        // Not a permutation of the queue it came with.
+        for broken in [&[1, 2][..], &[1, 2, 2], &[0, 1, 3], &[0, 1, 2, 3]] {
+            assert_eq!(
+                restored_order(saved(ShuffleMode::Tracks, broken), ShuffleMode::Tracks, 3),
+                None,
+                "{broken:?}"
+            );
+        }
+        assert_eq!(restored_order(None, ShuffleMode::Tracks, 3), None);
+        assert_eq!(
+            restored_order(saved(ShuffleMode::Off, &[0, 1, 2]), ShuffleMode::Off, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn a_snapshot_with_its_order_still_reads_in_older_builds() {
+        // 0.6.0's snapshot had no order; it ignores the field it does not know.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OlderSnapshot {
+            tracks: Vec<QueueTrack>,
+            index: usize,
+        }
+        let json = serde_json::to_string(&PersistedQueue {
+            tracks: vec![queue_track("a"), queue_track("b")],
+            index: 1,
+            server_url: None,
+            user_id: None,
+            snapshot_id: None,
+            order: Some(PersistedOrder {
+                mode: ShuffleMode::Tracks,
+                order: vec![1, 0],
+            }),
+        })
+        .unwrap();
+        let older: OlderSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!((older.tracks.len(), older.index), (2, 1));
+        // And a snapshot an older build wrote has no order: shuffled anew.
+        let without: PersistedQueue = serde_json::from_str(r#"{"tracks":[],"index":0}"#).unwrap();
+        assert!(without.order.is_none());
+    }
+
+    #[test]
+    fn an_order_this_build_cannot_read_costs_the_order_not_the_queue() {
+        let tracks = serde_json::to_value(vec![queue_track("a"), queue_track("b")]).unwrap();
+        // A later build's shuffle mode, and an order that is no order at all.
+        for order in [
+            serde_json::json!({ "mode": "artists", "order": [1, 0] }),
+            serde_json::json!({ "mode": "tracks", "order": "1,0" }),
+            serde_json::json!(null),
+        ] {
+            let json = serde_json::json!({ "tracks": tracks, "index": 1, "order": order });
+            let snapshot: PersistedQueue = serde_json::from_value(json).unwrap();
+            assert_eq!((snapshot.tracks.len(), snapshot.index), (2, 1), "{order}");
+            assert!(snapshot.order.is_none(), "{order}");
+        }
+        // An order it can read still comes back.
+        let json = serde_json::json!({
+            "tracks": tracks, "index": 0, "order": { "mode": "albums", "order": [1, 0] },
+        });
+        let snapshot: PersistedQueue = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            snapshot.order,
+            Some(PersistedOrder {
+                mode: ShuffleMode::Albums,
+                order: vec![1, 0]
+            })
+        );
     }
 
     #[test]

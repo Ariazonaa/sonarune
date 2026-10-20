@@ -41,8 +41,14 @@
           class="group relative flex h-36 flex-col justify-end overflow-hidden rounded-xl p-4 shadow-lg"
           style="background: linear-gradient(135deg, hsl({(decade.startYear * 7) % 360} 58% 43%), hsl({(decade.startYear * 7 + 55) % 360} 62% 25%));"
         >
-          <a href="/discover/decade/{decade.startYear}" class="absolute inset-0" aria-label={decade.label}></a>
-          <p class="relative pointer-events-none text-2xl font-black text-white drop-shadow">{decade.label}</p>
+          <a
+            href="/discover/decade/{decade.startYear}"
+            class="absolute inset-0"
+            aria-label={m.discover_decade_label({ year: decade.startYear })}
+          ></a>
+          <p class="relative pointer-events-none text-2xl font-black text-white drop-shadow">
+            {m.discover_decade_label({ year: decade.startYear })}
+          </p>
           <div class="relative mt-3 flex gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             <button
               class="rounded-full bg-black/40 px-3 py-1 text-xs font-bold text-white backdrop-blur"

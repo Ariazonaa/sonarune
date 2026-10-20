@@ -1,8 +1,10 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount } from "svelte";
+  import { afterNavigate } from "$app/navigation";
   import { page } from "$app/state";
   import { VList } from "virtua/svelte";
   import { api } from "#lib/api.js";
+  import { appendPage, pageUntil, type PagedList } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import AlphabetRail from "#lib/components/AlphabetRail.svelte";
   import Cover from "#lib/components/Cover.svelte";
@@ -12,7 +14,7 @@
   import EmptyState from "#lib/components/EmptyState.svelte";
   import { player } from "#lib/state/player.svelte.js";
   import { startDrag } from "#lib/dragToPlaylist.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
   import { layoutPreferences } from "#lib/state/layout.svelte.js";
   import { contextMenuKey } from "#lib/menu.js";
@@ -32,10 +34,24 @@
   let gridWidth = $state(0);
   let list = $state<VList<AlbumDto[]> | null>(null);
   let genres = $state<GenreDto[]>([]);
-  let activeGenre = $state<string | null>(null);
   const SORT_OPTIONS = ["name", "dateAdded", "year", "random", "playCount"] as const;
   const PLAYED_OPTIONS = ["all", "unplayed", "played"] as const;
-  let sort = $state<string>("name");
+
+  /** The genre the URL asks for: `/?genre=<id>` from the Genres page and the
+   *  Discover hub; a plain `/` (the sidebar) means all of them. */
+  function urlGenre(): string | null {
+    return page.url.searchParams.get("genre") || null;
+  }
+
+  /** The sort the URL asks for, when it names a known one. */
+  function urlSort(): string | null {
+    const value = page.url.searchParams.get("sort");
+    return value && (SORT_OPTIONS as readonly string[]).includes(value) ? value : null;
+  }
+
+  // From the URL right away: the first page must be fetched with them.
+  let activeGenre = $state<string | null>(urlGenre());
+  let sort = $state<string>(urlSort() ?? "name");
   let favoritesOnly = $state(false);
   let played = $state<(typeof PLAYED_OPTIONS)[number]>("all");
   const playedLabel = (p: string) =>
@@ -54,8 +70,15 @@
   let staleHint = $state(false);
   /** Bumped on genre change so in-flight page fetches discard themselves. */
   let requestSeq = 0;
+  /** Bumped by every letter jump and by a reload: an older jump stops paging
+   *  and must not scroll anywhere after that. */
+  let jumpSeq = 0;
+  /** The page fetch in flight, so a letter jump can wait for it. */
+  let pending: Promise<boolean> | null = null;
 
   const hasMore = $derived(total === null || albums.length < total);
+  /** Whether a filter, not the library, can be why the grid is empty. */
+  const filtered = $derived(activeGenre !== null || favoritesOnly || played !== "all");
   // `letterIndex` counts albums before a letter by ascending SortName within
   // the genre only, so the rail would land on unrelated rows under any other
   // sort or with the favorites/played filters active.
@@ -86,27 +109,32 @@
         played,
       );
       if (seq !== requestSeq) return false; // genre switched mid-flight
-      // Items can shift between page fetches; duplicate keys would crash the
-      // keyed list.
-      const seen = new Set(albums.map((a) => a.id));
-      const fresh = page.items.filter((i) => !seen.has(i.id));
-      albums = [...albums, ...fresh];
-      // A later page that adds nothing (the list shifted, or an album vanished
-      // after a play-sorted grid was scanned) ends paging; otherwise the
-      // scroll handler would request the same offset again and again.
-      total = fresh.length === 0 && albums.length > 0 ? albums.length : page.total;
-      return true;
+      // A page that adds nothing (the list shifted, or an album vanished after
+      // a play-sorted grid was scanned) ends paging.
+      const merged = appendPage(albums, page.items, page.total, (album) => album.id);
+      albums = merged.items;
+      total = merged.total;
+      return merged.grew;
     } catch (e) {
       if (seq === requestSeq) error = String(e);
       return false;
     } finally {
-      if (seq === requestSeq) loading = false;
+      if (seq === requestSeq) {
+        loading = false;
+        pending = null;
+      }
     }
   }
 
-  async function loadMore(): Promise<boolean> {
-    if (loading || !hasMore) return false;
-    return fetchPage();
+  /** Start a page fetch, kept as `pending` for a letter jump to wait on. */
+  function startPage(): Promise<boolean> {
+    pending = fetchPage();
+    return pending;
+  }
+
+  function loadMore(): Promise<boolean> {
+    if (loading || !hasMore) return Promise.resolve(false);
+    return startPage();
   }
 
   function maybeLoadMore() {
@@ -126,10 +154,11 @@
   function reloadFromTop() {
     staleHint = false;
     requestSeq++;
+    jumpSeq++; // a jump's row number belongs to the list being replaced
     albums = [];
     total = null;
     list?.scrollTo(0);
-    fetchPage().then((ok) => {
+    startPage().then((ok) => {
       if (ok) maybeLoadMore();
     });
   }
@@ -157,44 +186,60 @@
     reloadFromTop();
   }
 
+  /** The way out of an empty filtered grid: everything, in the current sort. */
+  function clearFilters() {
+    activeGenre = null;
+    favoritesOnly = false;
+    played = "all";
+    reloadFromTop();
+  }
+
   const refresh = reloadFromTop;
 
   // On a server library change: reload live when near the top, otherwise show
-  // a pill so a deep scroll position isn't yanked away. Only `library.revision`
-  // is a dependency (the rest is untracked).
-  $effect(() => {
-    const rev = library.revision;
-    untrack(() => {
-      if (rev === 0) return;
-      if (!list || list.getScrollOffset() < 400) refresh();
-      else staleHint = true;
-    });
+  // a pill so a deep scroll position isn't yanked away.
+  onLibraryChange(() => {
+    if (!list || list.getScrollOffset() < 400) refresh();
+    else staleHint = true;
   });
 
+  const paged: PagedList = {
+    length: () => albums.length,
+    hasMore: () => hasMore,
+    pending: () => pending,
+    loadMore,
+  };
+
   async function jumpToLetter(letter: string) {
+    const jump = ++jumpSeq;
+    const current = () => jump === jumpSeq;
     try {
       const index = letter === "#" ? 0 : await api.letterIndex("albums", letter, activeGenre);
-      // Page in until the target row exists; bail when a fetch fails or the
-      // list stops growing (end reached / concurrent load in progress).
-      while (albums.length <= index && hasMore) {
-        const before = albums.length;
-        if (!(await loadMore()) || albums.length === before) break;
-      }
+      // Page in until the target row exists, then scroll there, unless a
+      // later letter (or another genre) took over meanwhile.
+      if (!(await pageUntil(index, paged, current))) return;
       list?.scrollToIndex(Math.floor(Math.min(index, Math.max(albums.length - 1, 0)) / cols), {
         align: "start",
       });
     } catch (e) {
-      error = String(e);
+      if (current()) error = String(e);
     }
   }
 
+  // SvelteKit keeps this page when only the query changes (the sidebar's
+  // "Albums" from /?genre=…, Back and Forward between the two), so every
+  // navigation applies the URL, not just the first. A URL without ?sort=
+  // leaves the sort the user picked.
+  afterNavigate(() => {
+    const genre = urlGenre();
+    const nextSort = urlSort() ?? sort;
+    if (genre === activeGenre && nextSort === sort) return;
+    activeGenre = genre;
+    sort = nextSort;
+    reloadFromTop();
+  });
+
   onMount(() => {
-    // Pre-select a genre when arrived at via /?genre=<id> (the genres page).
-    activeGenre = page.url.searchParams.get("genre") ?? null;
-    const urlSort = page.url.searchParams.get("sort");
-    if (urlSort && SORT_OPTIONS.includes(urlSort as (typeof SORT_OPTIONS)[number])) {
-      sort = urlSort;
-    }
     loadMore().then(() => maybeLoadMore());
     api.getGenres().then((g) => (genres = g)).catch(() => {});
   });
@@ -267,7 +312,13 @@
     </p>
   {/if}
 
-  {#if total === 0}
+  {#if total === 0 && filtered}
+    <EmptyState
+      icon="filter"
+      title={m.albums_empty_filtered()}
+      action={{ label: m.albums_clear_filters(), onclick: clearFilters }}
+    />
+  {:else if total === 0}
     <EmptyState icon="albums" title={m.albums_empty()} hint={m.empty_library_hint()} />
   {/if}
 

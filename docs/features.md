@@ -70,6 +70,11 @@ the current build does.
 - **A statistics dashboard**: how much the library holds and how much of it has
   been played at least once, plus the most played artists and the albums per
   decade as bars you can walk into.
+- **Play history and year in review**: every track you listen to (half of it
+  or four minutes, the ListenBrainz rule) is recorded on this computer, per
+  server and account — a timeline by day, and a review per year with plays,
+  listening time, the most played artists, albums and tracks, and plays per
+  month. Entries can be removed, recording switched off.
 - **Deleting** items on the server, when the account is allowed to.
 - **Library watch**: the server is polled for changes (and on window focus), so
   music added while the app is open shows up without a manual refresh.
@@ -102,8 +107,11 @@ UI shows it, it never computes it.
 - Reorder entries by drag-and-drop, remove entries, remove duplicates.
 - **Transfer entries between playlists.**
 - Add anything to a playlist from its context menu, including multi-selections.
-- Reorders and removals use the playlist's *entry id* rather than the track id,
-  so a playlist that contains the same track twice behaves.
+- **A track in a playlist twice**: Jellyfin 10.11 tells playlist entries
+  apart by their track only, so such a playlist shows both rows, reordering
+  waits until the duplicates are cleaned up, a removal that would take every
+  copy asks first, and *Clean up duplicates* rewrites the playlist with each
+  track once.
 - **In the sidebar**, and tracks and albums can be dragged onto them from any
   list or grid.
 
@@ -114,9 +122,10 @@ UI shows it, it never computes it.
 
 - **Discover hub** with random albums, mixes, long-not-heard, artists.
 - **By decade**: decade rows and a page per decade.
-- **Smart views**: build a query from server-side filters (genre, year, rating,
-  added-since and so on), save it locally, and materialize it into a static
-  playlist when you want it to stop moving.
+- **Smart views**: build a query from server-side filters (genres, a year
+  range, played or not, favorites only, a minimum play count, added since),
+  save it locally, and materialize it into a static playlist when you want it
+  to stop moving.
 - **Collections** — Jellyfin BoxSets, read-only.
 - **Auto-DJ**: pick a seed (track, artist, genre, album or playlist) and when
   the queue is about to run dry, Sonarune appends a fresh instant mix. It
@@ -217,7 +226,7 @@ UI shows it, it never computes it.
   stays readable against black, with a fixed accent as the fallback for grey
   artwork — or pick one of eight presets or your own color.
 - **View density and layout presets**: compact or comfortable lists, grid card
-  size, sidebar width, remembered per view.
+  size, sidebar width, one layout for the whole app.
 - **Skeletons, empty states and an offline banner**, plus a
   stale-while-revalidate cache, so navigation is instant and the UI never
   pretends to know something it does not.

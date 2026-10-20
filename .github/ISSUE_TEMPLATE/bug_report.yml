@@ -24,7 +24,7 @@ body:
     id: sonarune-version
     attributes:
       label: Sonarune version
-      description: Settings → About, or the installer file name.
+      description: Settings → Updates ("Installed version"), or the installer or zip file name.
       placeholder: "0.1.0"
     validations:
       required: true
@@ -68,9 +68,10 @@ body:
     attributes:
       label: Diagnostics export
       description: |
-        Settings → Diagnostics → Export writes a redacted log. URLs,
-        credentials, absolute paths and long ids are stripped before it is
-        written, so it is safe to attach. Drag the file in here.
+        Settings → Cache and diagnostics → Export diagnostics writes
+        sonarune-diagnostics.json to your Downloads folder, with a redacted
+        log. URLs, credentials, absolute paths and long ids are stripped
+        before it is written, so it is safe to attach. Drag the file in here.
 
   - type: textarea
     id: media

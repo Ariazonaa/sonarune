@@ -2,11 +2,15 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "#lib/api.js";
 import { apiLibrary } from "#lib/api/library.js";
 import { net } from "#lib/state/net.svelte.js";
+import { session } from "#lib/state/session.svelte.js";
 import { toast } from "#lib/state/toast.svelte.js";
 import { m } from "#lib/paraglide/messages.js";
+import { UnmuteVolume } from "#lib/unmuteVolume.js";
+import { stepVolume } from "#lib/volume.js";
 import type {
   AudioOutputFallbackEvent,
   PlayerState,
+  QueuePosition,
   QueueSnapshot,
   WaveformEvent,
 } from "#lib/types.js";
@@ -15,11 +19,19 @@ import type {
  *  a few recent ones for skipping back. */
 const WAVEFORMS_KEPT = 8;
 
+/** How far the position is carried on past the last state: a couple of
+ *  ticks. A state older than that is stale (the WebView was suspended, the
+ *  player was busy), and running on from it would carry the lyrics off to
+ *  the end of the track. */
+const EXTRAPOLATE_MAX_MS = 1000;
+
 const initial: PlayerState = {
   status: "idle",
+  pendingPause: false,
   current: null,
   sleepRemainingMs: null,
   stopAfter: "off",
+  stopAfterEntry: null,
   stopAfterItem: null,
   index: 0,
   queueLen: 0,
@@ -36,9 +48,19 @@ const initial: PlayerState = {
 
 const REPEAT_CYCLE = ["off", "all", "one"] as const;
 
+/** The signed-in account, for what belongs to it alone. Item ids are the
+ *  server's, the same for every user on it. */
+function account(): string {
+  const info = session.info;
+  return info ? `${info.serverUrl}\n${info.userId}` : "";
+}
+
 class PlayerStore {
   state = $state<PlayerState>(initial);
   queue = $state<QueueSnapshot>({
+    // No revision Rust ever sends: a position event before the first
+    // snapshot reads the queue back.
+    revision: -1,
     tracks: [],
     index: 0,
     order: [],
@@ -62,13 +84,21 @@ class PlayerStore {
    *  off is not where the music is. */
   jumpToCurrent() {
     this.showQueue = true;
+    // The two panels share one place (see the toggles below).
+    this.showLyrics = false;
     this.revealCurrent++;
   }
 
-  /** Optimistic favorite overrides keyed by itemId — the queue's `isFavorite`
-   *  is only a snapshot, and the 400ms state ticks would otherwise revert a
-   *  toggle before the server round-trip returns. */
+  /** Track favorites set in this session, keyed by itemId. The queue's
+   *  `isFavorite` is a snapshot from when the queue was built, a page's tracks
+   *  one from when it loaded, and the 400ms state ticks would revert a toggle
+   *  before the server round-trip returns. What was set since wins over all of
+   *  them, wherever it was set — every track heart goes through
+   *  `setFavorite`. They are one account's: the next one to sign in, on the
+   *  same server too, has favorites of its own (see `#favAccount`). */
   favOverrides = $state<Record<string, boolean>>({});
+  /** The account `favOverrides` were set under. */
+  #favAccount = "";
   /** Seek-bar waveforms by item id. Rust analyses a track once it is fully
    *  downloaded and announces it with `player:waveform`. */
   waveforms = $state<Record<string, number[]>>({});
@@ -78,6 +108,8 @@ class PlayerStore {
   #lastStateAt = performance.now();
   /** Last track whose waveform was asked for, so a tick does not ask again. */
   #waveformAsked: string | null = null;
+  /** The level unmute returns to, learned from the reported volumes. */
+  #unmute = new UnmuteVolume();
 
   #setWaveform(itemId: string, peaks: number[]) {
     const kept = Object.entries(this.waveforms)
@@ -107,6 +139,7 @@ class PlayerStore {
     await listen<PlayerState>("player:state", (event) => {
       this.state = event.payload;
       this.#lastStateAt = performance.now();
+      this.#unmute.observe(event.payload.volume, this.#lastStateAt);
       this.#askWaveform(event.payload);
     });
     await listen<WaveformEvent>("player:waveform", (event) => {
@@ -115,12 +148,34 @@ class PlayerStore {
     await listen<QueueSnapshot>("player:queue", (event) => {
       this.queue = event.payload;
     });
+    // A track change moves the position only. The fields are set one by one,
+    // so the track list keeps its identity and nothing built from it is
+    // rebuilt. A position for another revision means a snapshot was missed
+    // (a suspended window): then the queue is read back.
+    await listen<QueuePosition>("player:queue-index", (event) => {
+      const position = event.payload;
+      if (position.revision !== this.queue.revision) {
+        void this.#reloadQueue();
+        return;
+      }
+      this.queue.index = position.index;
+      this.queue.canUndo = position.canUndo;
+      this.queue.playedCount = position.playedCount;
+      this.queue.duplicateCount = position.duplicateCount;
+    });
     await listen<string>("player:error", (event) => {
       this.error = event.payload;
       // A stream failure may be the server dropping — verify.
       void net.check();
     });
+    await listen<{ name: string }>("player:stream-broke-off", (event) => {
+      this.error = m.player_stream_broke_off({ name: event.payload.name });
+      void net.check();
+    });
     await listen<{ device: string }>("audio:profile-applied", (event) => {
+      // The volume changed with the device. Rust sends this before the state
+      // that carries the device's volume, so that one lands on the new device.
+      this.#unmute.switchDevice(event.payload.device, performance.now());
       this.audioProfileRevision++;
       toast.show(m.audio_profile_applied_toast({ device: event.payload.device }), {
         kind: "info",
@@ -152,6 +207,11 @@ class PlayerStore {
     try {
       this.state = await api.getPlayerState();
       this.#lastStateAt = performance.now();
+      this.#unmute.observe(this.state.volume, this.#lastStateAt);
+      // Ask again even for a track asked about before: that answer may have
+      // been "not analysed yet", and the event that followed lost with the
+      // suspension.
+      this.#waveformAsked = null;
       this.#askWaveform(this.state);
       this.queue = await api.getQueue();
     } catch (e) {
@@ -159,12 +219,30 @@ class PlayerStore {
     }
   }
 
-  /** Position extrapolated between the ~400 ms state ticks (lyrics sync). */
+  async #reloadQueue() {
+    try {
+      this.queue = await api.getQueue();
+    } catch (e) {
+      console.error("queue reload failed", e);
+    }
+  }
+
+  /** Position extrapolated between the ~400 ms state ticks (lyrics sync).
+   *  The position is track time, which runs at the playback speed. */
   estimatedPositionMs(): number {
     const s = this.state;
-    const extra = s.status === "playing" ? performance.now() - this.#lastStateAt : 0;
-    const estimated = s.positionMs + extra;
+    const elapsed =
+      s.status === "playing" ? Math.min(performance.now() - this.#lastStateAt, EXTRAPOLATE_MAX_MS) : 0;
+    const estimated = s.positionMs + elapsed * (s.speed > 0 ? s.speed : 1);
     return s.durationMs > 0 ? Math.min(estimated, s.durationMs) : estimated;
+  }
+
+  /** Whether Play/Pause stands for "pause": playing, or loading a source that
+   *  plays when it arrives. One that arrives paused (Pause pressed while it
+   *  loads, a paused track reopened by a seek) offers Play. */
+  get playing(): boolean {
+    const s = this.state;
+    return s.status === "playing" || (s.status === "loading" && !s.pendingPause);
   }
 
   /** Lyrics and queue panels are mutually exclusive. */
@@ -189,21 +267,44 @@ class PlayerStore {
       });
   };
 
-  /** Favorite state of the current track, with any optimistic override. */
+  /** A track's favorite state: what this account set in this session,
+   *  otherwise the snapshot the caller holds. */
+  isFavorite(itemId: string, snapshot: boolean): boolean {
+    if (account() !== this.#favAccount) return snapshot;
+    return itemId in this.favOverrides ? this.favOverrides[itemId] : snapshot;
+  }
+
+  /** Set a track's favorite — the one way to, so every heart for it agrees.
+   *  Optimistic: shown at once; reverts and rejects if the server refuses. */
+  async setFavorite(itemId: string, favorite: boolean): Promise<void> {
+    const owner = account();
+    if (owner !== this.#favAccount) {
+      // Signed in as someone else since: the old hearts were not theirs.
+      this.#favAccount = owner;
+      this.favOverrides = {};
+    }
+    this.favOverrides = { ...this.favOverrides, [itemId]: favorite };
+    try {
+      await apiLibrary.setFavorite(itemId, favorite);
+    } catch (e) {
+      if (this.#favAccount === owner) {
+        this.favOverrides = { ...this.favOverrides, [itemId]: !favorite };
+      }
+      throw e;
+    }
+  }
+
+  /** Favorite state of the current track, with anything set since. */
   get currentIsFavorite(): boolean {
     const cur = this.state.current;
-    if (!cur) return false;
-    return cur.itemId in this.favOverrides ? this.favOverrides[cur.itemId] : cur.isFavorite;
+    return cur ? this.isFavorite(cur.itemId, cur.isFavorite) : false;
   }
 
   /** Toggle the current track's favorite; optimistic, reverts on failure. */
   toggleCurrentFavorite = () => {
     const cur = this.state.current;
     if (!cur) return;
-    const next = !this.currentIsFavorite;
-    this.favOverrides = { ...this.favOverrides, [cur.itemId]: next };
-    apiLibrary.setFavorite(cur.itemId, next).catch((e) => {
-      this.favOverrides = { ...this.favOverrides, [cur.itemId]: !next };
+    this.setFavorite(cur.itemId, !this.currentIsFavorite).catch((e) => {
       this.error = String(e);
     });
   };
@@ -213,19 +314,20 @@ class PlayerStore {
   prev = () => api.playerPrev();
   seek = (positionMs: number) => api.playerSeek(Math.max(0, Math.round(positionMs)));
   setVolume = (volume: number) => api.playerSetVolume(Math.min(1, Math.max(0, volume)));
-  /** Nudge the volume by a delta (for keyboard shortcuts). */
-  nudgeVolume = (delta: number) => this.setVolume(this.state.volume + delta);
+  /** Nudge the volume by `delta` of slider travel (for keyboard shortcuts),
+   *  so a press moves the player bar's slider the same distance at any level. */
+  nudgeVolume = (delta: number) => this.setVolume(stepVolume(this.state.volume, delta));
   /** Seek relative to the current position (for keyboard shortcuts). */
   seekBy = (deltaMs: number) => this.seek(this.state.positionMs + deltaMs);
 
-  #preMuteVolume = 1;
-  /** Toggle mute, restoring the pre-mute level on unmute. */
+  /** Toggle mute; unmute returns to the last level listened at, also when the
+   *  0 came from the slider or a restart (see lib/unmuteVolume.ts). */
   toggleMute = () => {
     if (this.state.volume > 0) {
-      this.#preMuteVolume = this.state.volume;
+      this.#unmute.remember(this.state.volume);
       return api.playerSetVolume(0);
     }
-    return api.playerSetVolume(this.#preMuteVolume > 0 ? this.#preMuteVolume : 1);
+    return api.playerSetVolume(this.#unmute.level);
   };
   toggleShuffle = () => {
     const next = this.state.shuffleMode === "off"

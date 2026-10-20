@@ -362,6 +362,20 @@ export async function loadAdditionalPresetPacks(
 
 const RECENT_MEMORY = 10;
 
+/**
+ * Whether `candidate` takes the place of the same-named `current` entry. A
+ * bundled preset always beats an online one, whatever the pack priorities:
+ * the online copy would only download code the app already ships, and while
+ * online presets are off (the default) it cannot be picked at all, so the
+ * bundled preset would vanish. Between two of a kind, the higher priority
+ * (the fuller pack) wins.
+ */
+function replaces(candidate: PresetEntry, current: PresetEntry): boolean {
+  const remote = Boolean(candidate.sourceUrl);
+  if (remote !== Boolean(current.sourceUrl)) return !remote;
+  return candidate.priority > current.priority;
+}
+
 /** Shuffle-bag rotation that can grow while optional chunks are loading. */
 export class PresetRotation {
   #entries: PresetEntry[] = [];
@@ -410,7 +424,7 @@ export class PresetRotation {
         this.#byName.set(entry.name, this.#entries.length);
         this.#entries.push(entry);
         added += 1;
-      } else if (entry.priority > this.#entries[index].priority) {
+      } else if (replaces(entry, this.#entries[index])) {
         // Later/full packs intentionally replace reduced versions while the
         // stable list position and user preferences remain intact.
         this.#entries[index] = entry;

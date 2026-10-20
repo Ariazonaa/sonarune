@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import { svelte, vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 
@@ -10,10 +11,19 @@ export default defineConfig({
   // 3 replaced the `$lib` alias with it), so no alias is needed here.
   resolve: {
     conditions: ["browser"],
+    // `$app/*` comes from SvelteKit's Vite plugin, which the tests leave out:
+    // a component that navigates gets a stand-in (src/lib/testing), for its
+    // test to mock (see ArtistLinks.test.ts).
+    alias: {
+      "$app/navigation": fileURLToPath(
+        new URL("./src/lib/testing/appNavigation.ts", import.meta.url),
+      ),
+    },
   },
   test: {
     environment: "jsdom",
-    include: ["src/**/*.{test,spec}.ts"],
+    // The release and asset scripts carry their own tests next to them.
+    include: ["src/**/*.{test,spec}.ts", "scripts/**/*.test.ts"],
     // A checkout on a network share imports so slowly that a full pool of
     // workers times out before it starts ("Timeout waiting for worker to
     // respond"), and the run fails with no test having run. Two workers get

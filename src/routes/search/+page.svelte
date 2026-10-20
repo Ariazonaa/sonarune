@@ -4,6 +4,7 @@
   import { afterNavigate, goto } from "$app/navigation";
   import { page } from "$app/state";
   import { api, formatDuration } from "#lib/api.js";
+  import { appendPage } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
@@ -13,7 +14,15 @@
   import EmptyState from "#lib/components/EmptyState.svelte";
   import { contextMenuKey, menuPoint } from "#lib/menu.js";
   import { trackMenuItems } from "#lib/trackMenu.js";
+  import {
+    clearSearchHistory,
+    loadSearchHistory,
+    saveSearchHistory,
+    SEARCH_HISTORY_MAX,
+  } from "#lib/searchHistory.js";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import { player } from "#lib/state/player.svelte.js";
+  import { session } from "#lib/state/session.svelte.js";
   import type { AlbumDto, ArtistDto, SearchKind, SearchPage, TrackDto } from "#lib/types.js";
 
   let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
@@ -21,8 +30,6 @@
   let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
   let edit = $state<{ itemId: string; name: string } | null>(null);
 
-  const HISTORY_KEY = "sonarune:searchHistory";
-  const HISTORY_MAX = 8;
   const PAGE_SIZE = 100;
   const LOAD_AHEAD_PX = 1_000;
 
@@ -37,6 +44,9 @@
   let total = $state(0);
   let error = $state<string | null>(null);
   let searching = $state(false);
+  /** The current search's first page arrived. Only then does an empty list
+   *  mean "no results"; after a failed request it means nothing. */
+  let answered = $state(false);
   let loadingMore = $state(false);
   let history = $state<string[]>([]);
   let selectedIndex = $state(-1);
@@ -45,6 +55,8 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
   let requestId = 0;
   let mounted = false;
+  /** Where this page's own URL sync navigated to last (see syncUrl). */
+  let syncedHref: string | null = null;
 
   const hasMore = $derived(items.length < total);
   const showHistory = $derived(!term.trim() && history.length > 0);
@@ -52,17 +64,7 @@
 
   onMount(() => {
     mounted = true;
-    try {
-      const raw = localStorage.getItem(HISTORY_KEY);
-      const parsed: unknown = raw ? JSON.parse(raw) : null;
-      if (Array.isArray(parsed)) {
-        history = parsed
-          .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
-          .slice(0, HISTORY_MAX);
-      }
-    } catch {
-      /* corrupt entry — ignore */
-    }
+    history = loadSearchHistory(session.info);
     applyUrl();
     return () => {
       mounted = false;
@@ -71,8 +73,13 @@
     };
   });
 
-  afterNavigate(({ shallow, type }) => {
+  afterNavigate(({ shallow, type, to }) => {
     if (shallow && type === 'goto') return;
+    // The URL follows the input, never the other way round. Our own sync
+    // settles a frame or two later (the layout's view transition holds it),
+    // and applying its URL then would throw away what was typed meanwhile.
+    if (type === "goto" && to?.url.href === syncedHref) return;
+    syncedHref = null;
     if (mounted) applyUrl();
   });
 
@@ -98,28 +105,23 @@
     if (query) url.searchParams.set("q", query);
     else url.searchParams.delete("q");
     url.searchParams.set("type", nextKind);
-    if (url.href === page.url.href) return;
+    // Compared with the URL already asked for: while that navigation is in
+    // flight, `page.url` is still the one before it.
+    if (url.href === (syncedHref ?? page.url.href)) return;
+    syncedHref = url.href;
     // reset: false keeps scroll position and focus (the input being typed in).
     goto(url, { replace: replaceState, reset: false });
   }
 
   function rememberSearch(query: string) {
-    const next = [query, ...history.filter((entry) => entry !== query)].slice(0, HISTORY_MAX);
+    const next = [query, ...history.filter((entry) => entry !== query)].slice(0, SEARCH_HISTORY_MAX);
     history = next;
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
-    } catch {
-      /* private mode / quota — history stays in-memory only */
-    }
+    saveSearchHistory(session.info, next);
   }
 
   function clearHistory() {
     history = [];
-    try {
-      localStorage.removeItem(HISTORY_KEY);
-    } catch {
-      /* ignore */
-    }
+    clearSearchHistory(session.info);
   }
 
   function unpack(result: SearchPage, resultKind: SearchKind): SearchItem[] {
@@ -160,6 +162,7 @@
     total = 0;
     selectedIndex = -1;
     error = null;
+    answered = false;
     loadingMore = false;
     if (navigation) syncUrl(query, resultKind, navigation === "replace");
     if (!query) {
@@ -171,8 +174,10 @@
     try {
       const result = await api.searchPage(query, resultKind, 0, PAGE_SIZE);
       if (id !== requestId) return;
-      items = unpack(result, resultKind);
-      total = Math.max(0, result.total);
+      const first = appendPage([], unpack(result, resultKind), Math.max(0, result.total), itemKey);
+      items = first.items;
+      total = first.total;
+      answered = true;
       queueMicrotask(maybeLoadMore);
     } catch (cause) {
       if (id === requestId) error = String(cause);
@@ -191,9 +196,12 @@
     try {
       const result = await api.searchPage(query, resultKind, start, PAGE_SIZE);
       if (id !== requestId || resultKind !== kind || query !== term.trim()) return false;
-      items = [...items, ...unpack(result, resultKind)];
-      total = Math.max(0, result.total);
-      return true;
+      // Pages are plain offsets over an unsorted result: a library scan
+      // between two of them repeats a row, which would crash the keyed list.
+      const merged = appendPage(items, unpack(result, resultKind), Math.max(0, result.total), itemKey);
+      items = merged.items;
+      total = merged.total;
+      return merged.grew;
     } catch (cause) {
       if (id === requestId) error = String(cause);
       return false;
@@ -240,15 +248,8 @@
     }
   }
 
-  async function playTrack(track: TrackDto) {
-    if (!track.albumId) return;
-    try {
-      const detail = await api.getAlbum(track.albumId);
-      const index = detail.tracks.findIndex((candidate) => candidate.id === track.id);
-      await api.playAlbum(track.albumId, Math.max(0, index));
-    } catch (cause) {
-      player.error = String(cause);
-    }
+  function playTrack(track: TrackDto) {
+    player.run(playInAlbum(track.id, track.albumId));
   }
 
   function activate(item: SearchItem) {
@@ -335,7 +336,7 @@
           {tab === "tracks" ? m.search_tracks() : tab === "albums" ? m.search_albums() : m.search_artists()}
         </button>
       {/each}
-      {#if term.trim() && !searching}
+      {#if term.trim() && answered}
         <span class="ml-auto text-xs font-semibold text-ink-muted">{(total === 1 ? m.search_results_count_one : m.search_results_count_many)({ count: total })}</span>
       {/if}
     </div>
@@ -368,7 +369,7 @@
     <div class="mt-6 h-1.5 w-full max-w-2xl overflow-hidden rounded-full bg-ink/10">
       <div class="h-full w-1/3 animate-pulse rounded-full bg-accent"></div>
     </div>
-  {:else if term.trim() && items.length === 0}
+  {:else if term.trim() && answered && items.length === 0}
     <EmptyState
       icon="search"
       title={m.search_no_results({ term: term.trim() })}

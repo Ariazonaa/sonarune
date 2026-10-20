@@ -1,14 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, formatDuration } from "#lib/api.js";
+  import { formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
   import Cover from "#lib/components/Cover.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
   import BarList, { type BarItem } from "#lib/components/BarList.svelte";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import { player } from "#lib/state/player.svelte.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
   import type { AlbumDto, StatsData, TrackDto } from "#lib/types.js";
 
@@ -31,22 +32,10 @@
   onMount(load);
 
   // Play counts and last-played dates change as you listen; refresh on change.
-  $effect(() => {
-    if (library.revision > 0) load();
-  });
+  onLibraryChange(load);
 
-  async function playTrack(track: TrackDto) {
-    if (!track.albumId) {
-      player.run(api.enqueueTracks([track.id], false));
-      return;
-    }
-    try {
-      const album = await api.getAlbum(track.albumId);
-      const index = album.tracks.findIndex((t) => t.id === track.id);
-      await api.playAlbum(track.albumId, Math.max(0, index));
-    } catch (e) {
-      player.error = String(e);
-    }
+  function playTrack(track: TrackDto) {
+    player.run(playInAlbum(track.id, track.albumId));
   }
 
   /** Plain thousands separators, in the language the app is in. */
@@ -63,7 +52,7 @@
 
   const decadeBars = $derived<BarItem[]>(
     (stats?.decades ?? []).map((decade) => ({
-      label: decade.label,
+      label: m.discover_decade_label({ year: decade.startYear }),
       value: decade.albums,
       valueLabel: number.format(decade.albums),
       href: `/discover/decade/${decade.startYear}`,

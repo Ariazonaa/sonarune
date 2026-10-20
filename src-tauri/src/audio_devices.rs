@@ -1,9 +1,28 @@
 use serde::Serialize;
 use std::sync::{Mutex, OnceLock};
 
+/// One output device, as Settings lists it and the player opens it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDevice {
+    /// cpal's device id, on Windows the endpoint id
+    /// ("wasapi:{0.0.0.00000000}.{…}"): unique where names are not — Windows
+    /// calls the onboard output and a USB headset both "Speakers" — and kept
+    /// across restarts. Not for good, though: Windows makes a new endpoint,
+    /// under a new id and mostly the old name, for a re-paired Bluetooth
+    /// device, a USB device without a serial number in another port, or a
+    /// driver that has one endpoint per mode (a Focusrite interface per
+    /// sample rate). The output setting and the per-device profiles store
+    /// the id and find such a device again by its name (`player::resolve_output`,
+    /// `audio_profiles::on_device_opened`).
+    pub id: String,
+    /// What the system's sound settings show ("Speakers (Realtek(R) Audio)").
+    pub name: String,
+}
+
 /// Runtime-only output state. The persisted playback setting remains the
 /// user's requested device even while audio is temporarily routed through the
-/// system default.
+/// system default. Holds that stored value (a device id).
 static FALLBACK_DEVICE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn fallback_device_slot() -> &'static Mutex<Option<String>> {
@@ -12,33 +31,34 @@ fn fallback_device_slot() -> &'static Mutex<Option<String>> {
 
 /// The device the open output actually plays through (resolved from "system
 /// default" too). Keys the per-device sound profiles.
-static ACTIVE_DEVICE: Mutex<Option<String>> = Mutex::new(None);
+static ACTIVE_DEVICE: Mutex<Option<OutputDevice>> = Mutex::new(None);
 
-pub fn set_active_device(device: Option<String>) {
+pub fn set_active_device(device: Option<OutputDevice>) {
     *ACTIVE_DEVICE.lock().unwrap() = device;
 }
 
-pub fn active_device() -> Option<String> {
+pub fn active_device() -> Option<OutputDevice> {
     ACTIVE_DEVICE.lock().unwrap().clone()
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioDeviceSnapshot {
-    pub devices: Vec<String>,
+    pub devices: Vec<OutputDevice>,
     pub fallback_device: Option<String>,
-    pub active_device: Option<String>,
+    pub active_device: Option<OutputDevice>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioOutputFallbackEvent {
+    /// Name of the configured device the output could not stay on.
     pub requested_device: String,
 }
 
 pub fn snapshot() -> AudioDeviceSnapshot {
     AudioDeviceSnapshot {
-        devices: crate::player::output_device_names(),
+        devices: crate::player::output_devices(),
         fallback_device: fallback_device(),
         active_device: active_device(),
     }

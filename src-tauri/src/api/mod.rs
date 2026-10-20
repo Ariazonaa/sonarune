@@ -1,16 +1,28 @@
 pub mod types;
 
+#[cfg(test)]
+mod client_tests;
+
 use crate::error::{AppError, AppResult};
 use serde::de::DeserializeOwned;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use types::*;
 
 pub const CLIENT_NAME: &str = "Sonarune";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Sent with every request. reqwest sends none of its own, and a proxy in
+/// front of the server may refuse a request without one: Cloudflare's Browser
+/// Integrity Check (on by default) answers it with a 403 challenge, which the
+/// session probe would then read as a rejected token.
+pub const USER_AGENT: &str = concat!("Sonarune/", env!("CARGO_PKG_VERSION"));
 
 /// The download name from a Content-Disposition header.
 ///
@@ -124,6 +136,45 @@ fn unique_ids(ids: &[String]) -> Vec<&str> {
         .collect()
 }
 
+/// A Jellyfin item id: a GUID, as the server writes it (32 hex digits) or with
+/// its dashes.
+fn is_item_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(at, byte)| {
+            if matches!(at, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    }
+}
+
+/// An item id in one spelling, whatever the server or a stored value used.
+fn item_id_key(id: &str) -> String {
+    id.chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// How many of the entries a playlist holds (`stored`) are not among the ones
+/// listed for the user (`listed`): the entries hidden from them. Visibility
+/// goes by item, so it is enough to compare which items are listed.
+fn hidden_entries(stored: &[String], listed: &[String]) -> usize {
+    let listed = listed
+        .iter()
+        .map(|id| item_id_key(id))
+        .collect::<HashSet<_>>();
+    stored
+        .iter()
+        .filter(|id| !listed.contains(&item_id_key(id)))
+        .count()
+}
+
 /// Most of a non-2xx body read for the error message — a proxy's error page
 /// can be arbitrarily large and is never worth buffering whole.
 const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
@@ -132,6 +183,14 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 300;
 
 /// A bounded, banner-sized message from a failed response's body.
 async fn error_message(mut response: reqwest::Response) -> String {
+    // A proxy's redirect usually has no body at all, and "server returned
+    // 308: " alone does not say that the server moved.
+    if let Some(target) = redirect_target(&response) {
+        return format!(
+            "the server redirects to {} (not followed)",
+            target.origin().ascii_serialization()
+        );
+    }
     let mut body = Vec::new();
     while body.len() < MAX_ERROR_BODY_BYTES {
         match response.chunk().await {
@@ -154,6 +213,90 @@ fn shorten_error_message(body: &str) -> String {
         Some((cut, _)) => format!("{}…", collapsed[..cut].trim_end()),
         None => collapsed,
     }
+}
+
+/// Where a redirect the client did not follow points: `Location`, resolved
+/// against the request. Redirects are followed only inside the configured
+/// origin (`same_origin_redirects`), so one that reaches a caller leaves it —
+/// most often a proxy upgrading `http://` to `https://`.
+fn redirect_target(response: &reqwest::Response) -> Option<reqwest::Url> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    response.url().join(location).ok()
+}
+
+/// The server address a redirect of `api_path` (a path below `base_url`) asks
+/// the client to use instead — but only for an upgrade to `https://` on the
+/// same host: the target with the API path cut off, so a server under a
+/// sub-path keeps it. `None` for any other redirect: another host may be a
+/// captive portal, and is no address to suggest a password for.
+fn upgraded_base_url(base_url: &str, api_path: &str, target: &reqwest::Url) -> Option<String> {
+    let base = reqwest::Url::parse(base_url).ok()?;
+    if target.scheme() != "https" || target.host_str() != base.host_str() {
+        return None;
+    }
+    let path = target
+        .path()
+        .strip_suffix(api_path)
+        .unwrap_or(base.path())
+        .trim_end_matches('/');
+    Some(format!("{}{path}", target.origin().ascii_serialization()))
+}
+
+/// Ceiling for a JSON answer. The longest real one is an unpaged playlist
+/// (`playlist_tracks`, about 2 KB per entry): the app itself saves smart views
+/// of up to [`SMART_SCAN_MAX_ITEMS`] tracks as playlists — some 200 MB to read
+/// back — and other clients can make longer ones. A scan page of 1000 items is
+/// a few MB. The ceiling clears both and still keeps a broken or hostile
+/// server from making the client buffer gigabytes (see [`MAX_IMAGE_BYTES`]).
+const MAX_JSON_BYTES: u64 = 512 * 1024 * 1024;
+
+// The longest playlist the app makes must stay readable, with twice the room
+// an entry takes.
+const _: () = assert!(SMART_SCAN_MAX_ITEMS as u64 * 4 * 1024 <= MAX_JSON_BYTES);
+
+/// A JSON body, read with [`MAX_JSON_BYTES`] as the limit.
+async fn read_json<T: DeserializeOwned>(response: reqwest::Response) -> AppResult<T> {
+    read_json_capped(response, MAX_JSON_BYTES).await
+}
+
+async fn read_json_capped<T: DeserializeOwned>(
+    response: reqwest::Response,
+    limit: u64,
+) -> AppResult<T> {
+    let body = read_capped(response, limit, "server response").await?;
+    serde_json::from_slice(&body)
+        .map_err(|e| AppError::Other(format!("unreadable server response: {e}")))
+}
+
+/// A by-id lookup that came back empty: the item is gone, or this user may
+/// not see it. Jellyfin answers such an `/Items?ids=` query with an empty 200,
+/// never a 404 — reported as one, so a page can tell a deleted item from a
+/// request that failed.
+fn not_found(kind: &str, id: &str) -> AppError {
+    AppError::Server {
+        status: 404,
+        message: format!("{kind} {id} not found"),
+    }
+}
+
+/// A detail page's item and its contents, fetched side by side. When both
+/// fail, the item's error wins: for an item deleted on the server, the lookup
+/// by id says 404 while the contents query fails with whatever an unknown
+/// parent gets (a 400 for an album), and the page drops its cached copy only
+/// on that 404. `try_join!` would report whichever happened to come back first.
+pub async fn join_detail<A, B>(
+    item: impl std::future::Future<Output = AppResult<A>>,
+    contents: impl std::future::Future<Output = AppResult<B>>,
+) -> AppResult<(A, B)> {
+    let (item, contents) = tokio::join!(item, contents);
+    Ok((item?, contents?))
 }
 
 /// Reject malformed selections before contacting Jellyfin.
@@ -181,7 +324,10 @@ fn validate_playlist_entry_ids(entry_ids: &[String]) -> AppResult<()> {
 
 /// Resolve a selection of playlist entry ids to the item ids Jellyfin's add
 /// endpoint expects. The caller's selection order is deliberately ignored:
-/// copied tracks keep their order in the freshly fetched source playlist.
+/// copied tracks keep their order in the freshly fetched source playlist. An
+/// entry id the source lists more than once — on Jellyfin 10.11 that is a
+/// track in the playlist twice, whose entries both carry the track's id —
+/// resolves once, at its first entry.
 fn resolve_playlist_item_ids<'a>(
     source_entries: impl IntoIterator<Item = (&'a str, &'a str)>,
     entry_ids: &[String],
@@ -210,6 +356,45 @@ fn resolve_playlist_item_ids<'a>(
     }
 
     Ok(item_ids)
+}
+
+/// The index Jellyfin's playlist move needs for an entry to land at
+/// `audio_index` among the playlist's audio entries — the list
+/// `playlist_tracks` returns and the playlist page reorders.
+///
+/// `entries` is the playlist as Jellyfin lists it to the user, in order: each
+/// entry's id and whether it is audio. Jellyfin counts its move index over
+/// all of them (remove-then-insert, like the queue), so every non-audio entry
+/// `playlist_tracks` leaves out shifts it. The entry goes right below the
+/// audio entry it was dropped under, or right above the one it was dropped
+/// over, which keeps the hidden entries where they were among the rest.
+/// None when the entry is not in the playlist; the first match counts, as it
+/// does on the server.
+fn playlist_move_index(
+    entries: &[(&str, bool)],
+    entry_id: &str,
+    audio_index: usize,
+) -> Option<usize> {
+    use std::cmp::Ordering;
+
+    let from = entries.iter().position(|(id, _)| *id == entry_id)?;
+    let from_audio = entries[..from].iter().filter(|(_, audio)| *audio).count();
+    // Where the other audio entries sit once the moved one is taken out: the
+    // list Jellyfin inserts it back into.
+    let rest: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, audio))| *audio && *index != from)
+        .map(|(index, _)| if index > from { index - 1 } else { index })
+        .collect();
+    let target = audio_index.min(rest.len());
+    Some(match target.cmp(&from_audio) {
+        Ordering::Greater => rest[target - 1] + 1,
+        Ordering::Less => rest[target],
+        // Its audio position does not change; the server takes its own
+        // index as "no move".
+        Ordering::Equal => from,
+    })
 }
 
 const SMART_SCAN_BATCH: u32 = 500;
@@ -243,6 +428,52 @@ impl<K: PartialEq> ScanCache<K> {
     }
 }
 
+/// Tickets for one kind of paged browsing scan (smart views, the album grid).
+///
+/// A running command cannot be cancelled from the frontend: a view that was
+/// replaced (a filter edit, another sort) only drops the old answer, while its
+/// scan walks on through the whole library and, finishing last, would put the
+/// old view's ids into the single-slot cache. So every such scan takes a
+/// ticket. A newer one supersedes it: the old scan stops before its next page,
+/// and only the scan holding the newest ticket writes the cache.
+#[derive(Debug, Default)]
+struct ScanTickets(AtomicU64);
+
+impl ScanTickets {
+    fn take(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn is_current(&self, ticket: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == ticket
+    }
+}
+
+/// What a superseded scan stops with. Nobody gets to see it: the view that
+/// asked has already moved on and drops the answer.
+fn superseded() -> AppError {
+    AppError::Other("superseded by a newer query".into())
+}
+
+/// Keep `ids` as the scan cache for `key`, unless a newer scan of the same
+/// kind started in the meantime — its own result belongs there.
+fn cache_scan<K>(
+    slot: &Mutex<Option<ScanCache<K>>>,
+    tickets: &ScanTickets,
+    ticket: u64,
+    key: K,
+    ids: Arc<Vec<String>>,
+) {
+    let mut slot = slot.lock().unwrap();
+    if tickets.is_current(ticket) {
+        *slot = Some(ScanCache {
+            key,
+            scanned_at: Instant::now(),
+            ids,
+        });
+    }
+}
+
 /// Page size of the album grid's scans (played tracks, matching album ids).
 /// Both requests are ids plus user data only, so a large page stays cheap.
 const ALBUM_SCAN_BATCH: u32 = 1000;
@@ -250,6 +481,33 @@ const ALBUM_SCAN_BATCH: u32 = 1000;
 /// How long later pages of a locally evaluated album grid reuse its scan. As
 /// with smart views, the first page always rescans.
 const ALBUM_SCAN_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// How long later pages of "long not heard", and the Discover row, reuse the
+/// last ranking (the "see all" page's first page rescans). A play moves its
+/// album from wherever it was to the very end, so a rescan between two pages
+/// would shift the page boundary by one album per play — tolerable, but not
+/// on every page.
+const LONG_NOT_HEARD_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Page size and reach of a home row's walk through the played tracks.
+const HOME_TRACK_BATCH: u32 = 200;
+const HOME_TRACK_MAX: u32 = 2_000;
+
+/// A box set's music-album count, and its member count (`ChildCount`) when it
+/// was counted.
+#[derive(Debug, Clone, Copy)]
+struct CollectionCount {
+    members: i32,
+    albums: i64,
+    counted_at: Instant,
+}
+
+/// How long a box set's album count is trusted while its member count stays
+/// the same — a swap of one member for another keeps the count.
+const COLLECTION_COUNT_TTL: Duration = Duration::from_secs(600);
+
+/// Box sets counted at the same time.
+const COLLECTION_COUNT_CONCURRENCY: usize = 6;
 
 /// Sort keys of the album grid (`get_albums`'s `sort`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,13 +572,46 @@ struct AlbumGridQuery {
     played: PlayedFilter,
 }
 
+/// What a locally evaluated grid's scan is cached under: its query and, for a
+/// random grid, the seed of the shuffle it pages through.
+type AlbumGridKey = (AlbumGridQuery, Option<u64>);
+
 impl AlbumGridQuery {
     /// Whether the server can filter and order this grid itself, and so page
     /// it. Played state and play data live on tracks, not albums (an album's
     /// `IsPlayed`/`IsUnplayed` filter reads the album's own, never-written
-    /// user data): those need the local scan.
+    /// user data): those need the local scan. So does a random order:
+    /// `sortBy=Random` reshuffles on every request, so the server's pages
+    /// would overlap, and the grid stopped at the first page that brought
+    /// nothing new, with some albums never shown.
     fn is_server_side(&self) -> bool {
-        !self.sort.is_play_based() && self.played == PlayedFilter::All
+        !self.sort.is_play_based()
+            && self.sort != AlbumSort::Random
+            && self.played == PlayedFilter::All
+    }
+
+    /// Whether evaluating this grid locally needs the per-album play stats —
+    /// only a play-based sort or the played filter reads them.
+    fn needs_play_stats(&self) -> bool {
+        self.sort.is_play_based() || self.played != PlayedFilter::All
+    }
+}
+
+/// Fisher-Yates driven by SplitMix64: the same seed always lays the same items
+/// out the same way. That is what lets a random album grid continue one
+/// shuffle across a rescan instead of drawing a new one mid-list.
+fn shuffle_seeded<T>(items: &mut [T], seed: u64) {
+    let mut state = seed;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for upper in (1..items.len()).rev() {
+        let other = (next() % (upper as u64 + 1)) as usize;
+        items.swap(upper, other);
     }
 }
 
@@ -444,6 +735,46 @@ fn page_of_ids(ids: &[String], start_index: u32, limit: u32) -> Vec<String> {
         .skip(start_index as usize)
         .take(limit as usize)
         .cloned()
+        .collect()
+}
+
+/// Played albums, the one heard longest ago first. An album was last heard
+/// when any of its tracks last played, so it ranks by its latest track play;
+/// albums whose plays carry no date at all cannot be placed and come last.
+/// Ties keep id order, so two scans of the same plays rank the same way.
+fn least_recently_played(stats: &HashMap<String, AlbumPlayStats>) -> Vec<String> {
+    let mut ids = stats.keys().cloned().collect::<Vec<_>>();
+    ids.sort_unstable();
+    rank_album_ids(ids, false, |id| {
+        stats.get(id).and_then(|s| s.last_played.as_deref())
+    })
+}
+
+/// Append the albums of `items` that `albums` does not hold yet, in order,
+/// until it holds `limit`. Returns whether it is full.
+fn take_new_albums(albums: &mut Vec<String>, items: Vec<BaseItem>, limit: usize) -> bool {
+    for album_id in items.into_iter().filter_map(|item| item.album_id) {
+        if albums.len() >= limit {
+            break;
+        }
+        if !album_id.is_empty() && !albums.contains(&album_id) {
+            albums.push(album_id);
+        }
+    }
+    albums.len() >= limit
+}
+
+/// The music libraries among a user's views (`/UserViews`).
+fn music_libraries(views: Vec<BaseItem>) -> Vec<String> {
+    views
+        .into_iter()
+        .filter(|view| {
+            view.collection_type
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("music"))
+        })
+        .map(|view| view.id)
+        .filter(|id| !id.is_empty())
         .collect()
 }
 
@@ -600,6 +931,12 @@ fn reached_added_cutoff(items: &[BaseItem], since: &str) -> bool {
     })
 }
 
+/// The part of a smart filter checked on each scanned track. Genres are not
+/// among it: every scan already sends `genreIds`, and the server matches those
+/// by name, while an id comparison here can fail for the right track — the
+/// `Genre` item `/Genres` lists for a name (which saved views may still carry)
+/// and the music genre a track lists under the same name have different ids,
+/// so on Jellyfin 10.11 it rejected every track the server had found.
 fn smart_item_matches(item: &BaseItem, filter: &SmartFilter) -> bool {
     if filter
         .year_from
@@ -610,14 +947,6 @@ fn smart_item_matches(item: &BaseItem, filter: &SmartFilter) -> bool {
     if filter
         .year_to
         .is_some_and(|to| item.production_year.is_none_or(|year| year > to))
-    {
-        return false;
-    }
-    if !filter.genre_ids.is_empty()
-        && !item
-            .genre_items
-            .iter()
-            .any(|genre| filter.genre_ids.iter().any(|id| id == &genre.id))
     {
         return false;
     }
@@ -645,26 +974,53 @@ fn smart_item_matches(item: &BaseItem, filter: &SmartFilter) -> bool {
     true
 }
 
-fn unique_album_ids(items: impl IntoIterator<Item = BaseItem>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    items
-        .into_iter()
-        .filter_map(|item| item.album_id)
-        .filter(|id| seen.insert(id.clone()))
-        .collect()
+/// The matches of a smart-view scan, each track once. The scan pages by
+/// offset over "newest first", so a track added while it runs shifts every
+/// later page by one, and the last track of one page comes back as the first
+/// of the next (`AlbumPlayAggregate` guards the album grid's scan alike).
+#[derive(Debug, Default)]
+struct SmartMatches {
+    seen: HashSet<String>,
+    items: Vec<BaseItem>,
+}
+
+impl SmartMatches {
+    fn add(&mut self, items: impl IntoIterator<Item = BaseItem>, filter: &SmartFilter) {
+        for item in items {
+            if !smart_item_matches(&item, filter) {
+                continue;
+            }
+            if !item.id.is_empty() && !self.seen.insert(item.id.clone()) {
+                continue;
+            }
+            self.items.push(item);
+        }
+    }
 }
 
 fn flatten_album_tracks<T>(albums: impl IntoIterator<Item = Vec<T>>) -> Vec<T> {
     albums.into_iter().flatten().collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Album track requests [`JellyfinClient::tracks_for_albums`] keeps in flight.
+const ALBUM_TRACKS_IN_FLIGHT: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionValidity {
     Valid,
     /// Token rejected — re-authentication needed.
     Invalid,
     /// Server not reachable or unhealthy; token may well still be good.
     Unreachable,
+    /// The handshake failed on a certificate this client does not trust —
+    /// the fingerprint it presented. A pinned server that renewed its
+    /// certificate looks like this, and so does anything on the network that
+    /// presents its own (a captive portal, an interception): the user has to
+    /// look at it, a retry alone never gets through.
+    Untrusted(String),
+    /// The server redirects to `https://` on the same host: the address to
+    /// sign in with from now on. The stored one will never work again.
+    Moved(String),
 }
 
 /// Fingerprint of the music library used to detect server-side changes.
@@ -686,19 +1042,38 @@ pub struct JellyfinClient {
     /// Confirmed SHA-256 fingerprints this client's TLS backend also accepts on
     /// top of the OS trust store.
     trusted: Vec<String>,
-    /// Fingerprint the most recent handshake presented (set by the TLS verifier).
+    /// Fingerprint the most recent handshake presented (set by the TLS verifier,
+    /// cleared when a session probe starts — see [`Self::validate`]).
     observed: crate::tls::ObservedFingerprint,
     token: Option<String>,
     user_id: Option<String>,
     /// Last full smart-view scan, reused by that view's later pages. Per client,
     /// so it never outlives the session (server and user) it was scanned for.
     smart_scan_cache: Mutex<Option<ScanCache<SmartFilter>>>,
-    /// Last locally evaluated album-grid scan (play-based sort or played
-    /// filter), reused by that grid's later pages. Per client, like the above.
-    album_scan_cache: Mutex<Option<ScanCache<AlbumGridQuery>>>,
+    /// Last locally evaluated album-grid scan (play-based sort, played filter
+    /// or random order), reused by that grid's later pages. Per client, like
+    /// the above.
+    album_scan_cache: Mutex<Option<ScanCache<AlbumGridKey>>>,
+    /// The random album grid's query and the seed of the shuffle it pages
+    /// through (see [`Self::random_grid_seed`]).
+    random_grid_shuffle: Mutex<Option<(AlbumGridQuery, u64)>>,
+    /// The last "long not heard" ranking, keyed by user, reused by later pages
+    /// and the Discover row. The async lock is held through a scan, so calls
+    /// that arrive meanwhile wait for its ranking instead of scanning too.
+    long_not_heard_cache: tokio::sync::Mutex<Option<ScanCache<String>>>,
+    /// Music-album counts of the box sets by id, with the member count each
+    /// was taken at (see [`Self::collection_album_counts`]).
+    collection_counts: Mutex<HashMap<String, CollectionCount>>,
     /// The last 401 follow-up probe: when it started and what it found. The
     /// async lock makes the probe single-flight (see [`Self::validate_after`]).
     token_probe: tokio::sync::Mutex<Option<(Instant, SessionValidity)>>,
+    /// The last automatic re-login that tried to replace this client and
+    /// failed without the server refusing the password (a 5xx, a rate limit,
+    /// a dropped connection): when it started, and the error.
+    failed_relogin: Mutex<Option<(Instant, AppError)>>,
+    /// Tickets of the paged scans behind the two caches above.
+    smart_scan_tickets: ScanTickets,
+    album_scan_tickets: ScanTickets,
 }
 
 /// Ceiling for a cover image. Jellyfin's largest rendition is far below this;
@@ -706,6 +1081,38 @@ pub struct JellyfinClient {
 /// an unbounded body in memory (the bytes are held three times over: response
 /// buffer, cache write, and WebView response).
 const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Whether `bytes` start like an image the WebView can show: JPEG, PNG,
+/// WebP and GIF (what Jellyfin's image encoder writes), BMP, and AVIF/HEIF.
+/// Shared by the cover fetch and the cover cache, which must never hold —
+/// let alone serve as immutable — the HTML page some portal answered with.
+pub(crate) fn looks_like_image(bytes: &[u8]) -> bool {
+    let at = |offset: usize, magic: &[u8]| bytes.get(offset..offset + magic.len()) == Some(magic);
+    at(0, &[0xFF, 0xD8, 0xFF])
+        || at(0, b"\x89PNG\r\n\x1a\n")
+        || (at(0, b"RIFF") && at(8, b"WEBP"))
+        || at(0, b"GIF87a")
+        || at(0, b"GIF89a")
+        || at(0, b"BM")
+        || (at(4, b"ftyp")
+            && [b"avif", b"avis", b"heic", b"heix", b"mif1"]
+                .iter()
+                .any(|brand| at(8, *brand)))
+}
+
+/// How long a sign-out waits for the server to revoke the token.
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long creating a playlist of `tracks` may take. Jellyfin resolves every
+/// id before it answers and carries on when the client gives up — a client
+/// timing out on a long list left a playlist behind that the UI reported as
+/// failed, and saving again made a second one. 10 ms per track on top of the
+/// usual 30 s is far beyond what a server needs.
+fn create_playlist_timeout(tracks: usize) -> Duration {
+    let per_track =
+        Duration::from_millis(10).saturating_mul(u32::try_from(tracks).unwrap_or(u32::MAX));
+    Duration::from_secs(30).saturating_add(per_track)
+}
 
 /// Read a response body with a hard ceiling, streaming so the limit bites
 /// before the memory is committed rather than after. A declared
@@ -730,6 +1137,7 @@ impl JellyfinClient {
         let base = base_url.trim_end_matches('/').to_string();
         let (builder, observed) = crate::tls::apply(
             reqwest::Client::builder()
+                .user_agent(USER_AGENT)
                 // Stay on the configured server: a redirect off-origin would
                 // send requests (and, on a same-scheme host, our credentials)
                 // somewhere the user never configured, and an https -> http
@@ -750,7 +1158,13 @@ impl JellyfinClient {
             user_id: None,
             smart_scan_cache: Mutex::new(None),
             album_scan_cache: Mutex::new(None),
+            random_grid_shuffle: Mutex::new(None),
+            long_not_heard_cache: tokio::sync::Mutex::new(None),
+            collection_counts: Mutex::new(HashMap::new()),
             token_probe: tokio::sync::Mutex::new(None),
+            failed_relogin: Mutex::new(None),
+            smart_scan_tickets: ScanTickets::default(),
+            album_scan_tickets: ScanTickets::default(),
         })
     }
 
@@ -815,7 +1229,8 @@ impl JellyfinClient {
     }
 
     pub async fn authenticate(&mut self, username: &str, password: &str) -> AppResult<UserDto> {
-        let url = format!("{}/Users/AuthenticateByName", self.base_url);
+        const PATH: &str = "/Users/AuthenticateByName";
+        let url = format!("{}{PATH}", self.base_url);
         let response = self
             .http
             .post(&url)
@@ -825,8 +1240,15 @@ impl JellyfinClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let message = match status.as_u16() {
-                401 => "wrong username or password".to_string(),
+            // Not followed even to https: the password has already gone out
+            // on this request. The user signs in at the new address instead.
+            let upgraded = redirect_target(&response)
+                .and_then(|target| upgraded_base_url(&self.base_url, PATH, &target));
+            let message = match (status.as_u16(), upgraded) {
+                (401, _) => "wrong username or password".to_string(),
+                (_, Some(address)) => {
+                    format!("the server redirects to {address} — sign in with that address")
+                }
                 _ => error_message(response).await,
             };
             return Err(AppError::Server {
@@ -834,7 +1256,7 @@ impl JellyfinClient {
                 message,
             });
         }
-        let auth: AuthenticationResult = response.json().await?;
+        let auth: AuthenticationResult = read_json(response).await?;
         self.token = Some(auth.access_token);
         self.user_id = Some(auth.user.id.clone());
         Ok(auth.user)
@@ -843,7 +1265,15 @@ impl JellyfinClient {
     /// Cheap token validation used on session restore. Distinguishes a dead
     /// token from an unreachable server: offline must not log the user out.
     pub async fn validate(&self) -> SessionValidity {
-        let url = format!("{}/Users/Me", self.base_url);
+        const PATH: &str = "/Users/Me";
+        let url = format!("{}{PATH}", self.base_url);
+        // Only a handshake made for this probe may speak for the certificate.
+        // The verifier replaces what it recorded only on its next non-public
+        // leaf, so one recorded on a network the device has left since (a
+        // captive portal's) would turn every later outage — no DNS, no route,
+        // a refused connection — into an untrusted certificate, offered for
+        // trust instead of the offline banner (see `tls.rs`).
+        *self.observed.lock().unwrap() = None;
         match self
             .http
             .get(&url)
@@ -855,10 +1285,20 @@ impl JellyfinClient {
             Ok(r) if r.status().as_u16() == 401 || r.status().as_u16() == 403 => {
                 SessionValidity::Invalid
             }
-            // 5xx, proxies mid-restart, network errors: server trouble, not
-            // an auth problem.
-            Ok(_) => SessionValidity::Unreachable,
-            Err(_) => SessionValidity::Unreachable,
+            Ok(r) => match redirect_target(&r)
+                .and_then(|target| upgraded_base_url(&self.base_url, PATH, &target))
+            {
+                Some(address) => SessionValidity::Moved(address),
+                // 5xx, proxies mid-restart, a redirect to another host (a
+                // captive portal): server trouble, not an auth problem.
+                None => SessionValidity::Unreachable,
+            },
+            // A rejected certificate says nothing about the token either, but
+            // unlike a dead network it does not go away on its own.
+            Err(_) => match self.untrusted_fingerprint() {
+                Some(fingerprint) => SessionValidity::Untrusted(fingerprint),
+                None => SessionValidity::Unreachable,
+            },
         }
     }
 
@@ -872,15 +1312,34 @@ impl JellyfinClient {
     /// fresh one.
     pub async fn validate_after(&self, unauthorized_at: Instant) -> SessionValidity {
         let mut last = self.token_probe.lock().await;
-        if let Some((started, validity)) = *last {
-            if started >= unauthorized_at {
-                return validity;
+        if let Some((started, validity)) = last.as_ref() {
+            if *started >= unauthorized_at {
+                return validity.clone();
             }
         }
         let started = Instant::now();
         let validity = self.validate().await;
-        *last = Some((started, validity));
+        *last = Some((started, validity.clone()));
         validity
+    }
+
+    /// Remember that an automatic re-login meant to replace this client,
+    /// started at `started`, failed with `err`.
+    pub fn record_failed_relogin(&self, started: Instant, err: &AppError) {
+        *self.failed_relogin.lock().unwrap() = Some((started, err.replay()));
+    }
+
+    /// The failure of a re-login that started after a 401 at
+    /// `unauthorized_at`, if there was one. It saw the server at least as late
+    /// as that 401 did, so the caller shares its answer rather than logging in
+    /// once more — what [`Self::validate_after`] does for the probe.
+    pub fn failed_relogin_since(&self, unauthorized_at: Instant) -> Option<AppError> {
+        self.failed_relogin
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(started, _)| *started >= unauthorized_at)
+            .map(|(_, err)| err.replay())
     }
 
     /// The current user, including policy — used to refresh the delete
@@ -889,9 +1348,9 @@ impl JellyfinClient {
         self.get_json("/Users/Me", &[]).await
     }
 
-    /// The complete item as raw JSON, for a faithful metadata round-trip. Uses
-    /// `/Users/{userId}/Items/{itemId}` — the singular `/Items/{itemId}` path
-    /// returns 405, and this is the only fetch that populates every field.
+    /// The complete item as raw JSON, for a faithful metadata round-trip:
+    /// `GET /Items/{itemId}?userId=` (10.9+), the only fetch that returns
+    /// every field — an `/Items` query returns just the fields it names.
     pub async fn get_item_raw(&self, item_id: &str) -> AppResult<serde_json::Value> {
         // `userId` belongs in the query string: the `/Users/{id}/Items/...`
         // path form is the legacy route Jellyfin is retiring.
@@ -952,17 +1411,17 @@ impl JellyfinClient {
                 message: error_message(response).await,
             });
         }
-        Ok(response.json().await?)
+        read_json(response).await
     }
 
     /// One page of the album grid.
     ///
     /// The server filters, orders and pages the grid itself unless it needs
-    /// play data (a play-based sort or the played filter, see
-    /// [`AlbumGridQuery::is_server_side`]). Then only a scan knows the result:
-    /// the first page scans the played tracks and the albums passing the
-    /// server-side filters and evaluates the rest locally; later pages fetch
-    /// their slice by id from that scan's ids.
+    /// play data (a play-based sort or the played filter) or a random order
+    /// (see [`AlbumGridQuery::is_server_side`]). Then only a scan knows the
+    /// result: the first page scans the albums passing the server-side filters
+    /// (and the played tracks, when play data is needed) and evaluates the
+    /// rest locally; later pages fetch their slice by id from that scan's ids.
     pub async fn albums(
         &self,
         start_index: u32,
@@ -988,8 +1447,17 @@ impl JellyfinClient {
                 total: ids.len() as i64,
             });
         }
+        self.album_grid_page(&query, start_index, limit).await
+    }
 
-        let mut params = album_grid_params(&query, query.sort);
+    /// One page of an album grid the server filters, orders and pages itself.
+    async fn album_grid_page(
+        &self,
+        query: &AlbumGridQuery,
+        start_index: u32,
+        limit: u32,
+    ) -> AppResult<Page<AlbumDto>> {
+        let mut params = album_grid_params(query, query.sort);
         params.extend([
             ("startIndex", start_index.to_string()),
             ("limit", limit.to_string()),
@@ -1016,40 +1484,80 @@ impl JellyfinClient {
         query: &AlbumGridQuery,
         start_index: u32,
     ) -> AppResult<Arc<Vec<String>>> {
+        // The seed is part of the key: a scan that finishes late with another
+        // shuffle can never serve this grid's later pages.
+        let seed = (query.sort == AlbumSort::Random)
+            .then(|| self.random_grid_seed(query, start_index == 0));
+        let key = (query.clone(), seed);
         if start_index > 0 {
             let cached = self
                 .album_scan_cache
                 .lock()
                 .unwrap()
                 .as_ref()
-                .and_then(|cache| cache.ids_for(query, Instant::now(), ALBUM_SCAN_CACHE_TTL));
+                .and_then(|cache| cache.ids_for(&key, Instant::now(), ALBUM_SCAN_CACHE_TTL));
             if let Some(ids) = cached {
                 return Ok(ids);
             }
         }
 
-        let (stats, album_ids) = tokio::try_join!(
-            self.album_play_stats(&query.user_id),
-            self.album_grid_scan(query),
-        )?;
+        let ticket = self.album_scan_tickets.take();
+        let keep_going = || self.album_scan_tickets.is_current(ticket);
+        let (stats, album_ids) = if query.needs_play_stats() {
+            tokio::try_join!(
+                self.album_play_stats(&query.user_id, false, &keep_going),
+                self.album_grid_scan(query, &keep_going),
+            )?
+        } else {
+            (
+                HashMap::new(),
+                self.album_grid_scan(query, &keep_going).await?,
+            )
+        };
         let mut ids = select_grid_albums(album_ids, &stats, query.played, query.sort);
-        if query.sort == AlbumSort::Random {
-            crate::commands_discover::shuffle_items(&mut ids);
+        if let Some(seed) = seed {
+            // Sorted first, so the same albums always shuffle the same way,
+            // whatever order the server listed albums of the same name in.
+            ids.sort_unstable();
+            shuffle_seeded(&mut ids, seed);
         }
         let ids = Arc::new(ids);
-        *self.album_scan_cache.lock().unwrap() = Some(ScanCache {
-            key: query.clone(),
-            scanned_at: Instant::now(),
-            ids: ids.clone(),
-        });
+        cache_scan(
+            &self.album_scan_cache,
+            &self.album_scan_tickets,
+            ticket,
+            key,
+            ids.clone(),
+        );
         Ok(ids)
+    }
+
+    /// The seed of the shuffle the random grid `query` pages through. Its
+    /// first page draws a new one — reloading the grid is a fresh shuffle —
+    /// and later pages reuse it, so a rescan (the scan cache expired, or
+    /// another grid took its place) lays the same albums out in the same order
+    /// instead of reshuffling mid-list.
+    fn random_grid_seed(&self, query: &AlbumGridQuery, first_page: bool) -> u64 {
+        let mut shuffle = self.random_grid_shuffle.lock().unwrap();
+        match shuffle.as_ref() {
+            Some((key, seed)) if !first_page && key == query => *seed,
+            _ => {
+                let seed = uuid::Uuid::new_v4().as_u64_pair().0;
+                *shuffle = Some((query.clone(), seed));
+                seed
+            }
+        }
     }
 
     /// Ids of every album passing the grid's server-side filters, in the
     /// server order the grid builds on. A random grid is scanned in name order
     /// and shuffled afterwards: `sortBy=Random` reshuffles on every page
     /// request, so its pages would overlap and miss albums.
-    async fn album_grid_scan(&self, query: &AlbumGridQuery) -> AppResult<Vec<String>> {
+    async fn album_grid_scan(
+        &self,
+        query: &AlbumGridQuery,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> AppResult<Vec<String>> {
         let sort = match query.sort {
             AlbumSort::Random => AlbumSort::Name,
             sort => sort,
@@ -1061,47 +1569,67 @@ impl JellyfinClient {
         ]);
         let mut seen = HashSet::new();
         let mut ids = Vec::new();
-        self.scan_items(&params, |items| {
-            ids.extend(
-                items
-                    .into_iter()
-                    .map(|item| item.id)
-                    .filter(|id| seen.insert(id.clone())),
-            );
-        })
+        self.scan_items(
+            &params,
+            |items| {
+                ids.extend(
+                    items
+                        .into_iter()
+                        .map(|item| item.id)
+                        .filter(|id| seen.insert(id.clone())),
+                );
+            },
+            keep_going,
+        )
         .await?;
         Ok(ids)
     }
 
     /// Per-album play stats of `user_id`, folded from a scan of every played
-    /// track — the only items playback writes play data to.
-    async fn album_play_stats(&self, user_id: &str) -> AppResult<HashMap<String, AlbumPlayStats>> {
+    /// track — the only items playback writes play data to. With
+    /// `favorite_tracks`, of the played tracks the user favorited.
+    async fn album_play_stats(
+        &self,
+        user_id: &str,
+        favorite_tracks: bool,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> AppResult<HashMap<String, AlbumPlayStats>> {
+        let filters = if favorite_tracks {
+            "IsFavorite,IsPlayed"
+        } else {
+            "IsPlayed"
+        };
         let params = [
             ("userId", user_id.to_string()),
             ("includeItemTypes", "Audio".to_string()),
             ("recursive", "true".to_string()),
-            ("filters", "IsPlayed".to_string()),
+            ("filters", filters.to_string()),
             ("sortBy", "SortName".to_string()),
             ("sortOrder", "Ascending".to_string()),
             ("enableImages", "false".to_string()),
             ("enableUserData", "true".to_string()),
         ];
         let mut aggregate = AlbumPlayAggregate::default();
-        self.scan_items(&params, |items| aggregate.add(items))
+        self.scan_items(&params, |items| aggregate.add(items), keep_going)
             .await?;
         Ok(aggregate.albums)
     }
 
     /// Walk every page of an `/Items` query, [`ALBUM_SCAN_BATCH`] items at a
     /// time, handing each page to `take` so a caller keeps only what it needs.
+    /// Stops with [`superseded`] before any page once `keep_going` says no.
     async fn scan_items(
         &self,
         query: &[(&'static str, String)],
         mut take: impl FnMut(Vec<BaseItem>),
+        keep_going: &(dyn Fn() -> bool + Sync),
     ) -> AppResult<()> {
         let mut offset = 0u32;
         let mut scanned = 0usize;
         loop {
+            if !keep_going() {
+                return Err(superseded());
+            }
             let mut page = query.to_vec();
             page.push(("startIndex", offset.to_string()));
             page.push(("limit", ALBUM_SCAN_BATCH.to_string()));
@@ -1146,7 +1674,7 @@ impl JellyfinClient {
             .into_iter()
             .next()
             .map(AlbumDto::from_item)
-            .ok_or_else(|| AppError::Other(format!("album {album_id} not found")))
+            .ok_or_else(|| not_found("album", album_id))
     }
 
     pub async fn album_tracks(&self, album_id: &str) -> AppResult<Vec<TrackDto>> {
@@ -1253,7 +1781,7 @@ impl JellyfinClient {
                 message,
             });
         }
-        Ok(response.json().await?)
+        read_json(response).await
     }
 
     /// Poll until the user approved the code on another device.
@@ -1278,7 +1806,7 @@ impl JellyfinClient {
                 message: error_message(response).await,
             });
         }
-        let auth: AuthenticationResult = response.json().await?;
+        let auth: AuthenticationResult = read_json(response).await?;
         self.token = Some(auth.access_token);
         self.user_id = Some(auth.user.id.clone());
         Ok(auth.user)
@@ -1299,6 +1827,8 @@ impl JellyfinClient {
                     ("limit", limit.to_string()),
                     ("enableImages", "true".into()),
                     ("imageTypeLimit", "1".into()),
+                    // The grid's favorite toggle reads IsFavorite from it.
+                    ("enableUserData", "true".into()),
                 ],
             )
             .await?;
@@ -1322,6 +1852,7 @@ impl JellyfinClient {
                     ("ids", artist_id.to_string()),
                     ("fields", "Overview".into()),
                     ("enableImages", "true".into()),
+                    ("enableUserData", "true".into()),
                 ],
             )
             .await?;
@@ -1330,7 +1861,7 @@ impl JellyfinClient {
             .into_iter()
             .next()
             .map(ArtistDto::from_item)
-            .ok_or_else(|| AppError::Other(format!("artist {artist_id} not found")))
+            .ok_or_else(|| not_found("artist", artist_id))
     }
 
     /// Albums where this artist is the *album* artist ("Albums" section).
@@ -1696,6 +2227,12 @@ impl JellyfinClient {
     /// path: ogg-opus), otherwise transcodes to Ogg-Opus (progressive; HLS is
     /// a later refinement).
     ///
+    /// At most two channels (`maxAudioChannels`, which also sets the channel
+    /// count of a transcode): a surround source comes as a stereo downmix.
+    /// Our Opus decoder takes mono and stereo only, and played as it is, the
+    /// device mix would keep the first two channels and drop the centre with
+    /// the vocals in it.
+    ///
     /// Without a `playSessionId`: that one belongs to an attempt at playing
     /// the track, not to the track, and is appended when a source is opened
     /// (`player/source.rs`). It is what the server correlates our playback
@@ -1704,29 +2241,51 @@ impl JellyfinClient {
     pub fn stream_url(&self, item_id: &str) -> AppResult<String> {
         let user_id = self.user_id()?;
         Ok(format!(
-            "{}/Audio/{item_id}/universal?userId={user_id}&deviceId={}&container=opus,ogg%7Copus,flac,mp3,ogg%7Cvorbis,wav&transcodingContainer=opus&transcodingProtocol=http&audioCodec=opus&maxStreamingBitrate=320000000",
+            "{}/Audio/{item_id}/universal?userId={user_id}&deviceId={}&container=opus,ogg%7Copus,flac,mp3,ogg%7Cvorbis,wav&transcodingContainer=opus&transcodingProtocol=http&audioCodec=opus&maxStreamingBitrate=320000000&maxAudioChannels=2&transcodingAudioChannels=2",
             self.base_url, self.device_id
         ))
     }
 
+    /// Ceiling for one track fetched for the sonic analysis.
+    pub(crate) const MAX_ANALYSIS_BYTES: u64 = 64 * 1024 * 1024;
+    /// Longest track the sonic analysis fetches: its 96 kbit/s transcode is
+    /// ~58 MB, under [`Self::MAX_ANALYSIS_BYTES`]. Longer is a mix, not a
+    /// track to compare.
+    pub const MAX_ANALYSIS_MS: u64 = 80 * 60 * 1000;
+
+    /// The `maxStreamingBitrate` a track of `duration_ms` is fetched with
+    /// for the analysis: a lossy original comes as it is only while even
+    /// 320 kbit/s of it fits [`Self::MAX_ANALYSIS_BYTES`] (about 28 minutes);
+    /// a longer track always comes as the 96 kbit/s transcode.
+    pub(crate) fn analysis_bitrate(duration_ms: u64) -> u32 {
+        if duration_ms.saturating_mul(320_000 / 8) / 1000 > Self::MAX_ANALYSIS_BYTES {
+            96_000
+        } else {
+            320_000
+        }
+    }
+
     /// The whole track as a small file, for the library's sonic analysis
-    /// (`sonic_scan.rs`): lossy originals up to 320 kbit/s come as they are,
-    /// everything else is transcoded to 96 kbit/s Opus. The analysis works
-    /// below ~5.5 kHz, so nothing it looks at is lost, and a library of FLAC
-    /// does not have to cross the network at full size.
-    pub async fn analysis_audio(&self, item_id: &str) -> AppResult<Vec<u8>> {
-        /// A 96 kbit/s hour is ~43 MB; longer is a mix, not a track to compare.
-        const MAX_ANALYSIS_BYTES: u64 = 64 * 1024 * 1024;
+    /// (`sonic_scan.rs`): lossy originals come as they are while they are
+    /// small enough ([`Self::analysis_bitrate`]), everything else is
+    /// transcoded to 96 kbit/s Opus. The analysis works below 5 kHz, so
+    /// nothing it looks at is lost, and a library of FLAC does not have to
+    /// cross the network at full size. Stereo at most, as for playback
+    /// ([`Self::stream_url`]). `duration_ms` is the server's length of the
+    /// track (0: unknown).
+    pub async fn analysis_audio(&self, item_id: &str, duration_ms: u64) -> AppResult<Vec<u8>> {
         let user_id = self.user_id()?;
+        let max_bitrate = Self::analysis_bitrate(duration_ms);
         let url = format!(
-            "{}/Audio/{item_id}/universal?userId={user_id}&deviceId={}&container=opus,ogg%7Copus,mp3,ogg%7Cvorbis&transcodingContainer=opus&transcodingProtocol=http&audioCodec=opus&audioBitRate=96000&maxStreamingBitrate=320000",
+            "{}/Audio/{item_id}/universal?userId={user_id}&deviceId={}&container=opus,ogg%7Copus,mp3,ogg%7Cvorbis&transcodingContainer=opus&transcodingProtocol=http&audioCodec=opus&audioBitRate=96000&maxStreamingBitrate={max_bitrate}&maxAudioChannels=2&transcodingAudioChannels=2",
             self.base_url, self.device_id
         );
         let response = self
             .http
             .get(url)
             .header("Authorization", self.auth_header())
-            .timeout(Duration::from_secs(10 * 60))
+            // A long transcode takes a small server a while to produce.
+            .timeout(Duration::from_secs(10 * 60).max(Duration::from_millis(duration_ms / 4)))
             .send()
             .await?;
         let status = response.status();
@@ -1736,7 +2295,7 @@ impl JellyfinClient {
                 message: error_message(response).await,
             });
         }
-        read_capped(response, MAX_ANALYSIS_BYTES, "track for analysis").await
+        read_capped(response, Self::MAX_ANALYSIS_BYTES, "track for analysis").await
     }
 
     pub fn image_url(&self, item_id: &str, tag: &str, size: u32) -> String {
@@ -1761,7 +2320,16 @@ impl JellyfinClient {
                 message: "image fetch failed".into(),
             });
         }
-        read_capped(response, MAX_IMAGE_BYTES, "cover image").await
+        let bytes = read_capped(response, MAX_IMAGE_BYTES, "cover image").await?;
+        // A login page, a captive portal or a proxy's fallback page answers
+        // 200 as well. The bytes end up in the cover cache, which serves its
+        // files as immutable until the image tag changes.
+        if !looks_like_image(&bytes) {
+            return Err(AppError::Other(
+                "the server answered with something other than an image".into(),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Lyrics for a track. Servers answer 404 when the item has none (or no
@@ -1784,32 +2352,111 @@ impl JellyfinClient {
                 message: error_message(response).await,
             });
         }
-        let wire: LyricsResponse = response.json().await?;
+        let wire: LyricsResponse = read_json(response).await?;
         Ok(LyricsDto::from_wire(wire))
     }
 
     // --- Discovery (genre filter, alphabet scrubber, similar artists) ---
 
-    /// Music genres, for the album-grid filter chips.
+    /// Music genres, for the album-grid filter chips, the genres page, the
+    /// smart-view picker and the Discover row.
+    ///
+    /// `/Genres` answers with music genres only below a music library. Asked
+    /// without one it lists `Genre` items, which Jellyfin creates only for
+    /// genres something other than music carries too (a video, or a playlist,
+    /// which takes on its tracks' genres): a library of nothing but music had
+    /// none at all, and their ids are not the ones tracks name. So each music
+    /// library is asked, and the answers merged.
     pub async fn genres(&self) -> AppResult<Vec<GenreDto>> {
+        let user_id = self.user_id()?.to_string();
+        let libraries = self.music_library_ids().await?;
+        let mut seen = HashSet::new();
+        let mut genres = Vec::new();
+        for library_id in &libraries {
+            let response: ItemsResponse = self
+                .get_json(
+                    "/Genres",
+                    &[
+                        ("userId", user_id.clone()),
+                        ("parentId", library_id.clone()),
+                        // The genres of albums: the album grid filters by them.
+                        ("includeItemTypes", "MusicAlbum".into()),
+                        ("sortBy", "SortName".into()),
+                        ("sortOrder", "Ascending".into()),
+                        ("enableImages", "false".into()),
+                    ],
+                )
+                .await?;
+            // A music genre has one id across libraries.
+            genres.extend(
+                response
+                    .items
+                    .into_iter()
+                    .filter(|item| seen.insert(item.id.clone()))
+                    .map(GenreDto::from_item),
+            );
+        }
+        if libraries.len() > 1 {
+            // Each library's answer is in name order; the merged list must be too.
+            genres.sort_by_cached_key(|genre| genre.name.to_lowercase());
+        }
+        Ok(genres)
+    }
+
+    /// The music libraries the user can see, hidden ones included: hiding a
+    /// library from the home screen is no reason for its genres to vanish.
+    async fn music_library_ids(&self) -> AppResult<Vec<String>> {
         let user_id = self.user_id()?.to_string();
         let response: ItemsResponse = self
             .get_json(
-                "/Genres",
+                "/UserViews",
                 &[
                     ("userId", user_id),
-                    // Music genres only — a mixed server also has movie/show
-                    // genres that would filter the album grid to nothing.
-                    ("includeItemTypes", "MusicAlbum".into()),
-                    ("sortBy", "SortName".into()),
+                    ("includeHidden", "true".into()),
+                    ("includeExternalContent", "false".into()),
                 ],
             )
             .await?;
-        Ok(response
-            .items
-            .into_iter()
-            .map(GenreDto::from_item)
-            .collect())
+        Ok(music_libraries(response.items))
+    }
+
+    /// The genres among `ids`, with their names. For ids the genre list does
+    /// not have: smart views saved before it listed music genres hold the ids
+    /// of Jellyfin's `Genre` items — the same genres under other ids — and the
+    /// name leads back to the listed one. Ids that are no genre, or that the
+    /// server no longer has, are left out.
+    pub async fn genres_by_id(&self, ids: &[String]) -> AppResult<Vec<GenreDto>> {
+        let user_id = self.user_id()?.to_string();
+        // An id from storage that is no item id would get the whole request
+        // refused; a comma would split it into two.
+        let ids = ids
+            .iter()
+            .filter(|id| is_item_id(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut genres = Vec::new();
+        for chunk in unique_ids(&ids).chunks(MAX_IDS_PER_REQUEST) {
+            // A lookup by id reaches the genre items, which no library holds.
+            let response: ItemsResponse = self
+                .get_json(
+                    "/Items",
+                    &[
+                        ("userId", user_id.clone()),
+                        ("ids", chunk.join(",")),
+                        ("enableImages", "false".into()),
+                        ("enableUserData", "false".into()),
+                    ],
+                )
+                .await?;
+            genres.extend(
+                response
+                    .items
+                    .into_iter()
+                    .filter(|item| matches!(item.item_type.as_str(), "Genre" | "MusicGenre"))
+                    .map(GenreDto::from_item),
+            );
+        }
+        Ok(genres)
     }
 
     /// How many items sort strictly before `letter` — i.e. the index of the
@@ -1863,14 +2510,21 @@ impl JellyfinClient {
     }
 
     /// Random album cards for the Discover hub. Random ordering is intentionally
-    /// refreshed on every request; pagination is therefore a fresh sample.
+    /// refreshed on every request; pagination is therefore a fresh sample (the
+    /// album grid's random sort pages one shuffle instead).
     pub async fn discover_random_albums(
         &self,
         start_index: u32,
         limit: u32,
     ) -> AppResult<Page<AlbumDto>> {
-        self.albums(start_index, limit, None, "random", false, "all")
-            .await
+        let query = AlbumGridQuery {
+            user_id: self.user_id()?.to_string(),
+            genre_id: None,
+            sort: AlbumSort::Random,
+            favorites_only: false,
+            played: PlayedFilter::All,
+        };
+        self.album_grid_page(&query, start_index, limit).await
     }
 
     /// Random audio items that can seed Jellyfin's InstantMix endpoint.
@@ -2058,68 +2712,56 @@ impl JellyfinClient {
         })
     }
 
-    /// Played tracks ordered by oldest DatePlayed, then mapped to unique albums.
-    /// Play history belongs to tracks in Jellyfin, so querying BoxSet/Album
-    /// user-data here would silently produce the wrong result.
+    /// Played albums, the one heard longest ago first — ranked by each album's
+    /// latest track play (see [`least_recently_played`]). Ordering the played
+    /// tracks by DatePlayed and keeping each album's first one ranked it by
+    /// its least recently played track instead: one old interlude put an album
+    /// heard yesterday at the top. Play history belongs to tracks in Jellyfin,
+    /// so querying BoxSet/Album user-data here would silently produce the
+    /// wrong result.
+    ///
+    /// The ranking needs every played track. A first page scans them — unless
+    /// `reuse_recent`: the Discover row, loaded on every visit and every
+    /// library change, takes a ranking from the last few minutes. Later pages
+    /// page through the cached one. One scan at a time: a call that had to
+    /// wait for a scan takes its ranking, as fresh as one of its own.
     pub async fn long_not_heard_albums(
         &self,
         start_index: u32,
         limit: u32,
+        reuse_recent: bool,
     ) -> AppResult<Page<AlbumDto>> {
         let user_id = self.user_id()?.to_string();
-        let mut offset = 0u32;
-        let mut items = Vec::new();
-        loop {
-            let response: ItemsResponse = self
-                .get_json(
-                    "/Items",
-                    &[
-                        ("userId", user_id.clone()),
-                        ("includeItemTypes", "Audio".into()),
-                        ("recursive", "true".into()),
-                        ("filters", "IsPlayed".into()),
-                        ("sortBy", "DatePlayed".into()),
-                        ("sortOrder", "Ascending".into()),
-                        ("startIndex", offset.to_string()),
-                        ("limit", SMART_SCAN_BATCH.to_string()),
-                        ("enableImages", "false".into()),
-                        ("enableUserData", "true".into()),
-                    ],
-                )
-                .await?;
-            let received = response.items.len() as u32;
-            items.extend(response.items);
-            offset = offset.saturating_add(received);
-            // `total_record_count` is a server-supplied number and the only
-            // other stop condition, so bound the scan independently: a server
-            // that keeps returning full pages against a huge count would
-            // otherwise loop forever and grow `items` without limit. A partial
-            // page also means the end, whatever the count claims.
-            if received == 0
-                || received < SMART_SCAN_BATCH
-                || items.len() >= SMART_SCAN_MAX_ITEMS
-                || offset == u32::MAX
-                || i64::from(offset) >= response.total_record_count
-            {
-                if items.len() >= SMART_SCAN_MAX_ITEMS {
-                    tracing::warn!(
-                        "smart scan stopped at {} items; results are partial",
-                        items.len()
-                    );
+        let asked_at = Instant::now();
+        let ids = {
+            let mut cache = self.long_not_heard_cache.lock().await;
+            let reusable = cache.as_ref().and_then(|last| {
+                if start_index > 0 || reuse_recent {
+                    last.ids_for(&user_id, Instant::now(), LONG_NOT_HEARD_CACHE_TTL)
+                } else {
+                    // Only a scan that ended while this call waited for it.
+                    (last.key == user_id && last.scanned_at >= asked_at).then(|| last.ids.clone())
                 }
-                break;
+            });
+            match reusable {
+                Some(ids) => ids,
+                None => {
+                    let stats = self.album_play_stats(&user_id, false, &|| true).await?;
+                    let ids = Arc::new(least_recently_played(&stats));
+                    *cache = Some(ScanCache {
+                        key: user_id,
+                        scanned_at: Instant::now(),
+                        ids: ids.clone(),
+                    });
+                    ids
+                }
             }
-        }
-        let album_ids = unique_album_ids(items);
-        let total = album_ids.len() as i64;
-        let selected = album_ids
-            .into_iter()
-            .skip(start_index as usize)
-            .take(limit as usize)
-            .collect::<Vec<_>>();
+        };
         Ok(Page {
-            items: self.albums_by_ids(&selected).await?,
-            total,
+            items: self
+                .albums_by_ids(&page_of_ids(&ids, start_index, limit))
+                .await?,
+            total: ids.len() as i64,
         })
     }
 
@@ -2158,11 +2800,24 @@ impl JellyfinClient {
     }
 
     async fn smart_track_items(&self, filter: &SmartFilter) -> AppResult<Vec<BaseItem>> {
+        self.smart_track_items_while(filter, &|| true).await
+    }
+
+    /// [`Self::smart_track_items`], stopping with [`superseded`] before any
+    /// page once `keep_going` says no.
+    async fn smart_track_items_while(
+        &self,
+        filter: &SmartFilter,
+        keep_going: &(dyn Fn() -> bool + Sync),
+    ) -> AppResult<Vec<BaseItem>> {
         let plan = smart_query_plan(filter)?;
         let mut offset = 0u32;
         let mut scanned = 0usize;
-        let mut matches = Vec::new();
+        let mut matches = SmartMatches::default();
         loop {
+            if !keep_going() {
+                return Err(superseded());
+            }
             let query = self.smart_items_query(&plan, offset, SMART_SCAN_BATCH)?;
             let response: ItemsResponse = self.get_json("/Items", &query).await?;
             let received = response.items.len() as u32;
@@ -2170,15 +2825,10 @@ impl JellyfinClient {
                 .added_since
                 .as_deref()
                 .is_some_and(|since| reached_added_cutoff(&response.items, since));
-            matches.extend(
-                response
-                    .items
-                    .into_iter()
-                    .filter(|item| smart_item_matches(item, filter)),
-            );
+            matches.add(response.items, filter);
             offset = offset.saturating_add(received);
-            // Same bounds as `long_not_heard_albums`: `total_record_count` is
-            // a server-supplied number and must not be the only stop
+            // Same bounds as `scan_items`: `total_record_count` is a
+            // server-supplied number and must not be the only stop
             // condition. Count *scanned* items, not matched ones — a selective
             // filter would otherwise leave the ceiling unreachable.
             scanned = scanned.saturating_add(received as usize);
@@ -2195,7 +2845,7 @@ impl JellyfinClient {
                 break;
             }
         }
-        Ok(matches)
+        Ok(matches.items)
     }
 
     /// Every track of a smart view — for playing or materializing it, where
@@ -2256,14 +2906,19 @@ impl JellyfinClient {
             }
         }
 
-        let items = self.smart_track_items(filter).await?;
+        let ticket = self.smart_scan_tickets.take();
+        let items = self
+            .smart_track_items_while(filter, &|| self.smart_scan_tickets.is_current(ticket))
+            .await?;
         let ids = Arc::new(items.iter().map(|item| item.id.clone()).collect::<Vec<_>>());
         let total = ids.len() as i64;
-        *self.smart_scan_cache.lock().unwrap() = Some(ScanCache {
-            key: filter.clone(),
-            scanned_at: Instant::now(),
+        cache_scan(
+            &self.smart_scan_cache,
+            &self.smart_scan_tickets,
+            ticket,
+            filter.clone(),
             ids,
-        });
+        );
         Ok(Page {
             items: items
                 .into_iter()
@@ -2277,51 +2932,187 @@ impl JellyfinClient {
 
     /// Resolve albums in caller order and preserve disc/track order inside
     /// every album. Used by Discover row playback and collection playback.
+    ///
+    /// Several albums are in flight at once: one after the other, a large
+    /// collection waited out a full round trip per album before anything
+    /// played. [`ALBUM_TRACKS_IN_FLIGHT`] keeps a home server from being
+    /// flooded, and `buffered` hands the results back in caller order.
     pub async fn tracks_for_albums(&self, album_ids: &[String]) -> AppResult<Vec<TrackDto>> {
-        let mut per_album = Vec::with_capacity(album_ids.len());
-        for album_id in album_ids {
-            if album_id.trim().is_empty() {
-                return Err(AppError::Other("album id must not be empty".into()));
-            }
-            per_album.push(self.album_tracks(album_id).await?);
+        use futures_util::{StreamExt, TryStreamExt};
+
+        if album_ids.iter().any(|album_id| album_id.trim().is_empty()) {
+            return Err(AppError::Other("album id must not be empty".into()));
         }
+        // The requests are made up front (an async fn's future starts nothing
+        // until polled): a `StreamExt::map` closure over the borrowed ids is
+        // not provably `Send` for every lifetime, which the commands need.
+        let requests = album_ids
+            .iter()
+            .map(|album_id| self.album_tracks(album_id))
+            .collect::<Vec<_>>();
+        let per_album: Vec<Vec<TrackDto>> = futures_util::stream::iter(requests)
+            .buffered(ALBUM_TRACKS_IN_FLIGHT)
+            .try_collect()
+            .await?;
         Ok(flatten_album_tracks(per_album))
     }
 
     // --- Read-only Jellyfin Collections / BoxSets ---
 
+    /// One page of the box sets that hold music albums, each with its album
+    /// count. Jellyfin has no filter for that, and a server with a movie
+    /// library usually has plenty of movie collections, which were listed
+    /// with their movie count shown as albums and failed to play. So every box
+    /// set is listed, its music albums are counted, and the ones without are
+    /// left out.
     pub async fn collections(
-        &self,
+        self: &Arc<Self>,
         start_index: u32,
         limit: u32,
     ) -> AppResult<Page<CollectionDto>> {
         let user_id = self.user_id()?.to_string();
-        let response: ItemsResponse = self
-            .get_json(
-                "/Items",
-                &[
-                    ("userId", user_id),
-                    ("includeItemTypes", "BoxSet".into()),
-                    ("recursive", "true".into()),
-                    ("collapseBoxSetItems", "false".into()),
-                    ("sortBy", "SortName".into()),
-                    ("sortOrder", "Ascending".into()),
-                    ("startIndex", start_index.to_string()),
-                    ("limit", limit.to_string()),
-                    ("fields", "ChildCount".into()),
-                    ("enableImages", "true".into()),
-                    ("imageTypeLimit", "1".into()),
-                ],
-            )
+        let params = [
+            ("userId", user_id),
+            ("includeItemTypes", "BoxSet".to_string()),
+            ("recursive", "true".to_string()),
+            ("collapseBoxSetItems", "false".to_string()),
+            ("sortBy", "SortName".to_string()),
+            ("sortOrder", "Ascending".to_string()),
+            ("fields", "ChildCount".to_string()),
+            ("enableImages", "true".to_string()),
+            ("imageTypeLimit", "1".to_string()),
+        ];
+        let mut sets = Vec::new();
+        self.scan_items(&params, |items| sets.extend(items), &|| true)
             .await?;
+        let (counts, failure) = self.collection_album_counts(&sets).await?;
+        // A set whose count failed is left out this time; one timeout among a
+        // mixed server's movie collections must not hide the music ones.
+        let music = sets
+            .into_iter()
+            .zip(counts)
+            .filter_map(|(set, albums)| {
+                albums
+                    .filter(|albums| *albums > 0)
+                    .map(|albums| CollectionDto {
+                        album_count: i32::try_from(albums).unwrap_or(i32::MAX),
+                        ..CollectionDto::from_item(set)
+                    })
+            })
+            .collect::<Vec<_>>();
+        // With nothing to show, the failure is the answer, not "no collections".
+        if let (true, Some(failure)) = (music.is_empty(), failure) {
+            return Err(failure);
+        }
         Ok(Page {
-            total: response.total_record_count,
-            items: response
-                .items
+            total: music.len() as i64,
+            items: music
                 .into_iter()
-                .map(CollectionDto::from_item)
+                .skip(start_index as usize)
+                .take(limit as usize)
                 .collect(),
         })
+    }
+
+    /// The music-album count of each box set in `sets`, in order — `None`
+    /// where counting failed, with the first such failure. A count is reused
+    /// while the set's member count is the one it was taken at (and the count
+    /// is recent), so the movie collections of a mixed server are asked about
+    /// once rather than on every visit; the rest are counted a few at a time.
+    /// Every count that succeeds is kept, one that failed is asked again next
+    /// time. A 401 stops the counting and is returned instead: the session may
+    /// have expired, and `with_retry` renews it only on an error.
+    async fn collection_album_counts(
+        self: &Arc<Self>,
+        sets: &[BaseItem],
+    ) -> AppResult<(Vec<Option<i64>>, Option<AppError>)> {
+        let now = Instant::now();
+        let mut counts = {
+            let known = self.collection_counts.lock().unwrap();
+            sets.iter()
+                .map(|set| {
+                    known.get(&set.id).copied().filter(|count| {
+                        count.members == set.child_count.unwrap_or(0)
+                            && now.saturating_duration_since(count.counted_at)
+                                <= COLLECTION_COUNT_TTL
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut missing = counts
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| count.is_none())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+            .into_iter();
+        let mut jobs = tokio::task::JoinSet::new();
+        let mut failure = None;
+        let mut unauthorized = None;
+        loop {
+            while jobs.len() < COLLECTION_COUNT_CONCURRENCY {
+                let Some(index) = missing.next() else { break };
+                let client = Arc::clone(self);
+                let set_id = sets[index].id.clone();
+                jobs.spawn(async move {
+                    // The same membership the collection page shows.
+                    let albums = client
+                        .count_items(
+                            "/Items",
+                            &[
+                                ("parentId", set_id),
+                                ("includeItemTypes", "MusicAlbum".into()),
+                                ("collapseBoxSetItems", "false".into()),
+                            ],
+                        )
+                        .await;
+                    (index, albums)
+                });
+            }
+            let Some(joined) = jobs.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok((index, Ok(albums))) => {
+                    counts[index] = Some(CollectionCount {
+                        members: sets[index].child_count.unwrap_or(0),
+                        albums,
+                        counted_at: Instant::now(),
+                    });
+                }
+                Ok((_, Err(error @ AppError::Server { status: 401, .. }))) => {
+                    jobs.abort_all();
+                    unauthorized = Some(error);
+                    break;
+                }
+                Ok((_, Err(error))) => {
+                    tracing::warn!("could not count the albums of a collection: {error}");
+                    failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    tracing::warn!("counting the albums of a collection failed: {error}");
+                    failure.get_or_insert(AppError::Other(format!(
+                        "counting a collection failed: {error}"
+                    )));
+                }
+            }
+        }
+        // Box sets that are gone are forgotten, uncounted ones asked again.
+        *self.collection_counts.lock().unwrap() = sets
+            .iter()
+            .zip(&counts)
+            .filter_map(|(set, count)| count.map(|count| (set.id.clone(), count)))
+            .collect();
+        if let Some(error) = unauthorized {
+            return Err(error);
+        }
+        Ok((
+            counts
+                .into_iter()
+                .map(|count| count.map(|count| count.albums))
+                .collect(),
+            failure,
+        ))
     }
 
     pub async fn collection(&self, collection_id: &str) -> AppResult<CollectionDto> {
@@ -2347,7 +3138,7 @@ impl JellyfinClient {
             .into_iter()
             .next()
             .map(CollectionDto::from_item)
-            .ok_or_else(|| AppError::Other(format!("collection {collection_id} not found")))
+            .ok_or_else(|| not_found("collection", collection_id))
     }
 
     pub async fn collection_albums(&self, collection_id: &str) -> AppResult<Vec<AlbumDto>> {
@@ -2421,9 +3212,27 @@ impl JellyfinClient {
     /// locally must still work when the server is unreachable, but when it is
     /// reachable the token should stop being usable rather than staying valid
     /// until it expires on its own.
+    ///
+    /// Bounded by [`LOGOUT_TIMEOUT`], not the client's 30 s: the sign-out
+    /// waits for this (holding the re-login gate), and a stalled server must
+    /// not keep the user looking at a button that seems to do nothing.
     pub async fn logout(&self) -> AppResult<()> {
-        self.send_no_content(reqwest::Method::POST, "/Sessions/Logout", &[])
-            .await
+        let url = format!("{}/Sessions/Logout", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .timeout(LOGOUT_TIMEOUT)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::Server {
+                status: status.as_u16(),
+                message: error_message(response).await,
+            });
+        }
+        Ok(())
     }
 
     /// Mark/unmark an item (track, album, ...) as favorite. The server
@@ -2487,7 +3296,7 @@ impl JellyfinClient {
             .into_iter()
             .next()
             .map(PlaylistDto::from_item)
-            .ok_or_else(|| AppError::Other(format!("playlist {playlist_id} not found")))
+            .ok_or_else(|| not_found("playlist", playlist_id))
     }
 
     pub async fn playlist_tracks(&self, playlist_id: &str) -> AppResult<Vec<PlaylistTrackDto>> {
@@ -2539,8 +3348,9 @@ impl JellyfinClient {
         )
     }
 
-    /// Duplicate a playlist from a fresh source snapshot. Item ids are kept in
-    /// source order, including repeated tracks with distinct playlist entries.
+    /// Duplicate a playlist from a fresh source snapshot, its tracks in source
+    /// order. A track the source holds twice is in the copy once: Jellyfin
+    /// 10.11 creates a playlist from distinct ids.
     pub async fn duplicate_playlist(
         &self,
         source_playlist_id: &str,
@@ -2564,6 +3374,9 @@ impl JellyfinClient {
         self.create_playlist(name, &track_ids).await
     }
 
+    /// One request, so the playlist is created whole or not at all — which
+    /// also keeps a re-login retry from making a second one. Its timeout grows
+    /// with the list (see [`create_playlist_timeout`]).
     pub async fn create_playlist(&self, name: &str, track_ids: &[String]) -> AppResult<String> {
         let user_id = self.user_id()?.to_string();
         let url = format!("{}/Playlists", self.base_url);
@@ -2571,6 +3384,7 @@ impl JellyfinClient {
             .http
             .post(&url)
             .header("Authorization", self.auth_header())
+            .timeout(create_playlist_timeout(track_ids.len()))
             .json(&serde_json::json!({
                 "Name": name,
                 "Ids": track_ids,
@@ -2586,7 +3400,7 @@ impl JellyfinClient {
                 message: error_message(response).await,
             });
         }
-        let created: CreatePlaylistResult = response.json().await?;
+        let created: CreatePlaylistResult = read_json(response).await?;
         Ok(created.id)
     }
 
@@ -2717,6 +3531,79 @@ impl JellyfinClient {
         .await
     }
 
+    /// The item id of every playlist entry, in playlist order and whatever its
+    /// media type — for rewriting the playlist, where an entry left out is an
+    /// entry lost.
+    async fn playlist_entry_item_ids(&self, playlist_id: &str) -> AppResult<Vec<String>> {
+        let user_id = self.user_id()?.to_string();
+        let response: ItemsResponse = self
+            .get_json(
+                &format!("/Playlists/{playlist_id}/Items"),
+                &[
+                    ("userId", user_id),
+                    ("enableImages", "false".into()),
+                    ("enableUserData", "false".into()),
+                ],
+            )
+            .await?;
+        Ok(response.items.into_iter().map(|item| item.id).collect())
+    }
+
+    /// The item id of every entry the playlist holds, in order — with the ones
+    /// [`Self::playlist_entry_item_ids`] leaves out because the user may not
+    /// see them (a library they cannot open, a rating above their limit).
+    async fn playlist_stored_item_ids(&self, playlist_id: &str) -> AppResult<Vec<String>> {
+        let info: PlaylistInfoWire = self
+            .get_json(&format!("/Playlists/{playlist_id}"), &[])
+            .await?;
+        Ok(info.item_ids)
+    }
+
+    /// Drop the later entries of every item the playlist holds more than once,
+    /// keeping the first.
+    ///
+    /// Jellyfin 10.11 cannot remove one entry of a repeated track: the entry
+    /// id is the track's id, and removing by it takes every copy, the one to
+    /// keep included. So the playlist is rewritten with each item once, in
+    /// order — `Ids` on `POST /Playlists/{id}` replaces the entries. Built from
+    /// a fresh listing, so repeating it is harmless.
+    ///
+    /// The rewrite keeps only what the user may see: the server re-adds the
+    /// ids through the same visibility check that keeps hidden entries out of
+    /// the listing. A shared playlist can hold tracks a collaborator added from
+    /// a library this user cannot open; rewriting would delete them. So when
+    /// the playlist holds entries the listing does not, nothing is changed and
+    /// their number is reported. (Links to items that are gone are in neither
+    /// list; any edit of the playlist drops them, Jellyfin's removal too.)
+    pub async fn remove_playlist_duplicates(
+        &self,
+        playlist_id: &str,
+    ) -> AppResult<PlaylistCleanup> {
+        if playlist_id.trim().is_empty() {
+            return Err(AppError::Other("playlist id must not be empty".into()));
+        }
+        // Everything first, then what the user sees: an entry removed in
+        // between then counts as hidden instead of coming back with the
+        // rewrite.
+        let stored = self.playlist_stored_item_ids(playlist_id).await?;
+        let entries = self.playlist_entry_item_ids(playlist_id).await?;
+        let kept = unique_ids(&entries);
+        let removed = entries.len() - kept.len();
+        if removed == 0 {
+            return Ok(PlaylistCleanup::default());
+        }
+        let hidden = hidden_entries(&stored, &entries);
+        if hidden > 0 {
+            return Ok(PlaylistCleanup { removed: 0, hidden });
+        }
+        self.post_no_content(
+            &format!("/Playlists/{playlist_id}"),
+            serde_json::json!({ "Ids": kept }),
+        )
+        .await?;
+        Ok(PlaylistCleanup { removed, hidden: 0 })
+    }
+
     /// Add items to a playlist in ONE request, so at most
     /// [`MAX_IDS_PER_REQUEST`] of them. Adding is not idempotent: callers split
     /// a longer list with `chunks(MAX_IDS_PER_REQUEST)` and give every chunk its
@@ -2744,7 +3631,9 @@ impl JellyfinClient {
         .await
     }
 
-    /// Remove playlist entries. `entry_ids` are PlaylistItemIds, NOT item ids.
+    /// Remove playlist entries. `entry_ids` are PlaylistItemIds, NOT item ids —
+    /// though Jellyfin 10.11 makes them the same, and removes every entry
+    /// whose id matches: all copies of a track that is in the playlist twice.
     /// Chunked to keep the request line short; safe to repeat as a whole,
     /// because Jellyfin ignores entry ids that are no longer in the playlist.
     pub async fn playlist_remove(&self, playlist_id: &str, entry_ids: &[String]) -> AppResult<()> {
@@ -2760,7 +3649,11 @@ impl JellyfinClient {
     }
 
     /// Move a playlist entry (by PlaylistItemId) to `new_index`
-    /// (remove-then-insert semantics, like the queue).
+    /// (remove-then-insert semantics, like the queue). The index counts every
+    /// entry the user can see, non-audio ones included — an index into
+    /// `playlist_tracks` goes through `playlist_move_audio`. Jellyfin 10.11
+    /// moves the first entry with that id, and places it after the first entry
+    /// of the track before `new_index` — wrong for a repeated track.
     pub async fn playlist_move(
         &self,
         playlist_id: &str,
@@ -2775,12 +3668,51 @@ impl JellyfinClient {
         .await
     }
 
+    /// Move a playlist entry to `audio_index` among the playlist's audio
+    /// entries, the list `playlist_tracks` returns. That list hides the
+    /// non-audio entries Jellyfin's own index counts, so the index is worked
+    /// out against a fresh listing of the whole playlist first.
+    pub async fn playlist_move_audio(
+        &self,
+        playlist_id: &str,
+        entry_id: &str,
+        audio_index: usize,
+    ) -> AppResult<()> {
+        let user_id = self.user_id()?.to_string();
+        let response: ItemsResponse = self
+            .get_json(
+                &format!("/Playlists/{playlist_id}/Items"),
+                &[
+                    ("userId", user_id),
+                    ("enableImages", "false".into()),
+                    ("enableUserData", "false".into()),
+                ],
+            )
+            .await?;
+        // The same test `playlist_tracks` filters with.
+        let entries: Vec<(&str, bool)> = response
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.playlist_item_id.as_deref().unwrap_or_default(),
+                    item.item_type == "Audio",
+                )
+            })
+            .collect();
+        let index = playlist_move_index(&entries, entry_id, audio_index)
+            .ok_or_else(|| AppError::Other(format!("playlist entry not found: {entry_id}")))?;
+        self.playlist_move(playlist_id, entry_id, index).await
+    }
+
     /// Album row for the home page: newest/most/last played depending on
     /// `sort_by` ("DateCreated" / "PlayCount" / "DatePlayed").
     ///
     /// Playback only updates Played/PlayCount/DatePlayed on the *track*
     /// user-data, never on the album — so the played-based rows query tracks
-    /// and map them to their albums (jellyfin-web does the same).
+    /// and map them to their albums (jellyfin-web does the same). An album
+    /// comes where its first track does: at its latest play, or at its most
+    /// played track.
     pub async fn home_albums(&self, sort_by: &str, limit: u32) -> AppResult<Vec<AlbumDto>> {
         let user_id = self.user_id()?.to_string();
         if sort_by == "DateCreated" {
@@ -2807,34 +3739,52 @@ impl JellyfinClient {
                 .collect());
         }
 
-        let mut query = vec![
-            ("userId", user_id.clone()),
-            ("includeItemTypes", "Audio".into()),
-            ("recursive", "true".into()),
-            ("sortBy", sort_by.to_string()),
-            ("sortOrder", "Descending".into()),
-            // Oversample: many top tracks share an album.
-            ("limit", (limit * 8).to_string()),
-            ("enableImages", "false".into()),
-            ("enableUserData", "true".into()),
+        let query = [
+            ("userId", user_id),
+            ("includeItemTypes", "Audio".to_string()),
+            ("recursive", "true".to_string()),
+            // The server sorts never-played tracks (no DatePlayed, PlayCount
+            // 0) after the played ones, but it still returns them: without
+            // the filter, an account with a few plays had its "most played"
+            // padded with albums nobody played.
+            ("filters", "IsPlayed".to_string()),
+            // A tie-break of its own keeps the pages of the walk in one order.
+            ("sortBy", format!("{sort_by},SortName")),
+            ("sortOrder", "Descending,Ascending".to_string()),
+            ("enableImages", "false".to_string()),
+            ("enableUserData", "false".to_string()),
         ];
-        if sort_by == "DatePlayed" {
-            // Never-played tracks have no DatePlayed; keep them out.
-            query.push(("filters", "IsPlayed".into()));
-        }
-        let response: ItemsResponse = self.get_json("/Items", &query).await?;
-        let mut album_ids: Vec<String> = Vec::new();
-        for item in response.items {
-            if let Some(album_id) = item.album_id {
-                if !album_ids.contains(&album_id) {
-                    album_ids.push(album_id);
-                    if album_ids.len() as u32 >= limit {
-                        break;
-                    }
-                }
+        let album_ids = self.leading_album_ids(&query, limit).await?;
+        self.albums_by_ids(&album_ids).await
+    }
+
+    /// The first `limit` distinct albums of the tracks `query` lists, in the
+    /// order their first track comes. Walks the tracks page by page until it
+    /// has them: someone who plays whole albums has a dozen tracks of each at
+    /// the top, and the one fixed sample this used to take left the row short.
+    async fn leading_album_ids(
+        &self,
+        query: &[(&'static str, String)],
+        limit: u32,
+    ) -> AppResult<Vec<String>> {
+        let mut albums = Vec::new();
+        let mut offset = 0u32;
+        while offset < HOME_TRACK_MAX {
+            let mut page = query.to_vec();
+            page.push(("startIndex", offset.to_string()));
+            page.push(("limit", HOME_TRACK_BATCH.to_string()));
+            let response: ItemsResponse = self.get_json("/Items", &page).await?;
+            let received = response.items.len() as u32;
+            let total = response.total_record_count;
+            if take_new_albums(&mut albums, response.items, limit as usize) {
+                break;
+            }
+            offset = offset.saturating_add(received);
+            if received < HOME_TRACK_BATCH || i64::from(offset) >= total {
+                break;
             }
         }
-        self.albums_by_ids(&album_ids).await
+        Ok(albums)
     }
 
     /// Fetch albums by id, preserving the given order (the `ids` query returns
@@ -2870,37 +3820,15 @@ impl JellyfinClient {
         Ok(album_ids.iter().filter_map(|id| by_id.remove(id)).collect())
     }
 
-    /// "Forgotten favorites": favorited tracks you've played but least recently,
-    /// mapped up to their albums (played favorites, oldest DatePlayed first).
+    /// "Forgotten favorites": the albums of favorited tracks you have played,
+    /// the one whose favorites you heard longest ago first. Like "long not
+    /// heard", an album ranks by its latest favorite play — a favorite played
+    /// yesterday means its album's favorites are not forgotten. That takes
+    /// every played favorite, but favorites are few.
     pub async fn forgotten_favorite_albums(&self, limit: u32) -> AppResult<Vec<AlbumDto>> {
         let user_id = self.user_id()?.to_string();
-        let response: ItemsResponse = self
-            .get_json(
-                "/Items",
-                &[
-                    ("userId", user_id),
-                    ("includeItemTypes", "Audio".into()),
-                    ("recursive", "true".into()),
-                    ("filters", "IsFavorite,IsPlayed".into()),
-                    ("sortBy", "DatePlayed".into()),
-                    ("sortOrder", "Ascending".into()),
-                    ("limit", (limit * 8).to_string()),
-                    ("enableImages", "false".into()),
-                    ("enableUserData", "true".into()),
-                ],
-            )
-            .await?;
-        let mut album_ids: Vec<String> = Vec::new();
-        for item in response.items {
-            if let Some(album_id) = item.album_id {
-                if !album_ids.contains(&album_id) {
-                    album_ids.push(album_id);
-                    if album_ids.len() as u32 >= limit {
-                        break;
-                    }
-                }
-            }
-        }
+        let stats = self.album_play_stats(&user_id, true, &|| true).await?;
+        let album_ids = page_of_ids(&least_recently_played(&stats), 0, limit);
         self.albums_by_ids(&album_ids).await
     }
 
@@ -3057,6 +3985,19 @@ mod playlist_selection_tests {
     }
 
     #[test]
+    fn a_repeated_track_on_jellyfin_10_11_resolves_once() {
+        // 10.11 makes every entry id the track's own id, so both entries of a
+        // track that is in the playlist twice carry the same one.
+        let source = [
+            ("track-a", "track-a"),
+            ("track-b", "track-b"),
+            ("track-a", "track-a"),
+        ];
+        let resolved = resolve_playlist_item_ids(source, &ids(&["track-a"])).expect("selection");
+        assert_eq!(resolved, ids(&["track-a"]));
+    }
+
+    #[test]
     fn empty_entry_selections_are_rejected() {
         let source = [("entry-1", "track-1")];
 
@@ -3083,6 +4024,123 @@ mod playlist_selection_tests {
             duplicate.to_string(),
             "duplicate playlist entry id: entry-1"
         );
+    }
+}
+
+#[cfg(test)]
+mod playlist_move_tests {
+    use super::*;
+
+    /// Jellyfin's move: take the entry out, put it back at `index` (the end
+    /// when past it).
+    fn server_move(entries: &mut Vec<(&str, bool)>, entry_id: &str, index: usize) {
+        let from = entries.iter().position(|(id, _)| *id == entry_id).unwrap();
+        let entry = entries.remove(from);
+        entries.insert(index.min(entries.len()), entry);
+    }
+
+    fn audio_order<'a>(entries: &[(&'a str, bool)]) -> Vec<&'a str> {
+        entries
+            .iter()
+            .filter(|(_, audio)| *audio)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    #[test]
+    fn a_hidden_entry_before_the_target_shifts_the_server_index() {
+        // V is a video the playlist page never shows. Dragging A below C is
+        // audio index 2; sent as is, Jellyfin would put A between B and C.
+        let entries = [("V", false), ("A", true), ("B", true), ("C", true)];
+        let index = playlist_move_index(&entries, "A", 2).unwrap();
+        assert_eq!(index, 3);
+
+        let mut moved = entries.to_vec();
+        server_move(&mut moved, "A", index);
+        assert_eq!(moved, [("V", false), ("B", true), ("C", true), ("A", true)]);
+    }
+
+    #[test]
+    fn every_move_lands_where_the_page_put_it() {
+        // Every layout of six entries with at least two audio ones, every
+        // drag the page can make: the server's audio order must end up as the
+        // page's optimistic one, and the hidden entries keep their order.
+        let names = ["e0", "e1", "e2", "e3", "e4", "e5"];
+        for layout in 0u32..(1 << names.len()) {
+            let entries: Vec<(&str, bool)> = names
+                .iter()
+                .enumerate()
+                .map(|(bit, id)| (*id, layout & (1 << bit) != 0))
+                .collect();
+            let audio = audio_order(&entries);
+            if audio.len() < 2 {
+                continue;
+            }
+            let hidden: Vec<&str> = entries
+                .iter()
+                .filter(|(_, audio)| !*audio)
+                .map(|(id, _)| *id)
+                .collect();
+            for from in 0..audio.len() {
+                for to in 0..audio.len() {
+                    let mut expected = audio.clone();
+                    let dragged = expected.remove(from);
+                    expected.insert(to, dragged);
+
+                    let index = playlist_move_index(&entries, dragged, to).unwrap();
+                    let mut moved = entries.clone();
+                    server_move(&mut moved, dragged, index);
+
+                    let case = format!("layout {layout:06b}, {dragged} to {to}");
+                    assert_eq!(audio_order(&moved), expected, "{case}");
+                    let hidden_after: Vec<&str> = moved
+                        .iter()
+                        .filter(|(_, audio)| !*audio)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    assert_eq!(hidden_after, hidden, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_all_audio_playlist_keeps_the_index() {
+        let entries = [("A", true), ("B", true), ("C", true), ("D", true)];
+        for (id, from) in [("A", 0), ("B", 1), ("C", 2), ("D", 3)] {
+            for to in 0..entries.len() {
+                assert_eq!(
+                    playlist_move_index(&entries, id, to),
+                    Some(to),
+                    "{id} from {from}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_target_past_the_end_lands_after_the_last_audio_entry() {
+        let entries = [("A", true), ("B", true), ("V", false)];
+        assert_eq!(playlist_move_index(&entries, "A", 9), Some(1));
+    }
+
+    #[test]
+    fn an_unknown_entry_has_no_index() {
+        let entries = [("A", true), ("B", true)];
+        assert_eq!(playlist_move_index(&entries, "gone", 0), None);
+        assert_eq!(playlist_move_index(&[], "gone", 0), None);
+    }
+
+    #[test]
+    fn a_repeated_entry_id_moves_its_first_copy_like_the_server() {
+        // Jellyfin 10.11 hands out the track id as the entry id, so a track
+        // that is in a playlist twice has one id twice; the server moves the
+        // first match.
+        let entries = [("T", true), ("V", false), ("B", true), ("T", true)];
+        let index = playlist_move_index(&entries, "T", 1).unwrap();
+        let mut moved = entries.to_vec();
+        server_move(&mut moved, "T", index);
+        assert_eq!(audio_order(&moved), ["B", "T", "T"]);
     }
 }
 
@@ -3269,8 +4327,10 @@ mod phase11_query_tests {
         let mut item = BaseItem {
             production_year: Some(1991),
             date_created: Some("2024-03-01T12:30:00.0000000Z".into()),
+            // The track names its music genre, whose id is not the one the
+            // filter carries for the same name; the server matched the genre.
             genre_items: vec![NameGuidPair {
-                id: "rock".into(),
+                id: "music-genre-rock".into(),
                 name: "Rock".into(),
             }],
             user_data: Some(UserDataWire {
@@ -3371,25 +4431,6 @@ mod phase11_query_tests {
     }
 
     #[test]
-    fn long_not_heard_deduplicates_albums_without_changing_first_seen_order() {
-        let items = ["album-b", "album-a", "album-b", "album-c"]
-            .into_iter()
-            .map(|album_id| BaseItem {
-                album_id: Some(album_id.into()),
-                ..BaseItem::default()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            unique_album_ids(items),
-            vec![
-                "album-b".to_string(),
-                "album-a".to_string(),
-                "album-c".to_string()
-            ]
-        );
-    }
-
-    #[test]
     fn collection_playback_keeps_album_then_track_order() {
         assert_eq!(
             flatten_album_tracks(vec![vec!["a1", "a2"], vec!["b1"], vec!["c1", "c2"]]),
@@ -3479,7 +4520,7 @@ mod album_grid_tests {
     }
 
     #[test]
-    fn only_grids_without_play_data_page_on_the_server() {
+    fn only_grids_without_play_data_or_random_order_page_on_the_server() {
         assert!(query(AlbumSort::Name, PlayedFilter::All).is_server_side());
         assert!(AlbumGridQuery {
             genre_id: Some("rock".into()),
@@ -3492,9 +4533,135 @@ mod album_grid_tests {
             query(AlbumSort::DatePlayed, PlayedFilter::All),
             query(AlbumSort::Name, PlayedFilter::Played),
             query(AlbumSort::Random, PlayedFilter::Unplayed),
+            // The server would reshuffle every page.
+            query(AlbumSort::Random, PlayedFilter::All),
         ] {
             assert!(!local.is_server_side(), "{local:?}");
         }
+    }
+
+    #[test]
+    fn only_play_sorts_and_the_played_filter_scan_the_play_history() {
+        assert!(!query(AlbumSort::Random, PlayedFilter::All).needs_play_stats());
+        assert!(!query(AlbumSort::Name, PlayedFilter::All).needs_play_stats());
+        assert!(query(AlbumSort::Random, PlayedFilter::Unplayed).needs_play_stats());
+        assert!(query(AlbumSort::DatePlayed, PlayedFilter::All).needs_play_stats());
+    }
+
+    #[test]
+    fn a_seeded_shuffle_repeats_itself_and_keeps_every_album() {
+        let albums = (0..40).map(|n| format!("album-{n:02}")).collect::<Vec<_>>();
+        let mut first = albums.clone();
+        shuffle_seeded(&mut first, 7);
+        let mut again = albums.clone();
+        shuffle_seeded(&mut again, 7);
+        assert_eq!(first, again, "the same seed, the same order");
+        assert_ne!(first, albums, "it does shuffle");
+
+        let mut other = albums.clone();
+        shuffle_seeded(&mut other, 8);
+        assert_ne!(first, other, "another seed, another order");
+
+        first.sort();
+        assert_eq!(
+            first, albums,
+            "a permutation: nothing lost, nothing doubled"
+        );
+
+        let mut empty: Vec<String> = Vec::new();
+        shuffle_seeded(&mut empty, 7);
+        let mut one = ids(&["a"]);
+        shuffle_seeded(&mut one, 7);
+        assert_eq!(one, ids(&["a"]));
+    }
+
+    #[test]
+    fn long_not_heard_ranks_an_album_by_its_latest_play() {
+        let mut aggregate = AlbumPlayAggregate::default();
+        aggregate.add([
+            // Album "yesterday": mostly played yesterday, one interlude in 2022.
+            played_track(
+                "y1",
+                Some("yesterday"),
+                4,
+                Some("2026-10-19T20:00:00.0000000Z"),
+            ),
+            played_track(
+                "y2",
+                Some("yesterday"),
+                1,
+                Some("2022-01-01T10:00:00.0000000Z"),
+            ),
+            // Album "spring": every track last played in March 2024.
+            played_track(
+                "s1",
+                Some("spring"),
+                2,
+                Some("2024-03-01T08:00:00.0000000Z"),
+            ),
+            played_track(
+                "s2",
+                Some("spring"),
+                2,
+                Some("2024-03-02T08:00:00.0000000Z"),
+            ),
+            // Marked played without a date: nowhere to place it but last.
+            played_track("u1", Some("undated"), 0, None),
+            played_track("o1", Some("old"), 1, Some("2019-06-01T08:00:00.0000000Z")),
+        ]);
+        assert_eq!(
+            least_recently_played(&aggregate.albums),
+            ids(&["old", "spring", "yesterday", "undated"])
+        );
+        assert!(least_recently_played(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_home_row_takes_new_albums_until_it_is_full() {
+        let tracks = |albums: &[Option<&str>]| {
+            albums
+                .iter()
+                .map(|album| BaseItem {
+                    album_id: album.map(str::to_string),
+                    ..BaseItem::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut row = Vec::new();
+        // A whole album played through: one album, however many tracks.
+        assert!(!take_new_albums(
+            &mut row,
+            tracks(&[Some("a"), Some("a"), None, Some(""), Some("a")]),
+            3
+        ));
+        assert_eq!(row, ids(&["a"]));
+        // The next page continues the same row.
+        assert!(take_new_albums(
+            &mut row,
+            tracks(&[Some("b"), Some("a"), Some("c"), Some("d")]),
+            3
+        ));
+        assert_eq!(row, ids(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn genres_come_from_the_music_libraries() {
+        let view = |id: &str, kind: Option<&str>| BaseItem {
+            id: id.into(),
+            collection_type: kind.map(str::to_string),
+            ..BaseItem::default()
+        };
+        assert_eq!(
+            music_libraries(vec![
+                view("movies", Some("movies")),
+                view("music", Some("music")),
+                view("playlists", Some("playlists")),
+                view("folder", None),
+                view("music-2", Some("Music")),
+                view("", Some("music")),
+            ]),
+            ids(&["music", "music-2"])
+        );
     }
 
     #[test]
@@ -3698,6 +4865,521 @@ mod album_grid_tests {
     }
 }
 
+/// The library calls against a local stand-in that answers like Jellyfin 10.11
+/// and records every request line.
+#[cfg(test)]
+mod library_flow_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    type Requests = Arc<Mutex<Vec<String>>>;
+
+    /// A local HTTP server answering each request with `route(request line)`
+    /// as JSON, one connection at a time. Records the request line, followed
+    /// by the body when there is one.
+    fn server(route: impl Fn(&str) -> String + Send + 'static) -> (String, Requests) {
+        server_with_status(move |line| (200, route(line)))
+    }
+
+    /// [`server`], with the status of every answer picked by `route` too.
+    fn server_with_status(
+        route: impl Fn(&str) -> (u16, String) + Send + 'static,
+    ) -> (String, Requests) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().expect("server address"));
+        let requests = Requests::default();
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut data = Vec::new();
+                let mut buf = [0u8; 1024];
+                let head_end = loop {
+                    if let Some(at) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break data.len(),
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&data[..head_end]).to_string();
+                let length = head
+                    .lines()
+                    .filter_map(|header| header.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while data.len() < head_end + length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => data.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let (status, body) = route(&line);
+                let sent = String::from_utf8_lossy(&data[head_end..]);
+                seen.lock()
+                    .unwrap()
+                    .push(format!("{line} {sent}").trim_end().to_string());
+                let response = format!(
+                    "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, requests)
+    }
+
+    fn client(url: &str) -> Arc<JellyfinClient> {
+        Arc::new(
+            JellyfinClient::new(url, "test-device", Vec::new())
+                .expect("client")
+                .with_session("session".into(), "user".into()),
+        )
+    }
+
+    fn hits(requests: &Requests, needle: &str) -> usize {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn genres_are_the_music_genres_of_every_music_library() {
+        let (url, requests) = server(|line| {
+            if line.contains("/UserViews") {
+                r#"{"Items":[
+                    {"Id":"lib-a","Name":"Music","CollectionType":"music"},
+                    {"Id":"movies","Name":"Movies","CollectionType":"movies"},
+                    {"Id":"lib-b","Name":"Vinyl rips","CollectionType":"music"}]}"#
+            } else if line.contains("parentId=lib-a") {
+                r#"{"Items":[{"Id":"mg-rock","Name":"Rock"},{"Id":"mg-jazz","Name":"Jazz"}]}"#
+            } else if line.contains("parentId=lib-b") {
+                r#"{"Items":[{"Id":"mg-blues","Name":"Blues"},{"Id":"mg-rock","Name":"Rock"}]}"#
+            } else {
+                // `/Genres` without a music parent: never asked any more.
+                r#"{"Items":[{"Id":"genre-rock","Name":"Rock"}]}"#
+            }
+            .to_string()
+        });
+        let genres = client(&url).genres().await.expect("genres");
+        assert_eq!(
+            genres.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
+            ["mg-blues", "mg-jazz", "mg-rock"]
+        );
+        assert_eq!(hits(&requests, "/Genres"), 2);
+        assert_eq!(hits(&requests, "parentId=movies"), 0);
+        assert_eq!(hits(&requests, "includeHidden=true"), 1);
+    }
+
+    #[tokio::test]
+    async fn genre_ids_resolve_to_their_genres_and_nothing_else() {
+        // The `Genre` item an older smart view picked, and an id that names an
+        // album instead.
+        const ROCK: &str = "0123456789abcdef0123456789abcdef";
+        const ALBUM: &str = "fedcba98-7654-3210-fedc-ba9876543210";
+        let (url, requests) = server(|_| {
+            r#"{"Items":[
+                {"Id":"0123456789abcdef0123456789abcdef","Name":"Rock","Type":"Genre"},
+                {"Id":"fedcba9876543210fedcba9876543210","Name":"An album","Type":"MusicAlbum"}]}"#
+                .to_string()
+        });
+        let client = client(&url);
+        let ids = [ROCK, ALBUM, "not-an-id", "a,b", "", ROCK].map(String::from);
+        let genres = client.genres_by_id(&ids).await.expect("genres_by_id");
+        assert_eq!(
+            genres
+                .iter()
+                .map(|genre| (genre.id.as_str(), genre.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(ROCK, "Rock")]
+        );
+        // One lookup by id, of the well-formed ids, each once.
+        let lines = requests.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains(&format!("ids={ROCK}%2C{ALBUM}&")),
+            "{}",
+            lines[0]
+        );
+
+        // Nothing well-formed: nothing to ask.
+        let none = client
+            .genres_by_id(&["junk".to_string()])
+            .await
+            .expect("genres_by_id");
+        assert!(none.is_empty());
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_box_sets_with_music_albums_are_listed_and_counted_once() {
+        let (url, requests) = server(|line| {
+            if line.contains("includeItemTypes=BoxSet") {
+                r#"{"Items":[
+                    {"Id":"music-set","Name":"Quiet Hours","Type":"BoxSet","ChildCount":2},
+                    {"Id":"movie-set","Name":"Film Night","Type":"BoxSet","ChildCount":4}],
+                    "TotalRecordCount":2}"#
+            } else if line.contains("parentId=music-set") {
+                r#"{"Items":[],"TotalRecordCount":2}"#
+            } else {
+                r#"{"Items":[],"TotalRecordCount":0}"#
+            }
+            .to_string()
+        });
+        let client = client(&url);
+        let page = client.collections(0, 10).await.expect("collections");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name, "Quiet Hours");
+        // The music albums, not the members.
+        assert_eq!(page.items[0].album_count, 2);
+        assert_eq!(hits(&requests, "includeItemTypes=MusicAlbum"), 2);
+
+        // Member counts unchanged: the next visit counts nothing again.
+        let again = client.collections(0, 10).await.expect("collections");
+        assert_eq!(again.items[0].album_count, 2);
+        assert_eq!(hits(&requests, "includeItemTypes=MusicAlbum"), 2);
+        assert!(client
+            .collections(1, 10)
+            .await
+            .expect("page 2")
+            .items
+            .is_empty());
+    }
+
+    /// Two box sets, one with music, and the answer to counting the other's
+    /// albums.
+    fn box_sets_with_movie_count(movie_count: (u16, &'static str)) -> (String, Requests) {
+        server_with_status(move |line| {
+            if line.contains("includeItemTypes=BoxSet") {
+                (
+                    200,
+                    r#"{"Items":[
+                        {"Id":"music-set","Name":"Quiet Hours","Type":"BoxSet","ChildCount":2},
+                        {"Id":"movie-set","Name":"Film Night","Type":"BoxSet","ChildCount":4}],
+                        "TotalRecordCount":2}"#
+                        .to_string(),
+                )
+            } else if line.contains("parentId=music-set") {
+                (200, r#"{"Items":[],"TotalRecordCount":2}"#.to_string())
+            } else {
+                (movie_count.0, movie_count.1.to_string())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_box_set_that_cannot_be_counted_is_left_out_and_asked_again() {
+        let (url, requests) = box_sets_with_movie_count((500, r#"{"error":"timeout"}"#));
+        let client = client(&url);
+        let page = client.collections(0, 10).await.expect("collections");
+        // The music collection is there although the other count failed.
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].name, "Quiet Hours");
+        assert_eq!(page.items[0].album_count, 2);
+
+        // Its count was kept; the failed one is asked again.
+        client.collections(0, 10).await.expect("collections");
+        assert_eq!(hits(&requests, "parentId=music-set"), 1);
+        assert_eq!(hits(&requests, "parentId=movie-set"), 2);
+    }
+
+    #[tokio::test]
+    async fn collections_fail_only_when_nothing_could_be_shown() {
+        // The one music collection fails to count: an empty page would claim
+        // there are no collections.
+        let (url, _) = server_with_status(|line| {
+            if line.contains("includeItemTypes=BoxSet") {
+                (
+                    200,
+                    r#"{"Items":[{"Id":"music-set","Name":"Quiet Hours","Type":"BoxSet","ChildCount":2}],
+                        "TotalRecordCount":1}"#
+                        .to_string(),
+                )
+            } else {
+                (503, r#"{"error":"busy"}"#.to_string())
+            }
+        });
+        let error = client(&url)
+            .collections(0, 10)
+            .await
+            .expect_err("nothing could be counted");
+        assert!(
+            matches!(error, AppError::Server { status: 503, .. }),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_401_while_counting_fails_the_page_for_a_renewed_session() {
+        // `with_retry` renews an expired session only on an error.
+        let (url, _) = box_sets_with_movie_count((401, ""));
+        let error = client(&url)
+            .collections(0, 10)
+            .await
+            .expect_err("the 401 comes through");
+        assert!(
+            matches!(error, AppError::Server { status: 401, .. }),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_not_heard_scans_once_and_pages_through_the_ranking() {
+        let (url, requests) = server(|line| {
+            if line.contains("filters=IsPlayed") {
+                // Album "fresh" was heard yesterday, apart from one old track.
+                r#"{"Items":[
+                    {"Id":"t1","AlbumId":"fresh","UserData":{"PlayCount":3,"LastPlayedDate":"2026-10-19T20:00:00.0000000Z"}},
+                    {"Id":"t2","AlbumId":"fresh","UserData":{"PlayCount":1,"LastPlayedDate":"2021-01-01T08:00:00.0000000Z"}},
+                    {"Id":"t3","AlbumId":"stale","UserData":{"PlayCount":1,"LastPlayedDate":"2024-03-01T08:00:00.0000000Z"}}],
+                    "TotalRecordCount":3}"#
+            } else {
+                // The albums by id, in no particular order.
+                r#"{"Items":[{"Id":"stale","Name":"Stale"},{"Id":"fresh","Name":"Fresh"}]}"#
+            }
+            .to_string()
+        });
+        let client = client(&url);
+        let first = client
+            .long_not_heard_albums(0, 1, false)
+            .await
+            .expect("page 1");
+        assert_eq!(first.total, 2);
+        assert_eq!(first.items[0].id, "stale");
+        let second = client
+            .long_not_heard_albums(1, 1, false)
+            .await
+            .expect("page 2");
+        assert_eq!(second.items[0].id, "fresh");
+        // The second page came from the first page's ranking.
+        assert_eq!(hits(&requests, "filters=IsPlayed"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_discover_row_reuses_a_recent_ranking_and_scans_run_one_at_a_time() {
+        let (url, requests) = server(|line| {
+            if line.contains("filters=IsPlayed") {
+                r#"{"Items":[{"Id":"t1","AlbumId":"a","UserData":{"PlayCount":1,"LastPlayedDate":"2024-03-01T08:00:00.0000000Z"}}],
+                    "TotalRecordCount":1}"#
+            } else {
+                r#"{"Items":[{"Id":"a","Name":"A"}]}"#
+            }
+            .to_string()
+        });
+        let client = client(&url);
+        let scans = || hits(&requests, "filters=IsPlayed");
+
+        // The hub loads twice at once (mount and library change): one scan.
+        let (one, two) = tokio::join!(
+            client.long_not_heard_albums(0, 12, true),
+            client.long_not_heard_albums(0, 12, true),
+        );
+        assert_eq!(one.expect("row").items[0].id, "a");
+        assert_eq!(two.expect("row").items[0].id, "a");
+        assert_eq!(scans(), 1);
+
+        // The next visit takes that ranking.
+        client
+            .long_not_heard_albums(0, 12, true)
+            .await
+            .expect("row");
+        assert_eq!(scans(), 1);
+
+        // "See all" ranks afresh...
+        client
+            .long_not_heard_albums(0, 60, false)
+            .await
+            .expect("first page");
+        assert_eq!(scans(), 2);
+
+        // ...but a call that had to wait for a scan takes that one.
+        let (one, two) = tokio::join!(
+            client.long_not_heard_albums(0, 60, false),
+            client.long_not_heard_albums(0, 60, false),
+        );
+        one.expect("first page");
+        two.expect("first page");
+        assert_eq!(scans(), 3);
+    }
+
+    #[tokio::test]
+    async fn most_played_albums_come_from_played_tracks_only() {
+        let (url, requests) = server(|line| {
+            if line.contains("includeItemTypes=Audio") {
+                // One played album, its tracks across the first page.
+                r#"{"Items":[{"Id":"t1","AlbumId":"a"},{"Id":"t2","AlbumId":"a"}],"TotalRecordCount":2}"#
+            } else {
+                r#"{"Items":[{"Id":"a","Name":"A"}]}"#
+            }
+            .to_string()
+        });
+        let albums = client(&url)
+            .home_albums("PlayCount", 12)
+            .await
+            .expect("most played");
+        assert_eq!(albums.len(), 1);
+        let walk = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|line| line.contains("includeItemTypes=Audio"))
+            .cloned()
+            .expect("the track walk");
+        assert!(walk.contains("filters=IsPlayed"), "{walk}");
+        assert!(walk.contains("sortBy=PlayCount%2CSortName"), "{walk}");
+    }
+
+    /// A playlist as 10.11 answers for it: `stored` from `GET /Playlists/pl`
+    /// (every entry), `listed` from its `/Items` (what the user may see).
+    fn playlist_server(stored: &'static str, listed: &'static str) -> (String, Requests) {
+        server(move |line| {
+            if line.starts_with("GET /Playlists/pl/Items") {
+                listed.to_string()
+            } else if line.starts_with("GET /Playlists/pl") {
+                stored.to_string()
+            } else {
+                String::new()
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn duplicate_cleanup_rewrites_the_playlist_with_every_track_once() {
+        let (url, requests) = playlist_server(
+            r#"{"OpenAccess":false,"Shares":[],"ItemIds":["a","v","a","b"]}"#,
+            // As 10.11 lists a playlist with track "a" twice: one entry id.
+            r#"{"Items":[
+                {"Id":"a","Type":"Audio","PlaylistItemId":"a"},
+                {"Id":"v","Type":"Video","PlaylistItemId":"v"},
+                {"Id":"a","Type":"Audio","PlaylistItemId":"a"},
+                {"Id":"b","Type":"Audio","PlaylistItemId":"b"}]}"#,
+        );
+        let client = client(&url);
+        assert_eq!(
+            client
+                .remove_playlist_duplicates("pl")
+                .await
+                .expect("cleanup"),
+            PlaylistCleanup {
+                removed: 1,
+                hidden: 0
+            }
+        );
+        let rewrite = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|line| line.starts_with("POST /Playlists/pl "))
+            .cloned()
+            .expect("the rewrite");
+        // Every entry once, in order — the video too: an entry left out is lost.
+        assert!(rewrite.ends_with(r#"{"Ids":["a","v","b"]}"#), "{rewrite}");
+        // Nothing removed by entry id, which would have taken both copies.
+        assert_eq!(hits(&requests, "DELETE"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_playlist_without_duplicates_is_left_alone() {
+        let (url, requests) = playlist_server(
+            r#"{"ItemIds":["a","b"]}"#,
+            r#"{"Items":[{"Id":"a","PlaylistItemId":"a"},{"Id":"b","PlaylistItemId":"b"}]}"#,
+        );
+        let cleanup = client(&url)
+            .remove_playlist_duplicates("pl")
+            .await
+            .expect("cleanup");
+        assert_eq!(cleanup, PlaylistCleanup::default());
+        assert_eq!(hits(&requests, "POST"), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicates_stay_while_the_playlist_holds_entries_the_user_cannot_see() {
+        // "h" came from a library this user cannot open: the listing leaves it
+        // out, and a rewrite from the listing would delete it.
+        let (url, requests) = playlist_server(
+            r#"{"ItemIds":["a","h","a","b"]}"#,
+            r#"{"Items":[
+                {"Id":"a","PlaylistItemId":"a"},
+                {"Id":"a","PlaylistItemId":"a"},
+                {"Id":"b","PlaylistItemId":"b"}]}"#,
+        );
+        let cleanup = client(&url)
+            .remove_playlist_duplicates("pl")
+            .await
+            .expect("cleanup");
+        assert_eq!(
+            cleanup,
+            PlaylistCleanup {
+                removed: 0,
+                hidden: 1
+            }
+        );
+        assert_eq!(hits(&requests, "POST"), 0);
+        assert_eq!(hits(&requests, "DELETE"), 0);
+    }
+
+    #[test]
+    fn hidden_entries_are_the_stored_items_the_listing_lacks() {
+        let listed = [
+            "0123456789abcdef0123456789abcdef",
+            "ffffffffffffffffffffffffffffffff",
+        ]
+        .map(String::from);
+        // The same items, spelled with dashes and capitals.
+        let stored = [
+            "01234567-89AB-CDEF-0123-456789ABCDEF",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ]
+        .map(String::from);
+        assert_eq!(hidden_entries(&stored, &listed), 0);
+        let with_hidden = [stored[0].clone(), "a".repeat(32), "a".repeat(32)];
+        assert_eq!(hidden_entries(&with_hidden, &listed), 2);
+    }
+
+    #[test]
+    fn only_guids_pass_as_item_ids() {
+        assert!(is_item_id("0123456789abcdef0123456789ABCDEF"));
+        assert!(is_item_id("01234567-89ab-cdef-0123-456789abcdef"));
+        for bad in [
+            "",
+            "rock",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef-0123456789abcdef",
+            "01234567-89ab-cdef-0123-456789abcdef,0",
+            "012345678-9ab-cdef-0123-456789abcdef",
+        ] {
+            assert!(!is_item_id(bad), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_url_tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_is_asked_for_in_stereo_at_most() {
+        let client = JellyfinClient::new("http://jelly.test:8096", "test-device", Vec::new())
+            .expect("client")
+            .with_session("session".into(), "user".into());
+        let url = client.stream_url("track").expect("signed in");
+        // The direct-play condition and the channel count of a transcode.
+        assert!(url.contains("&maxAudioChannels=2"), "{url}");
+        assert!(url.contains("&transcodingAudioChannels=2"), "{url}");
+        // What belongs to one attempt at playing it is added when it opens.
+        assert!(!url.contains("playSessionId"), "{url}");
+    }
+}
+
 #[cfg(test)]
 mod token_probe_tests {
     use super::*;
@@ -3750,12 +5432,12 @@ mod token_probe_tests {
             client.validate_after(at),
             client.validate_after(at),
         );
-        let valid = SessionValidity::Valid;
-        assert_eq!(results, (valid, valid, valid, valid));
+        use SessionValidity::Valid;
+        assert_eq!(results, (Valid, Valid, Valid, Valid));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         // A 401 newer than the last probe is not answered by it.
-        assert_eq!(client.validate_after(Instant::now()).await, valid);
+        assert_eq!(client.validate_after(Instant::now()).await, Valid);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -3808,6 +5490,8 @@ mod smoke {
                 .expect("client");
         client.authenticate(&user, &pass).await.expect("login");
         eprintln!("✓ authenticated");
+        // Shared like the app shares it (some calls fan out over tasks).
+        let client = Arc::new(client);
 
         // --- browse / discovery ---
         let albums = client
@@ -3823,6 +5507,20 @@ mod smoke {
                 .await
                 .expect("genre-filtered albums");
             eprintln!("✓ genre '{}' filter: {} albums", g.name, ga.items.len());
+            // The scan behind genre Play / Materialize must find the tracks
+            // the server filtered for the same genre.
+            let genre_tracks = client
+                .smart_tracks(&SmartFilter {
+                    genre_ids: vec![g.id.clone()],
+                    ..SmartFilter::default()
+                })
+                .await
+                .expect("smart_tracks (genre)");
+            assert!(
+                ga.items.is_empty() || !genre_tracks.is_empty(),
+                "a genre with albums has tracks"
+            );
+            eprintln!("✓ genre '{}' scan: {} tracks", g.name, genre_tracks.len());
         }
         let idx_alb = client
             .items_before_letter("albums", "M", None)
@@ -3926,7 +5624,7 @@ mod smoke {
             .expect("discover_mix_seeds");
         let years = client.music_years().await.expect("music_years");
         let long_not_heard = client
-            .long_not_heard_albums(0, 12)
+            .long_not_heard_albums(0, 12, true)
             .await
             .expect("long_not_heard_albums");
         let smart = client
@@ -4058,12 +5756,21 @@ mod smoke {
         );
 
         let collections = client.collections(0, 20).await.expect("collections");
+        assert!(
+            collections.items.iter().all(|c| c.album_count > 0),
+            "only collections with music albums are listed"
+        );
         if let Some(collection) = collections.items.first() {
             let detail = client.collection(&collection.id).await.expect("collection");
             let albums = client
                 .collection_albums(&collection.id)
                 .await
                 .expect("collection_albums");
+            assert_eq!(
+                collection.album_count as usize,
+                albums.len(),
+                "the listed album count is the collection's albums"
+            );
             let tracks = client
                 .collection_tracks(&collection.id)
                 .await
@@ -4147,6 +5854,38 @@ mod smoke {
                         .await
                         .expect("playlist_add");
                 }
+                // 10.11 skips a track the playlist already holds and still
+                // answers 204; the count is how an add tells what it did.
+                let size = client.playlist(&pid).await.expect("playlist").track_count;
+                client
+                    .playlist_add_chunk(&pid, &seed[..1])
+                    .await
+                    .expect("playlist_add (already there)");
+                assert_eq!(
+                    client.playlist(&pid).await.expect("playlist").track_count,
+                    size,
+                    "a track the playlist holds is not added again"
+                );
+                // GET /Playlists/{id} names every stored entry: with nothing
+                // hidden, exactly the items the listing shows.
+                let stored = client
+                    .playlist_stored_item_ids(&pid)
+                    .await
+                    .expect("playlist_stored_item_ids");
+                let listed = client
+                    .playlist_entry_item_ids(&pid)
+                    .await
+                    .expect("playlist_entry_item_ids");
+                assert_eq!(stored.len(), listed.len(), "every entry is stored once");
+                assert_eq!(hidden_entries(&stored, &listed), 0, "nothing is hidden");
+                assert_eq!(
+                    client
+                        .remove_playlist_duplicates(&pid)
+                        .await
+                        .expect("remove_playlist_duplicates"),
+                    PlaylistCleanup::default(),
+                    "nothing to clean up"
+                );
                 let before = client.playlist_tracks(&pid).await.expect("playlist_tracks");
                 let n_before = before.len();
 
@@ -4175,9 +5914,9 @@ mod smoke {
 
                 if after.len() >= 2 {
                     client
-                        .playlist_move(&pid, &after[0].entry_id, 1)
+                        .playlist_move_audio(&pid, &after[0].entry_id, 1)
                         .await
-                        .expect("playlist_move");
+                        .expect("playlist_move_audio");
                 }
                 if let Some(first) = after.first() {
                     client

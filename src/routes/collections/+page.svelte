@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount } from "svelte";
   import { apiDiscovery, type CollectionDto } from "#lib/api/discovery.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import CardSkeleton from "#lib/components/CardSkeleton.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
+  import { appendPage } from "#lib/paging.js";
   import { player } from "#lib/state/player.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
   import type { Page } from "#lib/types.js";
@@ -30,15 +31,15 @@
       if (seq !== generation) return;
       if (reset) {
         collections = result.items;
+        total = result.total;
         swrSet("collections", result);
       } else {
-        const known = new Set(collections.map((collection) => collection.id));
-        collections = [
-          ...collections,
-          ...result.items.filter((collection) => !known.has(collection.id)),
-        ];
+        // A page that adds nothing ends paging; otherwise "Load more" stays
+        // and asks for the same offset again on every click.
+        const merged = appendPage(collections, result.items, result.total, (collection) => collection.id);
+        collections = merged.items;
+        total = merged.total;
       }
-      total = result.total;
     } catch (cause) {
       if (seq === generation && (!reset || collections.length === 0)) error = String(cause);
     } finally {
@@ -47,11 +48,7 @@
   }
 
   onMount(() => loadMore(true));
-  // Only `library.revision` is a dependency: the reload reads and writes
-  // `loading`, which would otherwise re-trigger this effect forever.
-  $effect(() => {
-    if (library.revision > 0) untrack(() => loadMore(true));
-  });
+  onLibraryChange(() => loadMore(true));
 </script>
 
 <div class="p-6">

@@ -20,6 +20,7 @@
     y,
     items,
     label,
+    trigger = null,
     onclose,
   }: {
     x: number;
@@ -27,6 +28,9 @@
     items: ContextMenuItem[];
     /** Accessible name of the menu; a generic "Actions" by default. */
     label?: string;
+    /** The menu button that opened it, if any — its click then closes the
+     *  menu again (see Popover). */
+    trigger?: HTMLElement | null;
     onclose: () => void;
   } = $props();
 
@@ -39,9 +43,21 @@
 
 <!-- The keys (arrows, Home/End, Enter/Space, type-ahead, Escape, Tab) are
      handled by Popover. Disabled items use aria-disabled, not the disabled
-     attribute, so screen readers still list them. -->
-<Popover at={{ x, y }} {onclose} label={label ?? m.context_menu_label()} class="min-w-44">
-  {#each items as item (item.label)}
+     attribute, so screen readers still list them.
+     Never taller or wider than the window: a track with many credited
+     artists gets one "Go to artist" entry each, and a label can carry a
+     track name — past the edge, Download and Delete could not be reached.
+     A long menu scrolls (focusing an item brings it into view), a long label
+     is cut off by its `truncate`.
+     Keyed by position: labels are not unique (two credits of one name). -->
+<Popover
+  at={{ x, y }}
+  {trigger}
+  {onclose}
+  label={label ?? m.context_menu_label()}
+  class="max-h-[calc(100vh-8px)] min-w-44 max-w-[min(24rem,calc(100vw-8px))] overflow-y-auto"
+>
+  {#each items as item, i (i)}
     <button
       class="flex w-full items-center gap-2.5 rounded-md px-3 py-1.5 text-left text-sm outline-none transition-colors focus-visible:ring-1 focus-visible:ring-accent focus-visible:ring-inset
         {item.disabled

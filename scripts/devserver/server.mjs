@@ -13,11 +13,22 @@
 // This is NOT a Jellyfin implementation. It ignores authentication entirely,
 // keeps everything in memory and answers only the routes below -- enough to
 // work with, not something to point at a real client you care about.
+import { randomUUID } from "node:crypto";
 import { createReadStream, statSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { library, playlists, user, TICKS_PER_MS, idFor } from "./fixtures.mjs";
+import {
+  collections,
+  genreId,
+  library,
+  musicGenreId,
+  musicLibraryId,
+  playlists,
+  user,
+  TICKS_PER_MS,
+  idFor,
+} from "./fixtures.mjs";
 import { AUDIO_SECONDS, ensureMedia } from "./media.mjs";
 
 const argv = process.argv.slice(2);
@@ -35,10 +46,13 @@ const MEDIA = join(homedir(), ".cache", "sonarune", "devserver-media");
 
 const favorites = new Set();
 const playCounts = new Map();
+/** When a track was last played (ISO-8601), as playback reports it. */
+const lastPlayed = new Map();
 
 // --- item shaping ------------------------------------------------------------
 
 const albumById = new Map(library.albums.map((a) => [a.id, a]));
+const trackById = new Map(library.tracks.map((t) => [t.id, t]));
 const tracksByAlbum = new Map();
 for (const t of library.tracks) {
   if (!tracksByAlbum.has(t.albumId)) tracksByAlbum.set(t.albumId, []);
@@ -51,6 +65,7 @@ function userData(id) {
     PlayCount: playCounts.get(id) ?? 0,
     Played: (playCounts.get(id) ?? 0) > 0,
     PlaybackPositionTicks: 0,
+    LastPlayedDate: lastPlayed.get(id),
   };
 }
 
@@ -65,7 +80,7 @@ function albumItem(album) {
     ProductionYear: album.year,
     ChildCount: album.trackCount,
     Genres: [album.genre],
-    GenreItems: [{ Id: idFor("genre", album.genre), Name: album.genre }],
+    GenreItems: [{ Id: musicGenreId(album.genre), Name: album.genre }],
     ImageTags: { Primary: album.id },
     ImageBlurHashes: {},
     DateCreated: `20${20 + (album.year % 5)}-03-14T10:00:00.0000000Z`,
@@ -91,7 +106,7 @@ function trackItem(track) {
     ParentIndexNumber: 1,
     RunTimeTicks: lengthMs(track) * TICKS_PER_MS,
     Genres: [track.genre],
-    GenreItems: [{ Id: idFor("genre", track.genre), Name: track.genre }],
+    GenreItems: [{ Id: musicGenreId(track.genre), Name: track.genre }],
     ImageTags: {},
     AlbumPrimaryImageTag: album ? album.id : undefined,
     ImageBlurHashes: {},
@@ -120,7 +135,9 @@ function playlistItem(pl) {
     Id: pl.id,
     Name: pl.name,
     Type: "Playlist",
-    ChildCount: pl.trackIds.length,
+    MediaType: "Audio",
+    // 10.11 counts a playlist's distinct items: a track in it twice is one.
+    ChildCount: new Set(pl.trackIds).size,
     ImageTags: {},
     ImageBlurHashes: {},
     RunTimeTicks:
@@ -129,6 +146,35 @@ function playlistItem(pl) {
         return s + (t ? lengthMs(t) : 0);
       }, 0) * TICKS_PER_MS,
     UserData: userData(pl.id),
+  };
+}
+
+function collectionItem(set) {
+  return {
+    Id: set.id,
+    Name: set.name,
+    Type: "BoxSet",
+    ChildCount: set.albumIds.length + set.otherMembers,
+    ImageTags: {},
+    ImageBlurHashes: {},
+    UserData: userData(set.id),
+  };
+}
+
+/** A genre id of either kind (see fixtures.mjs) back to its name. Jellyfin's
+ *  `genreIds` filter matches by name too, which is why both kinds work there. */
+function genreName(id) {
+  return library.genres.find((g) => g.musicGenreId === id || g.genreId === id)?.name ?? null;
+}
+
+/** A genre as an item: the `MusicGenre` tracks name, or its `Genre` twin. */
+function genreItem(g, music) {
+  return {
+    Id: music ? g.musicGenreId : g.genreId,
+    Name: g.name,
+    Type: music ? "MusicGenre" : "Genre",
+    ImageTags: {},
+    ImageBlurHashes: {},
   };
 }
 
@@ -158,7 +204,8 @@ function queryItems(q) {
   const nameLessThan = pick(q, "NameLessThan", "nameLessThan");
   const nameStartsWith = pick(q, "NameStartsWith", "nameStartsWith");
   const sortBy = csv(pick(q, "SortBy", "sortBy"))[0] ?? "SortName";
-  const descending = (pick(q, "SortOrder", "sortOrder") ?? "").toLowerCase() === "descending";
+  // One order per sort key ("Descending,Ascending"); only the first key sorts here.
+  const descending = csv(pick(q, "SortOrder", "sortOrder"))[0]?.toLowerCase() === "descending";
   const start = Number(pick(q, "StartIndex", "startIndex") ?? 0);
   const limitRaw = pick(q, "Limit", "limit");
   const limit = limitRaw === null ? null : Number(limitRaw);
@@ -174,6 +221,16 @@ function queryItems(q) {
       ...library.tracks.map((t) => ({ kind: "track", src: t, item: trackItem(t) })),
       ...library.artists.map((a) => ({ kind: "artist", src: a, item: artistItem(a) })),
       ...playlists.map((p) => ({ kind: "playlist", src: p, item: playlistItem(p) })),
+      ...collections.map((c) => ({ kind: "collection", src: c, item: collectionItem(c) })),
+      // Genres too, of both kinds: what a smart view saved before 0.6.1
+      // holds is looked up so.
+      ...library.genres.flatMap((g) =>
+        [true, false].map((music) => ({
+          kind: "genre",
+          src: { id: music ? g.musicGenreId : g.genreId, name: g.name },
+          item: genreItem(g, music),
+        })),
+      ),
     ];
   } else if (types.includes("Playlist")) {
     rows = playlists.map((p) => ({ kind: "playlist", src: p, item: playlistItem(p) }));
@@ -183,19 +240,28 @@ function queryItems(q) {
     rows = library.tracks.map((t) => ({ kind: "track", src: t, item: trackItem(t) }));
   } else if (types.includes("MusicAlbum") || types.length === 0) {
     rows = library.albums.map((a) => ({ kind: "album", src: a, item: albumItem(a) }));
+  } else if (types.includes("BoxSet")) {
+    rows = collections.map((c) => ({ kind: "collection", src: c, item: collectionItem(c) }));
   } else {
-    rows = []; // BoxSet and friends: the demo library has none
+    rows = [];
   }
 
   if (parentId) {
-    rows = rows.filter(
-      (r) => r.src.albumId === parentId || r.src.artistId === parentId || r.src.id === parentId,
-    );
+    const set = collections.find((c) => c.id === parentId);
+    if (set) {
+      // A box set's members are linked, not contained.
+      rows = rows.filter((r) => r.kind === "album" && set.albumIds.includes(r.src.id));
+    } else if (parentId !== musicLibraryId) {
+      rows = rows.filter(
+        (r) => r.src.albumId === parentId || r.src.artistId === parentId || r.src.id === parentId,
+      );
+    }
   }
   if (ids.length) rows = rows.filter((r) => ids.includes(r.src.id));
   if (artistIds.length) rows = rows.filter((r) => artistIds.includes(r.src.artistId));
   if (genreIds.length) {
-    rows = rows.filter((r) => r.src.genre && genreIds.includes(idFor("genre", r.src.genre)));
+    const names = genreIds.map(genreName).filter(Boolean);
+    rows = rows.filter((r) => r.src.genre && names.includes(r.src.genre));
   }
   if (years.length) rows = rows.filter((r) => years.includes(String(r.src.year)));
   if (search) rows = rows.filter((r) => r.src.name.toLowerCase().includes(search));
@@ -213,7 +279,7 @@ function queryItems(q) {
     AlbumArtist: (r) => r.src.artistName ?? "",
     ProductionYear: (r) => r.src.year ?? 0,
     DateCreated: (r) => r.src.year ?? 0,
-    DatePlayed: (r) => playCounts.get(r.src.id) ?? 0,
+    DatePlayed: (r) => lastPlayed.get(r.src.id) ?? "",
     PlayCount: (r) => playCounts.get(r.src.id) ?? 0,
     Random: () => Math.random(),
     ParentIndexNumber: (r) => r.src.indexNumber ?? 0,
@@ -234,6 +300,10 @@ function queryItems(q) {
 
 // --- http ----------------------------------------------------------------------
 
+// Every answer allows any origin, as Jellyfin does by default: browser-engine
+// clients pointed at this server (the bench drives one) need that. Nothing but
+// the fake library and its generated media is ever served.
+
 function json(res, body, status = 200) {
   const text = JSON.stringify(body);
   res.writeHead(status, {
@@ -249,7 +319,27 @@ function noContent(res) {
   res.end();
 }
 
-function sendFile(res, path, type, range) {
+/**
+ * The byte range a `Range` header asks for, within a file of `size` bytes:
+ * `{ start, end }` (inclusive), `null` without a usable header (send it all),
+ * or `"unsatisfiable"` for a range that lies outside the file.
+ */
+function byteRange(header, size) {
+  const m = header && /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m || (m[1] === "" && m[2] === "")) return null;
+  if (m[1] === "") {
+    // A suffix range: the last N bytes.
+    const length = Number(m[2]);
+    if (length === 0 || size === 0) return "unsatisfiable";
+    return { start: Math.max(0, size - length), end: size - 1 };
+  }
+  const start = Number(m[1]);
+  const end = m[2] === "" ? size - 1 : Math.min(Number(m[2]), size - 1);
+  if (start >= size || start > end) return "unsatisfiable";
+  return { start, end };
+}
+
+function sendFile(res, path, type, rangeHeader) {
   let stat;
   try {
     stat = statSync(path);
@@ -259,27 +349,31 @@ function sendFile(res, path, type, range) {
   }
   // Seeking a direct-play file goes through Range; without it the player can
   // only ever start from zero.
-  const m = range && /^bytes=(\d*)-(\d*)$/.exec(range);
-  if (m) {
-    const start = m[1] ? Number(m[1]) : 0;
-    const end = m[2] ? Number(m[2]) : stat.size - 1;
-    res.writeHead(206, {
-      "Content-Type": type,
-      "Content-Length": end - start + 1,
-      "Content-Range": `bytes ${start}-${end}/${stat.size}`,
-      "Accept-Ranges": "bytes",
+  const range = byteRange(rangeHeader, stat.size);
+  if (range === "unsatisfiable") {
+    res.writeHead(416, {
+      "Content-Range": `bytes */${stat.size}`,
       "Access-Control-Allow-Origin": "*",
     });
-    createReadStream(path, { start, end }).pipe(res);
+    res.end();
     return;
   }
-  res.writeHead(200, {
+  const { start, end } = range ?? { start: 0, end: stat.size - 1 };
+  res.writeHead(range ? 206 : 200, {
     "Content-Type": type,
-    "Content-Length": stat.size,
+    "Content-Length": stat.size === 0 ? 0 : end - start + 1,
+    ...(range ? { "Content-Range": `bytes ${start}-${end}/${stat.size}` } : {}),
     "Accept-Ranges": "bytes",
     "Access-Control-Allow-Origin": "*",
   });
-  createReadStream(path).pipe(res);
+  if (stat.size === 0) {
+    res.end();
+    return;
+  }
+  createReadStream(path, { start, end })
+    // A file that vanished after the stat ends the response, not the server.
+    .on("error", () => res.destroy())
+    .pipe(res);
 }
 
 function readBody(req) {
@@ -290,8 +384,71 @@ function readBody(req) {
   });
 }
 
-const server = createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host ?? "127.0.0.1"}`);
+/** The request's JSON body, or `{}` for a missing or malformed one. */
+async function readJson(req) {
+  try {
+    const parsed = JSON.parse((await readBody(req)) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** `ids` without repeats, first one first — 10.11 adds a playlist's tracks so. */
+function distinct(ids) {
+  return [...new Set(ids)];
+}
+
+/**
+ * Move the first entry of `itemId` to `newIndex`, the way 10.11 does it: the
+ * entry is found by its item id (the first copy of a repeated track), and the
+ * slot by the track that was at `newIndex - 1` — its first copy, too.
+ */
+function moveEntry(trackIds, itemId, index) {
+  const from = trackIds.indexOf(itemId);
+  const newIndex = Math.min(Math.max(index, 0), trackIds.length - 1);
+  if (from < 0 || from === newIndex) return trackIds;
+  const prior = trackIds[Math.max(newIndex - 1, 0)];
+  const priorIndex = trackIds.indexOf(prior);
+  const to = newIndex === 0 ? (priorIndex > 0 ? priorIndex - 1 : 0) : priorIndex + 1;
+  const next = trackIds.filter((_, i) => i !== from);
+  next.splice(Math.min(to, next.length), 0, itemId);
+  return next;
+}
+
+/** The demo user's one library — what `/UserViews` lists. */
+function musicView() {
+  return {
+    Id: musicLibraryId,
+    Name: "Music",
+    Type: "CollectionFolder",
+    CollectionType: "music",
+    ImageTags: {},
+    ImageBlurHashes: {},
+  };
+}
+
+/** Track ids from a request: known tracks only. */
+function trackIdsOf(values) {
+  return (Array.isArray(values) ? values : []).filter(
+    (id) => typeof id === "string" && trackById.has(id),
+  );
+}
+
+// A request that throws (a bad header, a bug in here) answers 500; it must not
+// take the server down with it, and every client connected to it.
+const server = createServer((req, res) => {
+  handle(req, res).catch((error) => {
+    console.error(`  (failed) ${req.method} ${req.url}: ${error?.stack ?? error}`);
+    if (res.headersSent) res.destroy();
+    else json(res, { error: "internal error" }, 500);
+  });
+});
+
+async function handle(req, res) {
+  // Only the path and the query matter, so a fixed base: a malformed Host
+  // header must not be able to make the URL unparseable.
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
   if (VERBOSE) {
     console.log(`${new Date().toISOString().slice(11, 19)} ${req.method} ${url.pathname}`);
   }
@@ -328,21 +485,7 @@ const server = createServer(async (req, res) => {
   if (um) {
     const sub = um[3];
     if (!sub) return json(res, user);
-    if (sub === "views") {
-      return json(res, {
-        Items: [
-          {
-            Id: idFor("view", "music"),
-            Name: "Music",
-            Type: "CollectionFolder",
-            CollectionType: "music",
-            ImageTags: {},
-            ImageBlurHashes: {},
-          },
-        ],
-        TotalRecordCount: 1,
-      });
-    }
+    if (sub === "views") return json(res, { Items: [musicView()], TotalRecordCount: 1 });
     if (um[4]) {
       const one = albumById.get(um[4])
         ? albumItem(albumById.get(um[4]))
@@ -364,7 +507,10 @@ const server = createServer(async (req, res) => {
     if (p.endsWith("/stopped")) {
       try {
         const id = JSON.parse(body || "{}").ItemId;
-        if (id) playCounts.set(id, (playCounts.get(id) ?? 0) + 1);
+        if (id) {
+          playCounts.set(id, (playCounts.get(id) ?? 0) + 1);
+          lastPlayed.set(id, new Date().toISOString());
+        }
       } catch {
         /* the demo server does not care about a malformed report */
       }
@@ -383,9 +529,12 @@ const server = createServer(async (req, res) => {
   // --- images ---
   m = /^\/items\/([0-9a-f]+)\/images\/primary$/.exec(p);
   if (m) {
-    const album = albumById.get(m[1]);
-    const id = album ? album.id : q.get("tag");
-    return sendFile(res, join(MEDIA, "covers", `${id}.png`), "image/png", req.headers.range);
+    // Covers exist for albums only; anything else names its album in `tag`.
+    // Never a file name taken from the request: `tag=../../..` walked out of
+    // the media directory to any PNG on the disk.
+    const album = albumById.get(m[1]) ?? albumById.get(q.get("tag") ?? "");
+    if (!album) return json(res, { error: "not found" }, 404);
+    return sendFile(res, join(MEDIA, "covers", `${album.id}.png`), "image/png", req.headers.range);
   }
 
   // --- audio ---
@@ -396,19 +545,23 @@ const server = createServer(async (req, res) => {
   if (m) return json(res, {}, 404);
 
   // --- browsing ---
+  if (p === "/userviews") return json(res, { Items: [musicView()], TotalRecordCount: 1 });
   if (p === "/items") return json(res, queryItems(q));
   if (p === "/artists" || p === "/artists/albumartists") {
     const rows = library.artists.map(artistItem);
     return json(res, { Items: rows, TotalRecordCount: rows.length });
   }
   if (p === "/genres" || p === "/musicgenres") {
-    const rows = library.genres.map((g) => ({
-      Id: g.id,
-      Name: g.name,
-      Type: "MusicGenre",
-      ImageTags: {},
-      ImageBlurHashes: {},
-    }));
+    // As 10.11 answers: music genres below a music library (and from the
+    // obsolete /MusicGenres); without one, the `Genre` items, which exist only
+    // for genres something besides music carries too — here, a playlist.
+    const music = p === "/musicgenres" || pick(q, "ParentId", "parentId") === musicLibraryId;
+    const onPlaylists = new Set(
+      playlists.flatMap((pl) => pl.trackIds.map((id) => trackById.get(id)?.genre)),
+    );
+    const rows = library.genres
+      .filter((g) => music || onPlaylists.has(g.name))
+      .map((g) => genreItem(g, music));
     return json(res, { Items: rows, TotalRecordCount: rows.length });
   }
   if (p === "/years") {
@@ -428,17 +581,78 @@ const server = createServer(async (req, res) => {
     return json(res, { Items: others.map(artistItem), TotalRecordCount: others.length });
   }
 
+  // --- playlists, kept the way Jellyfin 10.11 keeps them: an entry is known
+  // by its item id only, a track goes in once, and removing or moving by an
+  // entry id hits every copy or the first one ---
+  if (p === "/playlists" && req.method === "POST") {
+    const body = await readJson(req);
+    const pl = {
+      id: randomUUID().replaceAll("-", ""),
+      name: typeof body.Name === "string" && body.Name.trim() ? body.Name.trim() : "Playlist",
+      trackIds: distinct(trackIdsOf(body.Ids)),
+    };
+    playlists.push(pl);
+    return json(res, { Id: pl.id });
+  }
+
+  m = /^\/playlists\/([0-9a-f]+)$/.exec(p);
+  if (m && req.method === "POST") {
+    const pl = playlists.find((x) => x.id === m[1]);
+    if (!pl) return json(res, { error: "not found" }, 404);
+    const body = await readJson(req);
+    if (typeof body.Name === "string" && body.Name.trim()) pl.name = body.Name.trim();
+    // `Ids` replaces the entries, each item once.
+    if (Array.isArray(body.Ids)) pl.trackIds = distinct(trackIdsOf(body.Ids));
+    return noContent(res);
+  }
+  if (m && req.method === "GET") {
+    // Who may open it, and the item id of every entry in order — repeats, and
+    // in Jellyfin the entries hidden from the user, included (nothing is
+    // hidden here).
+    const pl = playlists.find((x) => x.id === m[1]);
+    if (!pl) return json(res, { error: "not found" }, 404);
+    return json(res, { OpenAccess: false, Shares: [], ItemIds: pl.trackIds });
+  }
+
+  m = /^\/playlists\/([0-9a-f]+)\/items\/([0-9a-f]+)\/move\/(\d+)$/.exec(p);
+  if (m && req.method === "POST") {
+    const pl = playlists.find((x) => x.id === m[1]);
+    if (!pl) return json(res, { error: "not found" }, 404);
+    pl.trackIds = moveEntry(pl.trackIds, m[2], Number(m[3]));
+    return noContent(res);
+  }
+
   m = /^\/playlists\/([0-9a-f]+)\/items$/.exec(p);
   if (m) {
     const pl = playlists.find((x) => x.id === m[1]);
-    const items = (pl?.trackIds ?? []).map((id, i) => {
-      const t = library.tracks.find((x) => x.id === id);
-      return { ...trackItem(t), PlaylistItemId: `${pl.id}-${i}` };
-    });
+    if (!pl) return json(res, { error: "not found" }, 404);
+    if (req.method === "POST") {
+      // What the playlist holds already, and repeats within the request, are
+      // skipped — and the answer is a 204 all the same.
+      const have = new Set(pl.trackIds);
+      const adding = distinct(trackIdsOf(csv(pick(q, "Ids", "ids")))).filter((id) => !have.has(id));
+      pl.trackIds = [...pl.trackIds, ...adding];
+      return noContent(res);
+    }
+    if (req.method === "DELETE") {
+      const remove = new Set(csv(pick(q, "EntryIds", "entryIds")));
+      pl.trackIds = pl.trackIds.filter((id) => !remove.has(id));
+      return noContent(res);
+    }
+    const items = pl.trackIds
+      .map((id) => trackById.get(id))
+      .filter(Boolean)
+      .map((t) => ({ ...trackItem(t), PlaylistItemId: t.id }));
     return json(res, { Items: items, TotalRecordCount: items.length });
   }
 
   m = /^\/items\/([0-9a-f]+)$/.exec(p);
+  if (m && req.method === "DELETE") {
+    const index = playlists.findIndex((x) => x.id === m[1]);
+    if (index < 0) return json(res, { error: "not found" }, 404);
+    playlists.splice(index, 1);
+    return noContent(res);
+  }
   if (m) {
     const id = m[1];
     const album = albumById.get(id);
@@ -455,7 +669,7 @@ const server = createServer(async (req, res) => {
   // Anything else: an empty, well-formed page beats a 500 in a demo.
   console.log(`  (unhandled) ${req.method} ${url.pathname}`);
   return json(res, { Items: [], TotalRecordCount: 0 });
-});
+}
 
 const made = ensureMedia(MEDIA, library.albums, library.tracks);
 if (made.madeCovers || made.madeAudio) {

@@ -15,6 +15,11 @@ use tokio::sync::{Notify, Semaphore};
 
 const MAX_CONCURRENT: usize = 2;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+/// How often progress alone may send the task list to the UI. Every event
+/// carries all tasks, finished ones included, so a tick from each running
+/// download would re-send and re-render a long batch some 13 times a second.
+/// A change of status still goes out at once.
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
 /// Ceiling for a single track when the server announces no `Content-Length`.
 /// Far above any real audio file, including long high-resolution material.
 const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -66,6 +71,11 @@ struct DownloadInner {
     semaphore: Arc<Semaphore>,
     tasks: Mutex<Vec<ManagedTask>>,
     reserved_paths: Mutex<HashSet<PathBuf>>,
+    /// When the task list last went to the UI. Held while a list is taken and
+    /// sent, so lists arrive in the order they were taken: two tasks finishing
+    /// at once could otherwise leave the older list, with one of them still
+    /// running, as the last word.
+    last_emit: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone)]
@@ -114,6 +124,7 @@ impl DownloadManager {
                 semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT)),
                 tasks: Mutex::new(Vec::new()),
                 reserved_paths: Mutex::new(HashSet::new()),
+                last_emit: Mutex::new(None),
             }),
         })
     }
@@ -202,6 +213,16 @@ impl DownloadManager {
                 task.public.status = DownloadStatus::Cancelled;
             }
         }
+    }
+
+    /// Cancel everything and forget the list, for a sign-out: neither the
+    /// queued downloads nor the track names in the panel may carry over to
+    /// whoever signs in next. Tasks still winding down find nothing left to
+    /// update.
+    pub fn reset(&self) {
+        self.cancel_all();
+        self.inner.tasks.lock().unwrap().clear();
+        self.emit();
     }
 
     pub fn retry(&self, id: &str) -> AppResult<()> {
@@ -384,14 +405,11 @@ impl DownloadManager {
             if cancel.load(Ordering::Acquire) {
                 return Err(RunError::Cancelled);
             }
-            // Claim the name atomically instead of renaming onto it. The
-            // reservation happened before the transfer, which may have taken
-            // minutes — anything could have created that file since, and
-            // `rename` replaces an existing target on Windows without a word.
-            let destination = claim_destination(&destination)
-                .await
-                .map_err(|error| RunError::Failed(format!("download finalize failed: {error}")))?;
-            tokio::fs::rename(&part, &destination)
+            #[cfg(windows)]
+            if let Err(error) = mark_from_internet(&part).await {
+                tracing::debug!("cannot mark a download as from the internet: {error}");
+            }
+            let destination = finalize(&part, &destination)
                 .await
                 .map_err(|error| RunError::Failed(format!("download finalize failed: {error}")))?;
             guard.disarm();
@@ -414,6 +432,18 @@ impl DownloadManager {
     }
 
     fn update(&self, id: &str, attempt: u64, update: impl FnOnce(&mut DownloadTask)) {
+        self.modify(id, attempt, update);
+        self.emit();
+    }
+
+    /// Progress alone waits for [`PROGRESS_EMIT_INTERVAL`]; the next list to
+    /// go out carries it either way.
+    fn update_progress(&self, id: &str, attempt: u64, received: u64) {
+        self.modify(id, attempt, |task| task.received_bytes = received);
+        self.send_list(true);
+    }
+
+    fn modify(&self, id: &str, attempt: u64, update: impl FnOnce(&mut DownloadTask)) {
         if let Some(task) = self
             .inner
             .tasks
@@ -424,11 +454,6 @@ impl DownloadManager {
         {
             update(&mut task.public);
         }
-        self.emit();
-    }
-
-    fn update_progress(&self, id: &str, attempt: u64, received: u64) {
-        self.update(id, attempt, |task| task.received_bytes = received);
     }
 
     fn finish(&self, id: &str, attempt: u64, result: Result<PathBuf, RunError>) {
@@ -475,8 +500,27 @@ impl DownloadManager {
     }
 
     fn emit(&self) {
-        let _ = self.inner.app.emit("download:state", self.list());
+        self.send_list(false);
     }
+
+    fn send_list(&self, progress_only: bool) {
+        let mut last_emit = self.inner.last_emit.lock().unwrap();
+        let now = Instant::now();
+        if !emit_due(*last_emit, now, progress_only) {
+            return;
+        }
+        let _ = self.inner.app.emit("download:state", self.list());
+        *last_emit = Some(now);
+    }
+}
+
+/// Whether a change to the task list goes out now: a change of status always
+/// does, progress alone once [`PROGRESS_EMIT_INTERVAL`] has passed since the
+/// last list was sent, whatever that one was for.
+fn emit_due(last_emit: Option<Instant>, now: Instant, progress_only: bool) -> bool {
+    !progress_only
+        || last_emit
+            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_EMIT_INTERVAL)
 }
 
 fn display_name(name: &str) -> String {
@@ -488,11 +532,35 @@ fn display_name(name: &str) -> String {
     }
 }
 
+/// Give the finished partial file its final name.
+///
+/// The name is claimed atomically instead of renamed onto: the reservation
+/// happened before the transfer, which may have taken minutes — anything
+/// could have created that file since, and `rename` replaces an existing
+/// target on Windows without a word. Should the rename itself fail (a sync
+/// client or scanner holding a file, a share that refuses), the empty
+/// placeholder goes again: it would otherwise stay in Downloads under the
+/// track's real name, and a retry would save next to it as " (1)".
+async fn finalize(part: &Path, destination: &Path) -> std::io::Result<PathBuf> {
+    let destination = claim_destination(destination).await?;
+    if let Err(error) = tokio::fs::rename(part, &destination).await {
+        // Only while it is still the empty file claim_destination created.
+        if tokio::fs::metadata(&destination)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
+        {
+            let _ = tokio::fs::remove_file(&destination).await;
+        }
+        return Err(error);
+    }
+    Ok(destination)
+}
+
 /// Take ownership of the target name at the last possible moment by creating
 /// it with `create_new` — the only way to test-and-claim without a gap. If it
 /// was taken while the download ran, fall back to the same " (n)" scheme the
 /// reservation uses. The empty placeholder is immediately replaced by the
-/// rename that follows.
+/// rename that follows (see [`finalize`]).
 async fn claim_destination(destination: &Path) -> std::io::Result<PathBuf> {
     let name = destination
         .file_name()
@@ -563,9 +631,52 @@ fn cleanup_stale_parts(dir: &Path) {
     }
 }
 
+/// Mark a download the way a browser marks one (the Mark of the Web): its
+/// `Zone.Identifier` stream says it came from the Internet zone, so Windows
+/// applies its usual checks — SmartScreen, the "Open File - Security Warning"
+/// prompt — should a server ever send something other than audio. Only the
+/// zone: browsers also record the address, which here would name the server.
+///
+/// Written onto the partial file, so the stream moves along with the rename
+/// and the file never sits under its real name unmarked. A drive without
+/// streams (FAT, exFAT) refuses it, which the caller shrugs off.
+#[cfg(windows)]
+async fn mark_from_internet(path: &Path) -> std::io::Result<()> {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    tokio::fs::write(PathBuf::from(stream), "[ZoneTransfer]\r\nZoneId=3\r\n").await
+}
+
+/// Explorer, by its full path. Started by name, Windows would look in the
+/// folder of our own exe first — for the portable build that is often
+/// Downloads itself, and an `explorer.exe` someone left there would run
+/// instead.
+#[cfg(target_os = "windows")]
+pub(crate) fn explorer() -> std::process::Command {
+    std::process::Command::new(windows_dir().join("explorer.exe"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_dir() -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut buffer = [0u16; 260];
+    // SAFETY: the buffer is valid for writes of the length passed with it.
+    let len = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    match usize::try_from(len) {
+        Ok(len) if len > 0 && len < buffer.len() => {
+            PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len]))
+        }
+        _ => std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows")),
+    }
+}
+
 fn open_folder(path: &Path) -> AppResult<()> {
     #[cfg(target_os = "windows")]
-    let mut command = std::process::Command::new("explorer.exe");
+    let mut command = explorer();
     #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -580,9 +691,88 @@ fn open_folder(path: &Path) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_name, part_path};
+    use super::{display_name, emit_due, finalize, part_path, PROGRESS_EMIT_INTERVAL};
     use crate::commands::{collision_filename, filename_len, sanitize_filename, MAX_FILENAME_LEN};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sonarune-download-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn progress_alone_goes_out_at_most_every_interval() {
+        let start = Instant::now();
+        // Nothing sent yet: the first progress goes out.
+        assert!(emit_due(None, start, true));
+        let soon = start + Duration::from_millis(150);
+        assert!(!emit_due(Some(start), soon, true));
+        assert!(emit_due(Some(start), start + PROGRESS_EMIT_INTERVAL, true));
+        // A change of status never waits.
+        assert!(emit_due(Some(start), soon, false));
+        assert!(emit_due(Some(start), start, false));
+    }
+
+    #[tokio::test]
+    async fn a_failed_finalize_leaves_no_empty_file_behind() {
+        let dir = temp_dir("finalize");
+        let destination = dir.join("Song.flac");
+        // No partial file to move, so the rename fails after the name was
+        // claimed.
+        let result = finalize(&dir.join("missing.part"), &destination).await;
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_err());
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    #[tokio::test]
+    async fn finalize_moves_the_partial_file_onto_a_free_name() {
+        let dir = temp_dir("finalize-ok");
+        let part = dir.join("Song.flac.sonarune-x-0.part");
+        std::fs::write(&part, b"audio").unwrap();
+        // Taken while the download ran: the file goes next to it.
+        std::fs::write(dir.join("Song.flac"), b"other").unwrap();
+        let result = finalize(&part, &dir.join("Song.flac")).await;
+        let moved = result
+            .as_ref()
+            .ok()
+            .map(|path| std::fs::read(path).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result.unwrap(), dir.join("Song (1).flac"));
+        assert_eq!(moved.as_deref(), Some(&b"audio"[..]));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn downloads_carry_the_mark_of_the_web() {
+        let dir = temp_dir("motw");
+        let file = dir.join("Song.flac.sonarune-x-0.part");
+        std::fs::write(&file, b"audio").unwrap();
+        let marked = super::mark_from_internet(&file).await;
+        let mut stream = file.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        let zone = std::fs::read_to_string(PathBuf::from(stream));
+        let _ = std::fs::remove_dir_all(&dir);
+        marked.expect("write the Zone.Identifier stream");
+        assert_eq!(zone.unwrap(), "[ZoneTransfer]\r\nZoneId=3\r\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explorer_is_started_by_its_full_path() {
+        let command = super::explorer();
+        let program = Path::new(command.get_program());
+        assert!(program.is_absolute(), "{program:?}");
+        assert_eq!(
+            program.file_name().and_then(|name| name.to_str()),
+            Some("explorer.exe")
+        );
+        assert!(program.is_file(), "{program:?}");
+    }
 
     #[test]
     fn long_names_yield_creatable_final_and_partial_files() {

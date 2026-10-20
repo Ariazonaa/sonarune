@@ -21,9 +21,10 @@
 
 <!-- One measure, one colour: the length is the comparison, so there is nothing
      for a legend to explain. Every value is written out as well, which is what
-     keeps the chart readable without colour. -->
+     keeps the chart readable without colour. Not keyed: a label is no
+     identity — two artists can share a name — and the rows never move. -->
 <ul class="space-y-2">
-  {#each items as item (item.label)}
+  {#each items as item}
     <li>
       <svelte:element
         this={item.href ? "a" : "div"}

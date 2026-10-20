@@ -1,5 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api } from "#lib/api.js";
+import { onVisible } from "#lib/visibility.js";
 import type { DownloadRequest, DownloadTask } from "#lib/types.js";
 
 class DownloadsState {
@@ -7,6 +8,7 @@ class DownloadsState {
   open = $state(false);
   error = $state<string | null>(null);
   private unlisten: UnlistenFn | null = null;
+  private stopResync: (() => void) | null = null;
   private initializing: Promise<void> | null = null;
 
   get activeCount() {
@@ -19,6 +21,14 @@ class DownloadsState {
 
   init(): Promise<void> {
     if (this.initializing) return this.initializing;
+    // Progress and the end of a download arrive as events only, and those may
+    // be lost while the window is hidden: read the list back when it returns.
+    this.stopResync = onVisible(() => {
+      api.getDownloads().then(
+        (tasks) => (this.tasks = tasks),
+        () => {},
+      );
+    });
     this.initializing = (async () => {
       this.unlisten = await listen<DownloadTask[]>("download:state", (event) => {
         this.tasks = event.payload;
@@ -33,7 +43,17 @@ class DownloadsState {
   destroy() {
     this.unlisten?.();
     this.unlisten = null;
+    this.stopResync?.();
+    this.stopResync = null;
     this.initializing = null;
+  }
+
+  /** On sign-out: the next account starts with an empty panel (Rust has
+   *  cancelled and dropped the downloads themselves). */
+  reset() {
+    this.tasks = [];
+    this.error = null;
+    this.open = false;
   }
 
   async enqueue(requests: DownloadRequest[]) {

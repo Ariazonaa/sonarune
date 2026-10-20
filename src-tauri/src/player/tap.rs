@@ -11,8 +11,9 @@
 //! (`ChunkPool`), and a forwarder thread polls the pool, encodes and sends.
 
 use rodio::Source;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Duration;
 
@@ -44,10 +45,10 @@ const FORWARD_POLL: Duration = Duration::from_millis(5);
 /// unpark the forwarder right away.
 const IDLE_PARK: Duration = Duration::from_secs(1);
 
-/// Wire format per frame: u32-le sample rate, u32-le channel count (always
-/// [`WIRE_CHANNELS`]), then f32-le samples interleaved L, R, L, R, … The
-/// frontend resamples to its AudioContext rate if they differ
-/// (`src/lib/visualizer/pcm.ts`). Encodes into `bytes`, replacing its
+/// Wire format per frame: u32-le sample rate (see [`wire_rate`]), u32-le
+/// channel count (always [`WIRE_CHANNELS`]), then f32-le samples interleaved
+/// L, R, L, R, … The frontend resamples to its AudioContext rate if they
+/// differ (`src/lib/visualizer/pcm.ts`). Encodes into `bytes`, replacing its
 /// contents, so the forwarder reuses one buffer for every frame.
 fn encode_frame_into(bytes: &mut Vec<u8>, sample_rate: u32, interleaved: &[f32]) {
     bytes.clear();
@@ -57,6 +58,20 @@ fn encode_frame_into(bytes: &mut Vec<u8>, sample_rate: u32, interleaved: &[f32])
     for sample in interleaved {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
+}
+
+/// The rate a chunk goes out with: its frames per second on the clock. The
+/// tap sits upstream of the playback-speed stage (`tempo.rs`), which pulls
+/// the sources `speed` times faster than real time, and the frontend paces
+/// the feed by the stamped rate — the source's own rate would starve the
+/// visuals below 1× and overflow them above. A pitch-keeping stretch is not
+/// reproduced: the feed's pitch follows the speed, like a record played
+/// faster.
+fn wire_rate(sample_rate: u32, speed: f32) -> u32 {
+    if super::tempo::is_unity(speed) || !speed.is_finite() || speed <= 0.0 {
+        return sample_rate;
+    }
+    (f64::from(sample_rate) * f64::from(speed)).round() as u32
 }
 
 /// Folds interleaved samples of any channel count into stereo frames: mono
@@ -276,24 +291,70 @@ impl ChunkPool {
     }
 }
 
+/// What a consumer draws from the feed, which decides what its window may do
+/// in the background (see [`VisualizerTap::keeps_window_awake`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TapConsumer {
+    /// Butterchurn (the visualizer route, the projector, the now-playing
+    /// backdrop): a WebGL context and an AudioWorklet, which suspending the
+    /// WebView would tear down. A consumer that does not say what it is
+    /// counts as one.
+    #[default]
+    Visualizer,
+    /// The now-playing spectrum bar: a 2D canvas that loses nothing while
+    /// its WebView sleeps, so it simply gets no frames meanwhile.
+    Spectrum,
+}
+
+struct Subscription {
+    /// Label of the owning window, see [`TapShared::consumers`].
+    window: String,
+    consumer: TapConsumer,
+    channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+}
+
+#[derive(Default)]
+struct Consumers {
+    /// Keyed by the channel's unique id; see [`TapShared::consumers`].
+    channels: HashMap<u32, Subscription>,
+    /// Windows whose WebView is suspended. Their channels stay subscribed but
+    /// get no frames: a frozen page takes none, and every frame sent to it
+    /// would be queued for it or wake it up.
+    paused: HashSet<String>,
+}
+
+impl Consumers {
+    /// Whether the next frame would reach anyone.
+    fn any_receiving(&self) -> bool {
+        self.channels
+            .values()
+            .any(|sub| !self.paused.contains(&sub.window))
+    }
+}
+
 struct TapShared {
     active: AtomicBool,
     /// The forwarder is gone (tap dropped, or its thread died): nothing would
     /// empty the pool, so `subscribe` no longer switches the tap on.
     closed: AtomicBool,
+    /// Playback speed as f32 bits, kept current by the player
+    /// ([`VisualizerTap::set_speed`]); chunks are stamped by it
+    /// ([`wire_rate`]).
+    speed: AtomicU32,
     /// Chunk buffers, allocated by the first `subscribe` — on a command
     /// thread, never on the audio thread — and kept for the life of the tap.
     pool: OnceLock<ChunkPool>,
-    /// Multiple consumers (e.g. the full visualizer and a player-bar spectrum)
-    /// can subscribe at once, keyed by the channel's unique id. Keying by id
-    /// makes teardown races safe: a stale engine only ever removes its own id.
-    /// Value is (owning window label, channel). The label lets us drop a
-    /// subscription when its window is destroyed: closing a window tears the
-    /// WebView down without running the frontend's unsubscribe, and the
-    /// channel's `send` does NOT report the dead consumer back to us — the
-    /// subscription would otherwise live, and keep the audio tap running, for
-    /// the rest of the process.
-    channels: Mutex<HashMap<u32, (String, tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>)>>,
+    /// Multiple consumers (e.g. the full visualizer and the now-playing
+    /// spectrum) can subscribe at once, keyed by the channel's unique id.
+    /// Keying by id makes teardown races safe: a stale engine only ever
+    /// removes its own id. Each subscription keeps its owning window's label
+    /// so the window's subscriptions can be dropped when it is destroyed or
+    /// starts loading a new document (a reload): both happen without the
+    /// frontend's unsubscribe running, and the channel's `send` does NOT
+    /// report the dead consumer back to us — the subscription would otherwise
+    /// live, and keep the audio tap running, for the rest of the process.
+    consumers: Mutex<Consumers>,
 }
 
 impl TapShared {
@@ -301,26 +362,39 @@ impl TapShared {
         Self {
             active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            speed: AtomicU32::new(1f32.to_bits()),
             pool: OnceLock::new(),
-            channels: Mutex::new(HashMap::new()),
+            consumers: Mutex::new(Consumers::default()),
         }
+    }
+
+    /// The audio thread produces chunks only while someone would receive
+    /// them (and a forwarder is still there to empty the pool).
+    fn update_active(&self, consumers: &Consumers) {
+        let on = consumers.any_receiving() && !self.closed.load(Ordering::Acquire);
+        self.active.store(on, Ordering::Release);
     }
 
     /// Forwarder thread: send one encoded frame to every consumer.
     fn fan_out(&self, frame: &[u8]) {
-        let mut guard = self.channels.lock().unwrap();
-        if guard.is_empty() {
+        let mut guard = self.consumers.lock().unwrap();
+        if guard.channels.is_empty() {
             return;
         }
+        let Consumers { channels, paused } = &mut *guard;
         // One owned copy per consumer (the IPC body takes a Vec; ~16 KiB, a
-        // handful of times) — on this thread, not the audio thread.
-        guard.retain(|_, (_, channel)| {
-            channel
-                .send(tauri::ipc::InvokeResponseBody::Raw(frame.to_vec()))
-                .is_ok()
+        // handful of times) — on this thread, not the audio thread. A paused
+        // window's channels are skipped, not dropped; a skipped frame is
+        // never sent, so it leaves no gap in the channel's message order.
+        channels.retain(|_, sub| {
+            paused.contains(&sub.window)
+                || sub
+                    .channel
+                    .send(tauri::ipc::InvokeResponseBody::Raw(frame.to_vec()))
+                    .is_ok()
         });
-        // No consumers left: stop the audio thread producing frames.
-        if guard.is_empty() {
+        // Nobody left to receive: stop the audio thread producing frames.
+        if !guard.any_receiving() {
             self.active.store(false, Ordering::Release);
         }
     }
@@ -382,50 +456,80 @@ impl VisualizerTap {
     pub fn subscribe(
         &self,
         window_label: String,
+        consumer: TapConsumer,
         channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
     ) {
         self.shared.pool.get_or_init(ChunkPool::new);
-        self.shared
-            .channels
-            .lock()
-            .unwrap()
-            .insert(channel.id(), (window_label, channel));
-        if !self.shared.closed.load(Ordering::Acquire) {
-            self.shared.active.store(true, Ordering::Release);
-        }
+        let mut consumers = self.shared.consumers.lock().unwrap();
+        consumers.channels.insert(
+            channel.id(),
+            Subscription {
+                window: window_label,
+                consumer,
+                channel,
+            },
+        );
+        self.shared.update_active(&consumers);
+        drop(consumers);
         self.wake_forwarder();
     }
 
-    /// Drop every subscription belonging to a window. Called when that window
-    /// is destroyed — see the comment on `TapShared::channels`.
-    /// Whether any window is currently receiving PCM. The visualizer and the
-    /// spectrum bar are the only consumers, and neither survives having its
-    /// WebView suspended: the WebGL context and the AudioWorklet would be torn
-    /// down under them.
-    pub fn has_subscribers_in(&self, window_label: &str) -> bool {
+    /// Whether a hidden window has to stay awake: a visualizer runs in it,
+    /// and suspending its WebView would tear down the WebGL context and the
+    /// AudioWorklet under it. A spectrum bar does not count — its frames are
+    /// held back while the window sleeps ([`Self::set_window_paused`]).
+    pub fn keeps_window_awake(&self, window_label: &str) -> bool {
         self.shared
-            .channels
+            .consumers
             .lock()
-            .map(|c| c.values().any(|(label, _)| label == window_label))
+            .map(|consumers| {
+                consumers.channels.values().any(|sub| {
+                    sub.window == window_label && sub.consumer == TapConsumer::Visualizer
+                })
+            })
             .unwrap_or(false)
     }
 
-    pub fn unsubscribe_window(&self, window_label: &str) {
-        let mut guard = self.shared.channels.lock().unwrap();
-        guard.retain(|_, (label, _)| label != window_label);
-        if guard.is_empty() {
-            self.shared.active.store(false, Ordering::Release);
+    /// Hold back a window's frames while its WebView is suspended (and send
+    /// them again once it is resumed). Its subscriptions stay: the page picks
+    /// up where it left off, with nothing to resubscribe.
+    pub fn set_window_paused(&self, window_label: &str, paused: bool) {
+        let mut consumers = self.shared.consumers.lock().unwrap();
+        if paused {
+            consumers.paused.insert(window_label.to_string());
+        } else {
+            consumers.paused.remove(window_label);
         }
+        self.shared.update_active(&consumers);
+        drop(consumers);
+        if !paused {
+            self.wake_forwarder();
+        }
+    }
+
+    /// Drop every subscription belonging to a window. Called when that window
+    /// is destroyed or starts loading a new document — see the comment on
+    /// `TapShared::consumers`.
+    pub fn unsubscribe_window(&self, window_label: &str) {
+        let mut consumers = self.shared.consumers.lock().unwrap();
+        consumers
+            .channels
+            .retain(|_, sub| sub.window != window_label);
+        self.shared.update_active(&consumers);
     }
 
     /// Remove one consumer by channel id. Keying by id makes teardown races
     /// safe: a stale engine only removes its own channel, never a newer one.
     pub fn unsubscribe(&self, channel_id: u32) {
-        let mut guard = self.shared.channels.lock().unwrap();
-        guard.remove(&channel_id);
-        if guard.is_empty() {
-            self.shared.active.store(false, Ordering::Release);
-        }
+        let mut consumers = self.shared.consumers.lock().unwrap();
+        consumers.channels.remove(&channel_id);
+        self.shared.update_active(&consumers);
+    }
+
+    /// The playback speed the tempo stage runs at; chunks finished from now
+    /// on are stamped with the matching wall-clock rate (`wire_rate`).
+    pub fn set_speed(&self, speed: f32) {
+        self.shared.speed.store(speed.to_bits(), Ordering::Relaxed);
     }
 
     #[inline]
@@ -441,11 +545,12 @@ impl VisualizerTap {
 
     /// Audio thread: hand one finished chunk to the forwarder, or drop it
     /// when the pool is full. Never allocates, frees or blocks (see
-    /// [`ChunkPool`]).
+    /// [`ChunkPool`]); the speed is one relaxed load per chunk.
     #[inline]
     fn send(&self, sample_rate: u32, interleaved: &[f32]) {
         if let Some(pool) = self.shared.pool.get() {
-            pool.push(sample_rate, interleaved);
+            let speed = f32::from_bits(self.shared.speed.load(Ordering::Relaxed));
+            pool.push(wire_rate(sample_rate, speed), interleaved);
         }
     }
 }
@@ -595,8 +700,9 @@ impl<S: Source> Source for TapSource<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_frame_into, wrap, ChunkPool, StereoFold, TapShared, VisualizerTap, CHUNK_FRAMES,
-        CHUNK_SAMPLES, HEADER_BYTES, POOL_SLOTS, SLOT_CLAIMED, SLOT_FREE,
+        encode_frame_into, wire_rate, wrap, ChunkPool, StereoFold, TapConsumer, TapShared,
+        VisualizerTap, CHUNK_FRAMES, CHUNK_SAMPLES, HEADER_BYTES, POOL_SLOTS, SLOT_CLAIMED,
+        SLOT_FREE,
     };
     use rodio::buffer::SamplesBuffer;
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -1022,34 +1128,150 @@ mod tests {
     }
 
     #[test]
-    fn has_subscribers_in_answers_per_window() {
+    fn only_a_visualizer_keeps_its_window_awake() {
         // The suspend-on-hide path asks this before freezing the main WebView:
         // freezing it under a running visualizer would tear down its WebGL
-        // context and AudioWorklet.
+        // context and AudioWorklet. The spectrum bar on Now Playing must not
+        // keep a minimised app at its foreground footprint all night.
         let tap = VisualizerTap::new();
-        let channel = |_label: &str| tauri::ipc::Channel::new(|_| Ok(()));
+        let channel = || tauri::ipc::Channel::new(|_| Ok(()));
 
-        assert!(!tap.has_subscribers_in("main"));
+        assert!(!tap.keeps_window_awake("main"));
 
-        let projector = channel("projector");
-        tap.subscribe("projector".into(), projector);
+        tap.subscribe("projector".into(), TapConsumer::Visualizer, channel());
         assert!(
-            !tap.has_subscribers_in("main"),
+            !tap.keeps_window_awake("main"),
             "another window must not count"
         );
-        assert!(tap.has_subscribers_in("projector"));
+        assert!(tap.keeps_window_awake("projector"));
 
-        let main = channel("main");
-        let main_id = main.id();
-        tap.subscribe("main".into(), main);
-        assert!(tap.has_subscribers_in("main"));
-
-        tap.unsubscribe(main_id);
-        assert!(!tap.has_subscribers_in("main"));
+        tap.subscribe("main".into(), TapConsumer::Spectrum, channel());
         assert!(
-            tap.has_subscribers_in("projector"),
+            !tap.keeps_window_awake("main"),
+            "a spectrum bar may sleep with its window"
+        );
+
+        let visualizer = channel();
+        let visualizer_id = visualizer.id();
+        tap.subscribe("main".into(), TapConsumer::Visualizer, visualizer);
+        assert!(tap.keeps_window_awake("main"));
+
+        tap.unsubscribe(visualizer_id);
+        assert!(!tap.keeps_window_awake("main"));
+        assert!(
+            tap.keeps_window_awake("projector"),
             "the other window stays"
         );
+    }
+
+    #[test]
+    fn consumers_name_themselves_as_the_frontend_does() {
+        // `invoke("visualizer_subscribe", { channel, consumer })` in
+        // src/lib/visualizer/engine.ts and SpectrumBar.svelte.
+        let parse = |json: &str| serde_json::from_str::<TapConsumer>(json).unwrap();
+        assert_eq!(parse("\"visualizer\""), TapConsumer::Visualizer);
+        assert_eq!(parse("\"spectrum\""), TapConsumer::Spectrum);
+        assert_eq!(TapConsumer::default(), TapConsumer::Visualizer);
+    }
+
+    /// A channel that hands every frame it is sent to `rx`.
+    fn recording_channel() -> (
+        tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Raw(bytes) = body {
+                let _ = tx.send(bytes);
+            }
+            Ok(())
+        });
+        (channel, rx)
+    }
+
+    #[test]
+    fn a_suspended_window_gets_no_frames_until_it_resumes() {
+        let tap = test_tap();
+        tap.shared.active.store(false, Ordering::Relaxed);
+        let (spectrum, spectrum_rx) = recording_channel();
+        tap.subscribe("main".into(), TapConsumer::Spectrum, spectrum);
+        assert!(tap.is_active());
+
+        // The main window is hidden and its WebView suspended: nothing may be
+        // evaluated in the frozen page, and with nobody else listening the
+        // audio thread stops producing frames.
+        tap.set_window_paused("main", true);
+        assert!(!tap.is_active());
+        tap.shared.fan_out(&[1, 2, 3]);
+        assert!(spectrum_rx.try_recv().is_err());
+
+        // A projector elsewhere still gets every frame meanwhile.
+        let (projector, projector_rx) = recording_channel();
+        tap.subscribe("projector".into(), TapConsumer::Visualizer, projector);
+        assert!(tap.is_active());
+        tap.shared.fan_out(&[4, 5, 6]);
+        assert_eq!(projector_rx.try_recv().unwrap(), [4, 5, 6]);
+        assert!(spectrum_rx.try_recv().is_err());
+        assert_eq!(
+            tap.shared.consumers.lock().unwrap().channels.len(),
+            2,
+            "the paused channel was kept, not dropped"
+        );
+
+        // Resumed: the same subscription picks up again, nothing to redo.
+        tap.set_window_paused("main", false);
+        tap.shared.fan_out(&[7, 8, 9]);
+        assert_eq!(spectrum_rx.try_recv().unwrap(), [7, 8, 9]);
+        assert_eq!(projector_rx.try_recv().unwrap(), [7, 8, 9]);
+    }
+
+    #[test]
+    fn a_reloaded_window_loses_its_subscriptions() {
+        // F5 in the main window: the old page's channels must go, or the tap
+        // keeps sending into the new page (which knows none of them) and the
+        // window counts as visualizing for the rest of the session.
+        let tap = test_tap();
+        let (main, main_rx) = recording_channel();
+        let (projector, projector_rx) = recording_channel();
+        tap.subscribe("main".into(), TapConsumer::Visualizer, main);
+        tap.subscribe("projector".into(), TapConsumer::Visualizer, projector);
+
+        tap.unsubscribe_window("main");
+        assert!(!tap.keeps_window_awake("main"));
+        assert!(tap.is_active(), "the projector still listens");
+        tap.shared.fan_out(&[1]);
+        assert!(main_rx.try_recv().is_err());
+        assert_eq!(projector_rx.try_recv().unwrap(), [1]);
+
+        tap.unsubscribe_window("projector");
+        assert!(!tap.is_active());
+    }
+
+    #[test]
+    fn frames_are_stamped_with_their_wall_clock_rate() {
+        assert_eq!(wire_rate(48_000, 1.0), 48_000);
+        assert_eq!(wire_rate(44_100, 1.0), 44_100);
+        assert_eq!(wire_rate(48_000, 1.5), 72_000);
+        assert_eq!(wire_rate(44_100, 0.75), 33_075);
+        assert_eq!(wire_rate(192_000, 2.0), 384_000);
+        for nonsense in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            assert_eq!(wire_rate(48_000, nonsense), 48_000);
+        }
+
+        // Through the source: at 1.5× the tempo stage pulls 72 000 frames of a
+        // 48 kHz track per second, and that is the rate the frontend paces by.
+        let tap = test_tap();
+        tap.set_speed(1.5);
+        let samples = noise(CHUNK_SAMPLES, 3);
+        let (source, _enabled) = wrap(buffer(2, samples.clone()), tap.clone());
+        source.for_each(drop);
+        tap.set_speed(1.0);
+        let (source, _enabled) = wrap(buffer(2, samples.clone()), tap.clone());
+        source.for_each(drop);
+        let frames = drain(&tap);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(decode(&frames[0]), (72_000, 2, samples.clone()));
+        assert_eq!(decode(&frames[1]), (48_000, 2, samples));
     }
 
     #[test]
@@ -1057,15 +1279,9 @@ mod tests {
         let tap = Arc::new(VisualizerTap::new());
         assert!(!tap.is_active());
         let subscribe = |label: &str| {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>();
-            let channel = tauri::ipc::Channel::new(move |body| {
-                if let tauri::ipc::InvokeResponseBody::Raw(bytes) = body {
-                    let _ = tx.send(bytes);
-                }
-                Ok(())
-            });
+            let (channel, rx) = recording_channel();
             let id = channel.id();
-            tap.subscribe(label.to_string(), channel);
+            tap.subscribe(label.to_string(), TapConsumer::Visualizer, channel);
             (id, rx)
         };
         let (main_id, main_rx) = subscribe("main");

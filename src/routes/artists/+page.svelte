@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount } from "svelte";
   import { VList } from "virtua/svelte";
   import { api } from "#lib/api.js";
+  import { appendPage, pageUntil, type PagedList } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import AlphabetRail from "#lib/components/AlphabetRail.svelte";
   import Cover from "#lib/components/Cover.svelte";
@@ -10,7 +11,7 @@
   import { contextMenuKey } from "#lib/menu.js";
   import { apiLibrary } from "#lib/api/library.js";
   import { player } from "#lib/state/player.svelte.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { layoutPreferences } from "#lib/state/layout.svelte.js";
   import type { ArtistDto } from "#lib/types.js";
@@ -28,16 +29,27 @@
           action: () => player.run(api.playInstantMix(artist.id)),
         },
         {
-          label: m.favorite_add(),
+          label: artist.isFavorite ? m.favorite_remove() : m.favorite_add(),
           icon: "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z",
-          action: () =>
-            apiLibrary
-              .setFavorite(artist.id, true)
-              .then(() => toast.show(m.favorite_added()))
-              .catch((err) => (player.error = String(err))),
+          action: () => toggleFavorite(artist),
         },
       ],
     };
+  }
+
+  // Optimistic like the album menu: flip the card's DTO (it is reactive), and
+  // flip it back if the server refuses. The cards show no heart, so the toast
+  // is the feedback.
+  function toggleFavorite(artist: ArtistDto) {
+    const next = !artist.isFavorite;
+    artist.isFavorite = next;
+    apiLibrary
+      .setFavorite(artist.id, next)
+      .then(() => toast.show(next ? m.favorite_added() : m.favorite_removed()))
+      .catch((err) => {
+        artist.isFavorite = !next;
+        player.error = String(err);
+      });
   }
 
   const PAGE_SIZE = 100;
@@ -52,6 +64,11 @@
   let staleHint = $state(false);
   /** Bumped on a library refresh so an in-flight page discards itself. */
   let reloadSeq = 0;
+  /** Bumped by every letter jump and by a refresh: an older jump stops paging
+   *  and must not scroll anywhere after that. */
+  let jumpSeq = 0;
+  /** The page fetch in flight, so a letter jump can wait for it. */
+  let pending: Promise<boolean> | null = null;
 
   const hasMore = $derived(total === null || artists.length < total);
   const cols = $derived(
@@ -65,25 +82,31 @@
     return chunked;
   });
 
-  async function loadMore(): Promise<boolean> {
-    if (loading || !hasMore) return false;
+  function loadMore(): Promise<boolean> {
+    if (loading || !hasMore) return Promise.resolve(false);
+    pending = fetchPage();
+    return pending;
+  }
+
+  async function fetchPage(): Promise<boolean> {
     const seq = reloadSeq;
     loading = true;
     error = null;
     try {
       const page = await api.getArtists(artists.length, PAGE_SIZE);
       if (seq !== reloadSeq) return false; // a library refresh superseded this
-      // Items can shift between page fetches; duplicate keys would crash the
-      // keyed list.
-      const seen = new Set(artists.map((a) => a.id));
-      artists = [...artists, ...page.items.filter((i) => !seen.has(i.id))];
-      total = page.total;
-      return true;
+      const merged = appendPage(artists, page.items, page.total, (artist) => artist.id);
+      artists = merged.items;
+      total = merged.total;
+      return merged.grew;
     } catch (e) {
       if (seq === reloadSeq) error = String(e);
       return false;
     } finally {
-      if (seq === reloadSeq) loading = false;
+      if (seq === reloadSeq) {
+        loading = false;
+        pending = null;
+      }
     }
   }
 
@@ -98,20 +121,26 @@
     }
   }
 
+  const paged: PagedList = {
+    length: () => artists.length,
+    hasMore: () => hasMore,
+    pending: () => pending,
+    loadMore,
+  };
+
   async function jumpToLetter(letter: string) {
+    const jump = ++jumpSeq;
+    const current = () => jump === jumpSeq;
     try {
       const index = letter === "#" ? 0 : await api.letterIndex("artists", letter);
-      // Page in until the target row exists; bail when a fetch fails or the
-      // list stops growing (end reached / concurrent load in progress).
-      while (artists.length <= index && hasMore) {
-        const before = artists.length;
-        if (!(await loadMore()) || artists.length === before) break;
-      }
+      // Page in until the target row exists, then scroll there, unless a
+      // later letter took over meanwhile.
+      if (!(await pageUntil(index, paged, current))) return;
       list?.scrollToIndex(Math.floor(Math.min(index, Math.max(artists.length - 1, 0)) / cols), {
         align: "start",
       });
     } catch (e) {
-      error = String(e);
+      if (current()) error = String(e);
     }
   }
 
@@ -122,6 +151,7 @@
   function refresh() {
     staleHint = false;
     reloadSeq++;
+    jumpSeq++; // a jump's row number belongs to the list being replaced
     artists = [];
     total = null;
     loading = false;
@@ -129,15 +159,10 @@
     loadMore().then((ok) => ok && maybeLoadMore());
   }
 
-  // Reload live near the top, else offer a refresh pill. Only
-  // `library.revision` is tracked; the reload's state reads are untracked.
-  $effect(() => {
-    const rev = library.revision;
-    untrack(() => {
-      if (rev === 0) return;
-      if (!list || list.getScrollOffset() < 400) refresh();
-      else staleHint = true;
-    });
+  // Reload live near the top, else offer a refresh pill.
+  onLibraryChange(() => {
+    if (!list || list.getScrollOffset() < 400) refresh();
+    else staleHint = true;
   });
 </script>
 

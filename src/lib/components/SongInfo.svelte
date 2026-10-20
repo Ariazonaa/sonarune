@@ -2,6 +2,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { api } from "#lib/api.js";
   import { keyName } from "#lib/musicalKey.js";
+  import { modalFocus } from "#lib/modal.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
   import { portal } from "#lib/portal.js";
@@ -49,9 +50,17 @@
       });
   });
 
+  /** `value` with exactly `digits` decimals, in the UI language ("44,1" in German). */
+  function decimal(value: number, digits: number): string {
+    return new Intl.NumberFormat(getLocale(), {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(value);
+  }
+
   function formatSize(bytes: number): string {
     const mb = bytes / (1024 * 1024);
-    return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
+    return mb >= 1024 ? `${decimal(mb / 1024, 2)} GB` : `${decimal(mb, 1)} MB`;
   }
   const channelsLabel = (n: number) =>
     n === 1 ? m.info_channels_mono() : n === 2 ? m.info_channels_stereo() : String(n);
@@ -64,7 +73,7 @@
       if (i.codec) r.push({ label: m.info_codec(), value: i.codec.toUpperCase() });
       if (i.bitrateKbps) r.push({ label: m.info_bitrate(), value: `${i.bitrateKbps} kbps` });
       if (i.sampleRateHz)
-        r.push({ label: m.info_sample_rate(), value: `${(i.sampleRateHz / 1000).toFixed(1)} kHz` });
+        r.push({ label: m.info_sample_rate(), value: `${decimal(i.sampleRateHz / 1000, 1)} kHz` });
       if (i.bitDepth) r.push({ label: m.info_bit_depth(), value: `${i.bitDepth}-bit` });
       if (i.channels) r.push({ label: m.info_channels(), value: channelsLabel(i.channels) });
       if (i.container) r.push({ label: m.info_container(), value: i.container.toUpperCase() });
@@ -92,21 +101,27 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<!-- The wrapper stays in place; the overlay moves to <body> (see portal.ts). -->
+<!-- The wrapper stays in place; the overlay moves to <body> (see portal.ts).
+     Opened from a row's menu, focus would otherwise go back to that row
+     behind the backdrop, and Space or Enter would play it. The dialog takes
+     focus itself — it is something to read, not a form. -->
 <div class="contents">
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
   {@attach portal}
+  {@attach modalFocus}
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
   onclick={(e) => {
     if (e.target === e.currentTarget) onclose();
   }}
 >
   <div
-    class="overlay w-full max-w-md rounded-overlay p-5"
+    class="overlay w-full max-w-md rounded-overlay p-5 outline-none"
     role="dialog"
     aria-modal="true"
     aria-label={m.track_info_title()}
+    tabindex="-1"
+    data-autofocus
   >
     <div class="mb-4 flex items-start justify-between gap-3">
       <div class="min-w-0">

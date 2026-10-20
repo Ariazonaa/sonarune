@@ -1,15 +1,23 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { VList } from "virtua/svelte";
   import { goto } from "$app/navigation";
   import { api, formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { autoDjReasonLabel } from "#lib/autoDjReason.js";
   import { m } from "#lib/paraglide/messages.js";
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { downloads } from "#lib/state/downloads.svelte.js";
   import { playlists } from "#lib/state/playlists.svelte.js";
-  import { listFlip, uniqueRowKeys } from "#lib/motion.js";
-  import { currentPosition, playOrder } from "#lib/queueOrder.js";
+  import { FLIP_ROW_LIMIT, listFlip, uniqueRowKeys } from "#lib/motion.js";
+  import {
+    currentPosition,
+    playOrder,
+    playOrderItemIds,
+    stopsAfter,
+    type QueueEntry,
+  } from "#lib/queueOrder.js";
   import { contextMenuKey } from "#lib/menu.js";
   import Cover from "./Cover.svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -26,18 +34,47 @@
   const entries = $derived(playOrder(queue));
   const currentPos = $derived(currentPosition(queue, entries));
 
+  // A queue past the FLIP limit (a played smart view runs to thousands of
+  // tracks) renders only the rows in view: building every row with its cover
+  // takes seconds there, and so does each track change that touches them all.
+  // A shorter queue stays a plain list, whose reorders animate — past the
+  // limit listFlip does not animate anyway.
+  const virtual = $derived(entries.length > FLIP_ROW_LIMIT);
+  let vlist = $state<VList<QueueEntry> | null>(null);
+  /** How far (in rows) the long list still scrolls smoothly to the playing
+   *  track; farther, it jumps. A few panel heights. */
+  const SMOOTH_SCROLL_ROWS = 50;
+
   // Scrolling to what is playing. The row is found in the DOM rather than
   // bound: only one row at a time is the current one, and which row that is
-  // changes with every track.
-  let listEl = $state<HTMLUListElement | null>(null);
+  // changes with every track. The long list keeps it mounted wherever it is
+  // scrolled (see `pinnedRows`).
+  let listEl = $state<HTMLElement | null>(null);
   let currentOffscreen = $state(false);
   const currentRow = () => listEl?.querySelector<HTMLElement>('[data-current="true"]') ?? null;
 
   /** Put the playing entry in the middle of the panel. Instant when the panel
    *  just opened — an animation out of nowhere reads as the list moving by
-   *  itself — and smooth when someone asked for it and can follow the motion. */
+   *  itself — and smooth when someone asked for it and can follow the motion.
+   *  Only the list scrolls: scrollIntoView would scroll every container above
+   *  it too, the app shell included. */
   function revealCurrent(behavior: ScrollBehavior) {
-    currentRow()?.scrollIntoView({ block: "center", behavior });
+    if (virtual) {
+      if (currentPos < 0 || !vlist) return;
+      // Smooth only over a short way: a long smooth scroll mounts every row
+      // it passes, the very cost the long list exists to avoid.
+      const first = vlist.findItemIndex(vlist.getScrollOffset());
+      const near = Math.abs(currentPos - first) <= SMOOTH_SCROLL_ROWS;
+      vlist.scrollToIndex(currentPos, { align: "center", smooth: behavior === "smooth" && near });
+      return;
+    }
+    const list = listEl;
+    const row = currentRow();
+    if (!list || !row) return;
+    const listTop = list.getBoundingClientRect().top + list.clientTop;
+    const box = row.getBoundingClientRect();
+    const top = list.scrollTop + box.top - listTop - (list.clientHeight - box.height) / 2;
+    list.scrollTo({ top, behavior });
   }
 
   onMount(() => revealCurrent("instant"));
@@ -72,6 +109,20 @@
     if (follow) void tick().then(() => revealCurrent("smooth"));
   });
 
+  // Growing past the limit (Auto-DJ appending, say) or shrinking back swaps
+  // the list for the other kind, which starts at the top: a playing row that
+  // was in view goes back into view.
+  let shownVirtual: boolean | null = null;
+  $effect(() => {
+    const mode = virtual;
+    if (shownVirtual === null || mode === shownVirtual) {
+      shownVirtual = mode;
+      return;
+    }
+    shownVirtual = mode;
+    if (!currentOffscreen) void tick().then(() => revealCurrent("instant"));
+  });
+
   // "Jump to the playing track" from the palette or the shortcut. The panel
   // may have been opened by that same request, and then `onMount` has already
   // put the row in place — hence the counter: only a change means jump.
@@ -87,23 +138,19 @@
   const ICON_STOP =
     "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16zM9 9h6v6H9V9z";
 
-  let menu = $state<{ x: number; y: number; items: ContextMenuItem[]; label?: string } | null>(null);
+  let menu = $state<{ x: number; y: number; items: ContextMenuItem[]; label?: string; trigger?: HTMLElement } | null>(null);
   let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
   let info = $state<{ itemId: string; name: string } | null>(null);
 
-  function autoDjReason(track: QueueTrack): string | null {
-    if (!track.autoDjReason) return null;
-    const kind = {
-      track: m.settings_autodj_seed_track(),
-      artist: m.settings_autodj_seed_artist(),
-      genre: m.settings_autodj_seed_genre(),
-      album: m.settings_autodj_seed_album(),
-      playlist: m.settings_autodj_seed_playlist(),
-    }[track.autoDjReason.kind];
-    return track.autoDjReason.label
-      ? m.queue_autodj_reason_detail({ kind, label: track.autoDjReason.label })
-      : m.queue_autodj_reason({ kind });
-  }
+  // The stop, read once for the whole list: the player state is replaced on
+  // every 400 ms tick, and a row reading it would re-run with each one. Plain
+  // values, so a row re-runs only when the stop itself changes.
+  const armedStop = $derived(player.state.stopAfter);
+  const armedStopEntry = $derived(player.state.stopAfterEntry);
+  const armedStopItem = $derived(player.state.stopAfterItem);
+  const armedStopTitle = $derived(
+    player.state.stopAfter === "album" ? m.queue_stop_after_album() : m.queue_stop_after_track(),
+  );
 
   // Inline "save queue as playlist" naming state.
   let naming = $state(false);
@@ -111,7 +158,8 @@
 
   async function saveAsPlaylist() {
     const name = playlistName.trim();
-    const trackIds = player.queue.tracks.map((t) => t.itemId);
+    // As the list shows it: under shuffle, the shuffled and rearranged order.
+    const trackIds = playOrderItemIds(player.queue);
     naming = false;
     playlistName = "";
     if (!name || trackIds.length === 0) return;
@@ -125,10 +173,17 @@
   }
 
   function openQueueMenu(event: MouseEvent) {
-    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const trigger = event.currentTarget as HTMLElement;
+    // The button toggles its menu: a press on it does not count as outside.
+    if (menu?.trigger === trigger) {
+      menu = null;
+      return;
+    }
+    const rect = trigger.getBoundingClientRect();
     menu = {
       x: rect.left,
       y: rect.bottom + 4,
+      trigger,
       label: m.queue_more_actions(),
       items: [
         {
@@ -178,23 +233,24 @@
           // Armed on this row already? Then the entry takes it back off —
           // otherwise there would be no way to undo it from here.
           label:
-            player.state.stopAfter === "track" && player.state.stopAfterItem === track.itemId
+            player.state.stopAfter === "track" && stopsAfter(player.state, track)
               ? m.queue_stop_after_track_off()
               : m.queue_stop_after_track(),
           icon: ICON_STOP,
           action: () =>
             player.run(
               api.playerSetStopAfter(
-                player.state.stopAfter === "track" && player.state.stopAfterItem === track.itemId
+                player.state.stopAfter === "track" && stopsAfter(player.state, track)
                   ? "off"
                   : "track",
                 track.itemId,
+                track.entryId,
               ),
             ),
         },
         {
           label:
-            player.state.stopAfter === "album" && player.state.stopAfterItem === track.itemId
+            player.state.stopAfter === "album" && stopsAfter(player.state, track)
               ? m.queue_stop_after_album_off()
               : m.queue_stop_after_album(),
           icon: ICON_STOP,
@@ -202,10 +258,11 @@
           action: () =>
             player.run(
               api.playerSetStopAfter(
-                player.state.stopAfter === "album" && player.state.stopAfterItem === track.itemId
+                player.state.stopAfter === "album" && stopsAfter(player.state, track)
                   ? "off"
                   : "album",
                 track.itemId,
+                track.entryId,
               ),
             ),
         },
@@ -241,7 +298,7 @@
           icon: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
           action: () => {
             const i = liveIndex();
-            if (i >= 0) player.run(api.queueRemove(i, track.itemId));
+            if (i >= 0) player.run(api.queueRemove(i, track.itemId, track.entryId));
           },
         },
         {
@@ -283,6 +340,11 @@
   let dragFrom = $state<number | null>(null);
   let dropAt = $state<number | null>(null);
 
+  // Rows the long list keeps mounted off screen: the playing one, which the
+  // pill and the follow-the-music logic watch, and the one being dragged — a
+  // drag ends on its source row, and dragging scrolls the list.
+  const pinnedRows = $derived([currentPos, dragFrom ?? -1].filter((position) => position >= 0));
+
   function onDrop() {
     if (dragFrom !== null && dropAt !== null) {
       // queue_move uses remove-then-insert semantics: dropping below the
@@ -298,8 +360,8 @@
 
   function onDragOver(event: DragEvent, index: number) {
     event.preventDefault();
-    // Measure the row itself, not the <li>: the "up next" heading sits in the
-    // same <li> and would shift the midpoint.
+    // Measure the row itself, not the whole entry: the "up next" heading sits
+    // in the same entry and would shift the midpoint.
     const item = event.currentTarget as HTMLElement;
     const row = (item.lastElementChild as HTMLElement | null) ?? item;
     const rect = row.getBoundingClientRect();
@@ -307,7 +369,8 @@
   }
 
   // Queue entries carry a per-entry id, which survives moves — the stable
-  // key FLIP needs. Entries from older builds may lack it.
+  // key FLIP and the long list's rows need. Entries from older builds may
+  // lack it.
   const rowKeys = $derived(uniqueRowKeys(entries.map((entry) => entry.track.entryId)));
 </script>
 
@@ -322,8 +385,15 @@
         autofocus
         onblur={() => (naming = false)}
         onkeydown={(e) => {
-          if (e.key === "Enter") saveAsPlaylist();
-          else if (e.key === "Escape") naming = false;
+          // Claimed, so the view behind the panel does not act on the key
+          // too (now playing closes on an Escape nobody took).
+          if (e.key === "Enter") {
+            e.preventDefault();
+            saveAsPlaylist();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            naming = false;
+          }
         }}
       />
     {:else}
@@ -383,6 +453,89 @@
     {/if}
   </div>
 
+  <!-- One entry of the list, in either kind of list. `i` is its play-order
+       position, `index` its stored one. -->
+  {#snippet row({ track, index }: QueueEntry, i: number)}
+    <div
+      role="listitem"
+      oncontextmenu={(e) => onRowContextMenu(e, track, index)}
+      {@attach contextMenuKey}
+      draggable="true"
+      ondragstart={(e) => {
+        dragFrom = i;
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+      }}
+      ondragover={(e) => onDragOver(e, i)}
+      ondrop={onDrop}
+      ondragend={() => {
+        dragFrom = null;
+        dropAt = null;
+      }}
+    >
+      {#if i === currentPos + 1}
+        <p class="px-2 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-ink-muted">
+          {m.queue_up_next()}
+        </p>
+      {/if}
+      <div
+        data-current={index === queue.index}
+        class="group relative flex items-center gap-2 rounded-md px-2 py-1.5
+          {index === queue.index ? 'bg-panel-2' : 'hover:bg-panel-2/60'}
+          {dragFrom === i ? 'opacity-40' : ''}"
+      >
+      {#if dropAt === i && dragFrom !== null}
+        <div class="pointer-events-none absolute inset-x-1 top-0 h-0.5 rounded bg-accent"></div>
+      {/if}
+      {#if dropAt === i + 1 && dragFrom !== null}
+        <div class="pointer-events-none absolute inset-x-1 bottom-0 h-0.5 rounded bg-accent"></div>
+      {/if}
+      <button
+        class="flex min-w-0 flex-1 items-center gap-2 text-left"
+        onclick={() => player.run(api.queueJump(index))}
+      >
+        <div class="w-9 shrink-0">
+          <Cover itemId={track.imageItemId} tag={track.imageTag} size={96} alt="" blurhash={track.imageBlurHash} />
+        </div>
+        <div class="min-w-0 flex-1">
+          <p class="truncate text-sm {index === queue.index ? 'text-accent' : ''}">
+            {track.name}
+          </p>
+          <p class="truncate text-xs text-ink-muted">{track.artist}</p>
+          {#if track.autoDjReason}
+            <p class="truncate text-[10px] text-accent">{autoDjReasonLabel(track.autoDjReason)}</p>
+          {/if}
+        </div>
+      </button>
+      {#if stopsAfter({ stopAfter: armedStop, stopAfterEntry: armedStopEntry, stopAfterItem: armedStopItem }, track)}
+        <!-- The armed stop belongs on the row it was armed on: nothing
+             else in the list says where the music will end. -->
+        <span
+          class="shrink-0 text-accent"
+          title={armedStopTitle}
+          aria-label={m.queue_stop_after_armed()}
+        >
+          <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
+            <path d={ICON_STOP} />
+          </svg>
+        </span>
+      {/if}
+      <span class="text-[11px] text-ink-muted tabular-nums">
+        {formatDuration(track.durationMs)}
+      </span>
+      <button
+        class="invisible rounded p-1 text-ink-muted hover:text-ink group-hover:visible"
+        onclick={() => player.run(api.queueRemove(index, track.itemId, track.entryId))}
+        aria-label={m.queue_remove()}
+        title={m.queue_remove()}
+      >
+        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor">
+          <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+        </svg>
+      </button>
+      </div>
+    </div>
+  {/snippet}
+
   {#if queue.tracks.length === 0}
     <EmptyState
       icon="playlist"
@@ -390,97 +543,42 @@
       action={{ label: m.nav_discover(), href: "/discover" }}
       compact
     />
-  {:else}
-    <ul
+  {:else if virtual}
+    <div
       bind:this={listEl}
-      class="min-h-0 flex-1 overflow-y-auto p-2"
+      class="min-h-0 flex-1 py-2"
+      class:dragging={dragFrom !== null}
+      role="list"
       ondragleave={() => (dropAt = null)}
     >
-      {#each entries as { track, index }, i (rowKeys[i])}
-        <li
-          animate:listFlip={{ rows: entries.length }}
-          oncontextmenu={(e) => onRowContextMenu(e, track, index)}
-          {@attach contextMenuKey}
-          draggable="true"
-          ondragstart={(e) => {
-            dragFrom = i;
-            if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-          }}
-          ondragover={(e) => onDragOver(e, i)}
-          ondrop={onDrop}
-          ondragend={() => {
-            dragFrom = null;
-            dropAt = null;
-          }}
-        >
-          <!-- Inside the <li>: an animated element has to be the only child
-               of its {#each}. -->
-          {#if i === currentPos + 1}
-            <p class="px-2 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-ink-muted">
-              {m.queue_up_next()}
-            </p>
-          {/if}
-          <div
-            data-current={index === queue.index}
-            class="group relative flex items-center gap-2 rounded-md px-2 py-1.5
-              {index === queue.index ? 'bg-panel-2' : 'hover:bg-panel-2/60'}
-              {dragFrom === i ? 'opacity-40' : ''}"
-          >
-          {#if dropAt === i && dragFrom !== null}
-            <div class="pointer-events-none absolute inset-x-1 top-0 h-0.5 rounded bg-accent"></div>
-          {/if}
-          {#if dropAt === i + 1 && dragFrom !== null}
-            <div class="pointer-events-none absolute inset-x-1 bottom-0 h-0.5 rounded bg-accent"></div>
-          {/if}
-          <button
-            class="flex min-w-0 flex-1 items-center gap-2 text-left"
-            onclick={() => player.run(api.queueJump(index))}
-          >
-            <div class="w-9 shrink-0">
-              <Cover itemId={track.imageItemId} tag={track.imageTag} size={96} alt="" blurhash={track.imageBlurHash} />
-            </div>
-            <div class="min-w-0 flex-1">
-              <p class="truncate text-sm {index === queue.index ? 'text-accent' : ''}">
-                {track.name}
-              </p>
-              <p class="truncate text-xs text-ink-muted">{track.artist}</p>
-              {#if track.autoDjReason}
-                <p class="truncate text-[10px] text-accent">{autoDjReason(track)}</p>
-              {/if}
-            </div>
-          </button>
-          {#if player.state.stopAfter !== "off" && player.state.stopAfterItem === track.itemId}
-            <!-- The armed stop belongs on the row it was armed on: nothing
-                 else in the list says where the music will end. -->
-            <span
-              class="shrink-0 text-accent"
-              title={player.state.stopAfter === "album"
-                ? m.queue_stop_after_album()
-                : m.queue_stop_after_track()}
-              aria-label={m.queue_stop_after_armed()}
-            >
-              <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
-                <path d={ICON_STOP} />
-              </svg>
-            </span>
-          {/if}
-          <span class="text-[11px] text-ink-muted tabular-nums">
-            {formatDuration(track.durationMs)}
-          </span>
-          <button
-            class="invisible rounded p-1 text-ink-muted hover:text-ink group-hover:visible"
-            onclick={() => player.run(api.queueRemove(index, track.itemId))}
-            aria-label={m.queue_remove()}
-            title={m.queue_remove()}
-          >
-            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor">
-              <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
-            </svg>
-          </button>
-          </div>
-        </li>
+      <VList
+        bind:this={vlist}
+        data={entries}
+        getKey={(_, i) => rowKeys[i]}
+        keepMounted={pinnedRows}
+        class="px-2"
+        style="height: 100%;"
+      >
+        {#snippet children(entry, i)}
+          {@render row(entry, i)}
+        {/snippet}
+      </VList>
+    </div>
+  {:else}
+    <div
+      bind:this={listEl}
+      class="min-h-0 flex-1 overflow-y-auto p-2"
+      role="list"
+      ondragleave={() => (dropAt = null)}
+    >
+      {#each entries as entry, i (rowKeys[i])}
+        <!-- A wrapper for the animation alone: an animated element has to be
+             the only child of its {#each}. -->
+        <div animate:listFlip={{ rows: entries.length }}>
+          {@render row(entry, i)}
+        </div>
       {/each}
-    </ul>
+    </div>
   {/if}
 
   <!-- Only while the playing entry is scrolled out of sight: it is an offer to
@@ -501,7 +599,7 @@
 </aside>
 
 {#if menu}
-  <ContextMenu x={menu.x} y={menu.y} items={menu.items} label={menu.label} onclose={() => (menu = null)} />
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} label={menu.label} trigger={menu.trigger} onclose={() => (menu = null)} />
 {/if}
 {#if addTo}
   <AddToPlaylistMenu x={addTo.x} y={addTo.y} trackIds={addTo.trackIds} onclose={() => (addTo = null)} />
@@ -509,3 +607,14 @@
 {#if info}
   <SongInfo itemId={info.itemId} name={info.name} onclose={() => (info = null)} />
 {/if}
+
+<style>
+  /* The long list's rows box (VList's viewport > virtua's container). virtua
+     takes pointer events off it while the list scrolls, until 150 ms after the
+     last scroll — and a drag scrolls the list when it nears an edge. A row
+     that cannot be hit cannot take the drop, so while a drag runs, the rows
+     stay targets. */
+  .dragging > :global(div) > :global(div) {
+    pointer-events: auto !important;
+  }
+</style>

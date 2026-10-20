@@ -60,6 +60,25 @@ export function swapRows(order: HomeRowId[], a: HomeRowId, b: HomeRowId): HomeRo
   return next;
 }
 
+/**
+ * `order` with `id` swapped with its neighbour `delta` places away among
+ * `shown`, the rows a page actually draws; unchanged when there is no such
+ * neighbour. Stepping through the full order instead could swap with a row
+ * nobody sees (a hidden one, or one the server has nothing for) and look like
+ * nothing happened.
+ */
+export function moveAmong(
+  order: HomeRowId[],
+  shown: readonly HomeRowId[],
+  id: HomeRowId,
+  delta: number,
+): HomeRowId[] {
+  const from = shown.indexOf(id);
+  const to = from + delta;
+  if (from < 0 || to < 0 || to >= shown.length) return order;
+  return swapRows(order, id, shown[to]);
+}
+
 /** `order` with `id` moved by `delta` places, clamped to the ends. */
 export function moveRow(order: HomeRowId[], id: HomeRowId, delta: number): HomeRowId[] {
   const from = order.indexOf(id);
@@ -111,15 +130,17 @@ class HomeRowPreferences {
   }
 
   /**
-   * Move past the next *visible* row — for the home page, where that is the
-   * only movement anyone can see. Stepping one position in the full order
-   * would swap with a hidden row and look like nothing happened.
+   * Move past the neighbouring row the home page draws (`shown`: visible and
+   * not empty), the only movement anyone can see there.
    */
-  moveAmongVisible(id: HomeRowId, delta: number) {
-    const visible = this.visible;
-    const to = visible.indexOf(id) + delta;
-    if (visible.indexOf(id) < 0 || to < 0 || to >= visible.length) return;
-    this.#save({ ...this.#prefs, order: swapRows(this.#prefs.order, id, visible[to]) });
+  moveAmong(id: HomeRowId, delta: number, shown: readonly HomeRowId[]) {
+    const order = moveAmong(this.#prefs.order, shown, id, delta);
+    if (order !== this.#prefs.order) this.#save({ ...this.#prefs, order });
+  }
+
+  /** Bring every hidden row back, in the order they have. */
+  showAll() {
+    this.#save({ ...this.#prefs, hidden: [] });
   }
 
   reset() {

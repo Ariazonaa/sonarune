@@ -36,11 +36,13 @@
 //! cache-busting parameter on every check would cost everyone a cached
 //! response to spare one person a few minutes once per release.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, Updater, UpdaterExt};
+use tauri_plugin_window_state::AppHandleExt;
 
 use crate::error::{AppError, AppResult};
 use crate::player::PlaybackStatus;
@@ -101,21 +103,104 @@ impl From<UpdateError> for AppError {
     }
 }
 
+/// Which step of an update failed. The plugin reports a dropped connection as
+/// the same `Reqwest` error whether it was asking for `latest.json` or halfway
+/// through the installer, and the two call for different advice.
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    /// Asking the endpoint what the current release is.
+    Check,
+    /// Fetching the installer and checking its signature.
+    Download,
+    /// Writing the installer out and starting it.
+    Install,
+}
+
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Check => "update check",
+            Phase::Download => "update download",
+            Phase::Install => "update install",
+        }
+    }
+}
+
 /// Sort a plugin failure into what the user can do about it, and log what
 /// actually happened -- the diagnostic export carries the log, the UI does not.
-fn classify(context: &str, error: tauri_plugin_updater::Error) -> UpdateError {
+fn classify(phase: Phase, error: tauri_plugin_updater::Error) -> UpdateError {
+    let (detail, error) = describe(error);
+    tracing::warn!("{} failed: {detail}", phase.name());
+    code_for(phase, &error)
+}
+
+/// The variants are matched by name, and the plugin's `Error` is
+/// `#[non_exhaustive]`: check the arms again whenever the plugin is updated.
+fn code_for(phase: Phase, error: &tauri_plugin_updater::Error) -> UpdateError {
     use tauri_plugin_updater::Error as E;
-    tracing::warn!("{context}: {error}");
     match error {
-        E::ReleaseNotFound
-        | E::TargetNotFound(_)
-        | E::TargetsNotFound(_)
-        | E::UnsupportedArch
-        | E::UnsupportedOs => UpdateError::NoRelease,
-        E::Reqwest(_) | E::Network(_) => UpdateError::Offline,
-        E::Minisign(_) | E::SignatureUtf8(_) | E::Base64(_) => UpdateError::Signature,
-        E::EmptyEndpoints => UpdateError::Unavailable,
-        _ => UpdateError::Download,
+        E::EmptyEndpoints | E::InsecureTransportProtocol => UpdateError::Unavailable,
+        // A signed version that differs from the announced one is the
+        // plugin's own detection of a manifest that pairs a new version
+        // number with another release's file.
+        E::Minisign(_)
+        | E::SignatureUtf8(_)
+        | E::Base64(_)
+        | E::SignedVersionMismatch { .. }
+        | E::MissingSignedVersion => UpdateError::Signature,
+        _ => match phase {
+            Phase::Check => match error {
+                // `latest.json` arrived but is not JSON.
+                E::Reqwest(e) if e.is_decode() => UpdateError::NoRelease,
+                E::Reqwest(_) | E::Network(_) => UpdateError::Offline,
+                // No release for this platform, or a manifest that does not
+                // read as one (a bad date, a missing url or signature).
+                _ => UpdateError::NoRelease,
+            },
+            Phase::Download => match error {
+                // The release names an installer that is not there (renamed,
+                // deleted, forbidden): retrying cannot help, the releases page
+                // can.
+                E::Network(message)
+                    if http_status(message).is_some_and(|status| (400..500).contains(&status)) =>
+                {
+                    UpdateError::NoRelease
+                }
+                // The check reached the endpoint moments ago; a failure now is
+                // the transfer itself.
+                _ => UpdateError::Download,
+            },
+            Phase::Install => UpdateError::Install,
+        },
+    }
+}
+
+/// The status code in the plugin's download failure, "Download request failed
+/// with status: 404 Not Found".
+fn http_status(message: &str) -> Option<u16> {
+    let (_, rest) = message.split_once("status: ")?;
+    rest.get(..3)?.parse().ok()
+}
+
+/// The log line for a failure. reqwest's own text names the URL, which makes
+/// the diagnostics ring drop the whole line (`diagnostics::redact_log_line`),
+/// and leaves out the cause — DNS, a refused connection, TLS, a proxy — that
+/// the export exists to answer. The error is handed back for sorting.
+fn describe(error: tauri_plugin_updater::Error) -> (String, tauri_plugin_updater::Error) {
+    use tauri_plugin_updater::Error as E;
+    match error {
+        E::Reqwest(error) => {
+            let error = error.without_url();
+            let mut detail = error.to_string();
+            let mut cause = std::error::Error::source(&error);
+            while let Some(inner) = cause {
+                detail.push_str(": ");
+                detail.push_str(&inner.to_string());
+                cause = inner.source();
+            }
+            (detail, E::Reqwest(error))
+        }
+        error => (error.to_string(), error),
     }
 }
 
@@ -151,25 +236,144 @@ struct ProgressEvent {
     total: Option<u64>,
 }
 
-/// An updater whose exit hook leaves the app in a clean state: the installer
-/// kills this process, so the last playback report and any running download
-/// have to be dealt with first — the same order as the quit path.
+/// An updater whose exit hook hands the app over to the installer (see
+/// [`hand_over`]).
 fn updater(app: &AppHandle) -> Result<Updater, UpdateError> {
     let handle = app.clone();
     app.updater_builder()
-        .on_before_exit(move || {
-            crate::flush_before_exit(&handle);
-            handle.cleanup_before_exit();
-        })
+        .on_before_exit(move || hand_over(&handle))
         .build()
-        .map_err(|e| classify("updater unavailable", e))
+        .map_err(|e| classify(Phase::Check, e))
+}
+
+/// Whether this process is being handed over to the installer: set by
+/// [`hand_over`], cleared by [`recover_from_failed_launch`] when the launch
+/// fails. A type of its own so the tests can have one without touching the
+/// app's.
+struct HandOverFlag(AtomicBool);
+
+impl HandOverFlag {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    fn begin(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Ends a hand-over, and says whether one was under way: an install that
+    /// failed before the hook (writing the installer out) took nothing away
+    /// that would need giving back.
+    fn end(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+static HAND_OVER: HandOverFlag = HandOverFlag::new();
+
+/// Whether the installer is about to end the process. The player starts no
+/// track meanwhile (`Worker::start_current`): the hand-over begins with the
+/// final reports, the window stays usable and media keys still reach the
+/// player, and a track begun after them would be cut off a moment later, its
+/// start reported to a server that never hears it stop.
+pub(crate) fn handing_over() -> bool {
+    HAND_OVER.is_set()
+}
+
+/// How long the hand-over waits for the main thread to save the window
+/// geometry. The save itself takes milliseconds; this only bounds a main
+/// thread that is busy with something else.
+const WINDOW_STATE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run `job` through `queue` and wait for its result, but no longer than
+/// `timeout`. `None` when it could not be queued or did not finish in time; a
+/// job that runs late still runs, with nobody waiting for it any more.
+fn run_bounded<T: Send + 'static>(
+    queue: impl FnOnce(Box<dyn FnOnce() + Send>) -> tauri::Result<()>,
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: Duration,
+) -> Option<T> {
+    // Room for the result, so a job that runs inline (`run_on_main_thread`
+    // called on the main thread) does not wait on its own send.
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    queue(Box::new(move || {
+        let _ = done.send(job());
+    }))
+    .ok()?;
+    result.recv_timeout(timeout).ok()
+}
+
+/// The window-state plugin writes its file only when the event loop exits,
+/// which an update never gets to. The save runs on the main thread: the
+/// plugin keeps its cache locked while it asks each window for its geometry,
+/// and asked from any other thread, every one of those questions waits for
+/// the main thread — which blocks on that same lock as soon as it handles a
+/// move, resize or close of a window first, and the app hangs. On the main
+/// thread they are answered inline, as on the plugin's own save at exit.
+fn save_window_geometry(app: &AppHandle) {
+    let handle = app.clone();
+    let saved = run_bounded(
+        |task| app.run_on_main_thread(task),
+        move || handle.save_window_state(crate::WINDOW_STATE_FLAGS),
+        WINDOW_STATE_TIMEOUT,
+    );
+    match saved {
+        Some(Ok(())) => {}
+        Some(Err(e)) => tracing::debug!("saving the window state before the update failed: {e}"),
+        None => tracing::debug!("the window state was not saved before the update in time"),
+    }
+}
+
+/// Get the app ready to be ended by the installer. The plugin calls this right
+/// before it starts the installer and ends the process with
+/// `std::process::exit` right after — no event loop exit, so nothing of what
+/// quitting does happens on its own: the last playback report, the downloads,
+/// the window geometry and the tray icon are dealt with here.
+///
+/// Unlike quitting, all of it has to be undoable. The launch can still fail
+/// (Smart App Control or an antivirus holding the fresh, unsigned installer,
+/// an AppLocker rule on the temp folder), and then the process carries on:
+/// the player thread must not be gone, nor the windows torn down
+/// (`cleanup_before_exit`), and [`recover_from_failed_launch`] gives the rest
+/// back.
+///
+/// Runs on the install task's blocking thread, not on the main thread, which
+/// has work to do meanwhile: the window save runs there, and the player's last
+/// state update reaches the tray through it while this waits for the reports.
+fn hand_over(app: &AppHandle) {
+    // First, so nothing can start playing between the final reports and the
+    // end of the process (see `handing_over`).
+    HAND_OVER.begin();
+    save_window_geometry(app);
+    // The same final reports as quitting sends — Jellyfin's "stopped", the
+    // ListenBrainz listen, the history row — but the player thread stays.
+    if let Some(state) = app.try_state::<AppState>() {
+        state.player.stop_and_report(Duration::from_millis(2500));
+    }
+    if let Some(downloads) = app.try_state::<crate::download::DownloadManager>() {
+        downloads.cancel_all();
+    }
+    crate::tray::set_icon_visible(app, false);
+}
+
+/// The installer did not start: give back what [`hand_over`] took away from
+/// a process that keeps running. Playback stays stopped but can be started
+/// again, and the downloads it cancelled can be retried from their panel.
+fn recover_from_failed_launch(app: &AppHandle) {
+    if HAND_OVER.end() {
+        crate::tray::set_icon_visible(app, true);
+    }
 }
 
 async fn check(app: &AppHandle) -> Result<Option<Update>, UpdateError> {
     updater(app)?
         .check()
         .await
-        .map_err(|e| classify("update check failed", e))
+        .map_err(|e| classify(Phase::Check, e))
 }
 
 /// Whether this copy was installed rather than unpacked from the portable zip.
@@ -230,6 +434,24 @@ fn refuse_while_playing(app: &AppHandle) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// What the last check that reached the UI said: the background check's
+/// announcement or a check from Settings. The announcement is a single event,
+/// 20 s after start — with the window hidden or minimized it goes out to a
+/// suspended WebView — so the UI reads this back when it comes up or back
+/// (`get_known_update`).
+static LAST_ANSWER: std::sync::Mutex<Option<UpdateInfo>> = std::sync::Mutex::new(None);
+
+fn remember(info: &UpdateInfo) {
+    *LAST_ANSWER.lock().unwrap() = Some(info.clone());
+}
+
+/// The last answer, without asking the endpoint again. `None` until a check
+/// found something to announce or ran from Settings.
+#[tauri::command]
+pub fn get_known_update() -> Option<UpdateInfo> {
+    LAST_ANSWER.lock().unwrap().clone()
+}
+
 /// Ask the endpoint what the current version is. Errors are the network's, not
 /// the app's: the caller shows them, nothing else changes.
 #[tauri::command]
@@ -246,14 +468,17 @@ pub async fn check_for_update(app: AppHandle) -> AppResult<UpdateInfo> {
         ),
         None => tracing::info!("checked for updates: nothing newer"),
     }
-    Ok(info(&app, update.as_ref()))
+    let answer = info(&app, update.as_ref());
+    remember(&answer);
+    Ok(answer)
 }
 
 /// Download the update, verify its signature, and hand it to the installer.
 ///
 /// On Windows this does not return: the installer is launched and the process
-/// exits through the hook in [`updater`]. The frontend therefore sees the
+/// exits right after the hook in [`updater`]. The frontend therefore sees the
 /// window close, which is what the confirmation before it says will happen.
+/// It returns only when the installer could not be started.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> AppResult<()> {
     if !installed_copy() {
@@ -274,16 +499,21 @@ pub async fn install_update(app: AppHandle) -> AppResult<()> {
             || {},
         )
         .await
-        .map_err(|e| classify("update download failed", e))?;
+        .map_err(|e| classify(Phase::Download, e))?;
 
     // The download runs for a while; playback may have started in it.
     refuse_while_playing(&app)?;
 
     tracing::info!(version = %update.version, "installing update");
-    update.install(bytes).map_err(|e| {
-        classify("update install failed", e);
-        AppError::from(UpdateError::Install)
-    })
+    // Blocking from here on: the hook waits for the player's final reports,
+    // and the plugin writes the installer out before starting it.
+    let installed = tauri::async_runtime::spawn_blocking(move || update.install(bytes)).await;
+    // Still running, so the installer did not start — also when the task
+    // itself fell over, which must not leave playback held either.
+    recover_from_failed_launch(&app);
+    installed
+        .map_err(|e| AppError::Other(format!("update install task failed: {e}")))?
+        .map_err(|e| classify(Phase::Install, e).into())
 }
 
 /// Check once, quietly, a while after startup, and tell the UI only when there
@@ -296,7 +526,9 @@ pub fn check_in_background(app: &AppHandle) {
         match check(&app).await {
             Ok(Some(update)) => {
                 tracing::info!(version = %update.version, "update available");
-                let _ = app.emit("updater:available", info(&app, Some(&update)));
+                let answer = info(&app, Some(&update));
+                remember(&answer);
+                let _ = app.emit("updater:available", answer);
             }
             Ok(None) => tracing::debug!("no update available"),
             // `classify` already logged it; a failed background check is
@@ -311,6 +543,10 @@ mod tests {
     //! The updater's configuration decides whether an update can be verified
     //! at all, and a missing field shows up only in a shipped build — where a
     //! wrong answer means either no updates or, worse, unchecked ones.
+
+    use super::{code_for, describe, http_status, run_bounded, HandOverFlag, Phase, UpdateError};
+    use std::time::{Duration, Instant};
+    use tauri_plugin_updater::Error as E;
 
     fn updater_config() -> serde_json::Value {
         let config: serde_json::Value =
@@ -368,5 +604,190 @@ mod tests {
     #[test]
     fn downgrades_stay_off() {
         assert!(updater_config()["allowDowngrades"].is_null());
+    }
+
+    #[test]
+    fn the_last_answer_waits_for_a_ui_that_missed_it() {
+        let answer = super::UpdateInfo {
+            current_version: "0.6.1".into(),
+            version: Some("0.6.2".into()),
+            notes: None,
+            date: None,
+            installable: true,
+        };
+        super::remember(&answer);
+        let known = super::get_known_update().expect("remembered");
+        assert_eq!(known.version.as_deref(), Some("0.6.2"));
+        assert_eq!(known.current_version, "0.6.1");
+    }
+
+    /// `latest.json` is not signed, only the installer is. Without this a
+    /// manifest could pair a new version number with an older installer whose
+    /// signature carries no version. The CLI that signs the releases (2.11.5+)
+    /// records the version in the signature's trusted comment.
+    #[test]
+    fn the_signed_version_is_required() {
+        assert_eq!(updater_config()["requireSignedVersion"], true);
+    }
+
+    fn wire(e: UpdateError) -> String {
+        crate::error::AppError::from(e).to_string()
+    }
+
+    fn code(phase: Phase, error: &E) -> String {
+        wire(code_for(phase, error))
+    }
+
+    /// An error with a URL and a cause, as a failed connection produces it.
+    async fn refused_request() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("http://127.0.0.1:0/releases/latest/download/latest.json")
+            .send()
+            .await
+            .expect_err("nothing listens on port 0")
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_means_offline_only_while_checking() {
+        let check = E::Reqwest(refused_request().await);
+        assert_eq!(code(Phase::Check, &check), "update:offline");
+        // After a successful check, the same failure is the download breaking
+        // off — not "the releases page could not be reached".
+        let download = E::Reqwest(refused_request().await);
+        assert_eq!(code(Phase::Download, &download), "update:download");
+    }
+
+    #[test]
+    fn a_missing_installer_points_to_the_releases_page() {
+        let missing = E::Network("Download request failed with status: 404 Not Found".into());
+        assert_eq!(code(Phase::Download, &missing), "update:no-release");
+        let forbidden = E::Network("Download request failed with status: 403 Forbidden".into());
+        assert_eq!(code(Phase::Download, &forbidden), "update:no-release");
+        let server = E::Network("Download request failed with status: 502 Bad Gateway".into());
+        assert_eq!(code(Phase::Download, &server), "update:download");
+        assert_eq!(
+            http_status("Download request failed with status: 404 Not Found"),
+            Some(404)
+        );
+        assert_eq!(http_status("no status here"), None);
+    }
+
+    #[test]
+    fn signature_failures_are_reported_as_such() {
+        let mismatch = E::SignedVersionMismatch {
+            signed: "0.6.0".into(),
+            announced: "0.6.2".into(),
+        };
+        assert_eq!(code(Phase::Download, &mismatch), "update:signature");
+        assert_eq!(
+            code(Phase::Download, &E::MissingSignedVersion),
+            "update:signature"
+        );
+        assert_eq!(
+            code(Phase::Download, &E::SignatureUtf8("x".into())),
+            "update:signature"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_manifest_is_no_release_not_a_broken_download() {
+        let unreadable = E::Serialization(serde_json::from_str::<u32>("{").unwrap_err());
+        assert_eq!(code(Phase::Check, &unreadable), "update:no-release");
+        assert_eq!(code(Phase::Check, &E::ReleaseNotFound), "update:no-release");
+        assert_eq!(
+            code(Phase::Check, &E::TargetNotFound("windows-x86_64".into())),
+            "update:no-release"
+        );
+        assert_eq!(code(Phase::Check, &E::EmptyEndpoints), "update:unavailable");
+    }
+
+    #[test]
+    fn a_failed_launch_is_an_install_failure() {
+        let blocked = E::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(code(Phase::Install, &blocked), "update:install");
+    }
+
+    #[test]
+    fn a_failed_launch_gives_back_only_what_the_hand_over_took() {
+        let flag = HandOverFlag::new();
+        // Writing the installer out failed: the hook never ran, the tray icon
+        // was never taken down.
+        assert!(!flag.end());
+        flag.begin();
+        assert!(flag.is_set());
+        assert!(flag.end());
+        assert!(!flag.is_set(), "playback has to be possible again");
+        assert!(!flag.end());
+    }
+
+    #[test]
+    fn a_main_thread_that_never_gets_to_the_save_cannot_hold_up_the_hand_over() {
+        let parked = std::sync::Mutex::new(Vec::new());
+        let started = Instant::now();
+        let saved = run_bounded(
+            |task| {
+                parked.lock().unwrap().push(task);
+                Ok(())
+            },
+            || "saved",
+            Duration::from_millis(50),
+        );
+        assert_eq!(saved, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_save_on_the_other_thread_reports_back() {
+        let saved = run_bounded(
+            |task| {
+                std::thread::spawn(task);
+                Ok(())
+            },
+            || "saved",
+            Duration::from_secs(10),
+        );
+        assert_eq!(saved, Some("saved"));
+    }
+
+    #[test]
+    fn a_save_that_runs_inline_does_not_wait_on_itself() {
+        // What `run_on_main_thread` does when called on the main thread.
+        let saved = run_bounded(
+            |task| {
+                task();
+                Ok(())
+            },
+            || "saved",
+            Duration::ZERO,
+        );
+        assert_eq!(saved, Some("saved"));
+    }
+
+    #[test]
+    fn a_save_that_cannot_be_queued_is_not_waited_for() {
+        let started = Instant::now();
+        let saved = run_bounded(
+            |_| Err(tauri::Error::FailedToReceiveMessage),
+            || "saved",
+            Duration::from_secs(10),
+        );
+        assert_eq!(saved, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_is_logged_with_its_cause_and_without_its_url() {
+        let (detail, error) = describe(E::Reqwest(refused_request().await));
+        assert!(matches!(error, E::Reqwest(_)));
+        assert!(!detail.contains("127.0.0.1"), "{detail}");
+        assert!(!detail.contains("http"), "{detail}");
+        // reqwest's own text is just "error sending request"; the cause
+        // follows after it.
+        assert!(detail.starts_with("error sending request: "), "{detail}");
+        assert_ne!(
+            crate::diagnostics::redact_log_line(&format!("update check failed: {detail}")),
+            "[redacted sensitive log entry]",
+            "{detail}"
+        );
     }
 }

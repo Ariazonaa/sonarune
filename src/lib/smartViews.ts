@@ -1,5 +1,5 @@
 import type { SmartFilter } from "#lib/api/discovery.js";
-import type { SessionInfo } from "#lib/types.js";
+import type { GenreDto, SessionInfo } from "#lib/types.js";
 
 export interface SavedSmartView {
   id: string;
@@ -103,6 +103,53 @@ export function newSmartView(name: string, filter: SmartFilter): SavedSmartView 
     createdAt: now,
     updatedAt: now,
   };
+}
+
+/**
+ * The genre ids selected in any of `filters` that `genres` does not list, each
+ * once. Views saved before 0.6.1 picked genres by the ids of Jellyfin's
+ * `Genre` items, while the list now carries the music genres' own ids — the
+ * same genres under other ids. An id can also outlive its genre.
+ */
+export function unknownGenreIds(filters: SmartFilter[], genres: GenreDto[]): string[] {
+  const listed = new Set(genres.map((genre) => genre.id));
+  return [...new Set(filters.flatMap((filter) => filter.genreIds))].filter((id) => !listed.has(id));
+}
+
+/**
+ * For every id whose genre name is known (`names`: id → name), the listed
+ * genre of that name — compared without case and outer spaces, close to how
+ * the server matches a genre filter. Ids no listed genre matches are left out.
+ */
+export function genreIdReplacements(
+  names: Record<string, string>,
+  genres: GenreDto[],
+): Map<string, string> {
+  const byName = new Map<string, string>();
+  for (const genre of genres) {
+    const key = genreNameKey(genre.name);
+    if (!byName.has(key)) byName.set(key, genre.id);
+  }
+  const replacements = new Map<string, string>();
+  for (const [id, name] of Object.entries(names)) {
+    const listed = byName.get(genreNameKey(name));
+    if (listed !== undefined && listed !== id) replacements.set(id, listed);
+  }
+  return replacements;
+}
+
+/** `filter` with its genre ids replaced, each once — or `filter` itself when
+ *  none of them is replaced. */
+export function replaceGenreIds(filter: SmartFilter, replacements: Map<string, string>): SmartFilter {
+  if (!filter.genreIds.some((id) => replacements.has(id))) return filter;
+  return {
+    ...filter,
+    genreIds: [...new Set(filter.genreIds.map((id) => replacements.get(id) ?? id))],
+  };
+}
+
+function genreNameKey(name: string): string {
+  return name.trim().toLowerCase();
 }
 
 /** A number input yields decimals and anything in f64 range; the backend

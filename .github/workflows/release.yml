@@ -7,8 +7,11 @@ name: Release
 # GitHub shows a SHA-256 next to every file of a release, so there is no
 # separate checksum file.
 #
-# A manual run builds the same way but creates nothing. That is the way to find
-# out whether the release path still works without cutting a release.
+# A manual run builds, signs and checks the signature the same way but creates
+# nothing. That is the way to find out whether the release path still works
+# without cutting a release. The installer and the zip it built stay on the
+# run for a day, unsigned: the signature goes no further than the machine that
+# made it (see "The signature stays off the record" below).
 #
 # ## Updates
 #
@@ -18,10 +21,8 @@ name: Release
 #   * the installer is signed with the updater's minisign key, which lives in
 #     the `TAURI_SIGNING_PRIVATE_KEY` secret and nowhere else. The matching
 #     public key is in `src-tauri/tauri.conf.json`, so a build that is not
-#     signed with this key cannot be installed by anyone's app. Signing is
-#     switched on by `src-tauri/tauri.updater.conf.json`, which is merged into
-#     the config for this build only -- an ordinary local `tauri build` keeps
-#     working without the key.
+#     signed with this key cannot be installed by anyone's app. An ordinary
+#     local `tauri build` never signs, so it needs no key.
 #   * the release carries `latest.json`, the manifest the app asks for. The
 #     endpoint is `releases/latest/download/latest.json`, so it is always the
 #     newest published release that answers.
@@ -34,32 +35,78 @@ name: Release
 # or anyone able to spoof the endpoint could push an old, still validly signed
 # build onto every client). Those users need a fixed release with a higher
 # version.
+#
+# ## Three jobs, so that the build never holds the key
+#
+# Building runs a great deal of code nobody here wrote: the install scripts of
+# `npm ci`, every Vite plugin, the build script and proc-macros of every crate.
+# None of it may see the key every installed Sonarune trusts, nor a token that
+# can write to this repository. So the work is split, and each job runs on a
+# fresh machine that only gets the files the job before it uploaded:
+#
+#   * `build` has a read-only token and no secrets. It builds the installer and
+#     the portable zip and hands them on.
+#   * `sign` gets the key, in a single step that runs nothing of the project's
+#     but the Tauri CLI's signer, installed from the lockfile without install
+#     scripts. The steps after it, without the key, check the signature
+#     against the public key the app ships with and write `latest.json`. Its
+#     token is read-only too.
+#   * `release`, on tag pushes only, is the one job that can write, and it runs
+#     nothing but `gh` on the signed files.
+#
+# No checkout leaves its token in the git config (`persist-credentials`), and
+# the plugin Paraglide compiles the interface strings with comes from
+# node_modules (`project.inlang/settings.json`), pinned by the lockfile, not
+# from a CDN at build time.
+#
+# ## The signature stays off the record
+#
+# Artifacts and logs of a public repository are open to anyone signed in to
+# GitHub, and the `unsigned` artifact holds the installer. Its signature next
+# to it would make a validly signed build that was never released -- from a
+# manual run before the version is tagged, or from a draft that was thrown
+# away -- and whoever later controls what `releases/latest/download/latest.json`
+# serves could roll it out to every install. So neither the signer's output
+# nor the manifest's signature goes into the log, a manual run hands nothing
+# signed on, and a tag run hands `latest.json` and the .sig to `release` in an
+# artifact of their own, which `release` deletes once the draft holds them:
+# minutes on the run instead of the day an artifact is kept.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
-# Only the release job writes, and only to releases.
-permissions:
-  contents: write
+# Nothing by default; each job names what it needs. `contents: write` would
+# also let a job push branches and tags or replace the files of any release,
+# so only `release` has it, together with `actions: write` for deleting the
+# signature's artifact.
+permissions: {}
 
 env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
   CARGO_INCREMENTAL: "0"
 
 # Action SHAs are the same ones ci.yml pins, for the same reason: a tag can be
-# repointed by whoever controls the action repository.
+# repointed by whoever controls the action repository. The artifact actions
+# are pinned the same way.
 
 jobs:
-  windows:
+  build:
     runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # A tag that disagrees with the manifests would ship an installer whose
       # file name lies about what is inside it. Catch that before building.
       - name: Check the version agrees everywhere
+        id: version
         shell: pwsh
         run: |
           $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
@@ -81,6 +128,7 @@ jobs:
             }
           }
           "VERSION=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "version=$pkg" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -89,6 +137,12 @@ jobs:
 
       - name: Install frontend deps
         run: npm ci
+
+      # A tag does not go through ci.yml, and strings that failed to compile
+      # still build: Paraglide only warns and emits an empty catalog, and the
+      # app then throws on every message. svelte-check is what notices.
+      - name: Type check (svelte-check)
+        run: npm run check
 
       - name: Install Rust toolchain
         shell: pwsh
@@ -104,31 +158,20 @@ jobs:
       # 21.09.2026 by running this very workflow, on a branch and without the
       # action, as a manual run: uncached, so every dependency including
       # libopus was compiled from source, and the installer came out
-      # (35649841406). With that gone, nothing third-party runs in the workflow
-      # that signs and publishes the installer -- only actions/checkout and
-      # actions/setup-node.
+      # (35649841406). With that gone, every action in this workflow is
+      # GitHub's own. Third-party code still runs in this job -- npm's install
+      # scripts, the Vite plugins, every crate's build script -- which is why
+      # it holds neither the key nor a token that can write.
 
       # Deliberately uncached: a release is worth the extra minutes of building
       # every dependency from source rather than trusting a restored cache.
       #
-      # The updater config is merged in only when the signing key is there.
-      # Without it the bundler refuses to produce updater artefacts and the
-      # whole build fails, which would be a pointless way to lose a release --
-      # and a dry run in a fork has no secrets at all.
+      # Built without the updater config, so the bundler signs nothing; the
+      # signature comes from the `sign` job.
       - name: Build the app and the installer
         shell: pwsh
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          if ($env:TAURI_SIGNING_PRIVATE_KEY) {
-            "SIGNED=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-            npm run tauri build -- --config src-tauri/tauri.updater.conf.json
-          } else {
-            "::warning::no TAURI_SIGNING_PRIVATE_KEY -- building without updater artefacts, this release cannot be installed as an update"
-            "SIGNED=0" | Out-File -FilePath $env:GITHUB_ENV -Append
-            npm run tauri build
-          }
+          npm run tauri build
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Collect the artefacts
@@ -146,53 +189,193 @@ jobs:
           if (-not (Test-Path $exe)) { "::error::sonarune.exe not found at $exe"; exit 1 }
           Compress-Archive -Path $exe -DestinationPath "$out/Sonarune_${env:VERSION}_x64-portable.zip"
 
-          # The signed installer and the manifest the app polls. The signature
-          # travels inside latest.json; the .sig file rides along so a release
-          # can be verified with `minisign -Vm` by hand, without picking the
-          # string out of the JSON.
-          if ($env:SIGNED -eq "1") {
-            $sig = "$setup.sig"
-            if (-not (Test-Path $sig)) { "::error::signature not found at $sig"; exit 1 }
-            Copy-Item $sig $out
-
-            # On a manual run there is no tag; the URL still has to name one,
-            # and the tag a release of this version would carry is known.
-            $tag = if ($env:GITHUB_REF -like "refs/tags/*") { $env:GITHUB_REF_NAME } else { "v$($env:VERSION)" }
-            $name = Split-Path $setup -Leaf
-
-            # What the app itself shows when it finds this update, so it has to
-            # say what changed rather than point at a file the dialog cannot
-            # open. The sentence stays as the fallback for a version the
-            # changelog does not name -- a missing section is worth a warning,
-            # not a failed release.
-            $notes = (node scripts/changelog-section.mjs $env:VERSION) -join ([string][char]10)
-            if (-not $notes) {
-              "::warning::CHANGELOG.md has no section for $($env:VERSION); the update notes only point at it"
-              $notes = "See the release notes and CHANGELOG.md for what changed in $($env:VERSION)."
-            }
-
-            $manifest = [ordered]@{
-              version   = $env:VERSION
-              notes     = $notes
-              pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-              platforms = [ordered]@{
-                "windows-x86_64" = [ordered]@{
-                  signature = (Get-Content $sig -Raw).Trim()
-                  url       = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$tag/$name"
-                }
-              }
-            }
-            [System.IO.File]::WriteAllText(
-              (Join-Path (Get-Location) "$out/latest.json"),
-              ($manifest | ConvertTo-Json -Depth 5),
-              (New-Object System.Text.UTF8Encoding $false))
-            Get-Content "$out/latest.json"
-          }
-
           Get-ChildItem $out | Select-Object Name, Length
 
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    outputs:
+      # On a tag run, the id of the artifact that carries the signature, so
+      # that `release` can delete it. A number, nothing signed.
+      signature-artifact: ${{ steps.handover.outputs.artifact-id }}
+    steps:
+      # For the lockfile and the changelog.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No cache: nothing the build job could have written to sits next to the
+      # key.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      # Only for the Tauri CLI, the one package that runs in this job. The
+      # lockfile pins every tarball by hash, and no install script runs.
+      - name: Install the signer
+        run: npm ci --ignore-scripts
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned
+          path: dist
+
+      # The key is in this step's environment and nowhere else in the workflow.
+      #
+      # A tag build without it would draft a release without latest.json, and
+      # once that is published `releases/latest/download/latest.json` answers
+      # 404: no installed app finds an update until a signed release is newer.
+      # So only a manual run may go on without the key -- a dry run in a fork
+      # has no secrets at all.
+      #
+      # `--app-version` puts the version into the signature's trusted comment,
+      # as `tauri build` does by itself (`requireSignedVersion` needs it). The
+      # password goes in as an argument: with the variable missing altogether,
+      # which a key without a password can leave it, the signer asks for one on
+      # the console and the job hangs. An empty value means "no password".
+      #
+      # The signer prints the signature it made; that output goes nowhere (see
+      # the top). Its errors are on stderr and still show.
+      - name: Sign the installer
+        id: sign
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            if ($env:GITHUB_REF -like 'refs/tags/*') {
+              "::error::no TAURI_SIGNING_PRIVATE_KEY -- a tagged release without latest.json would stop every installed app from finding updates once it is published"
+              exit 1
+            }
+            "::warning::no TAURI_SIGNING_PRIVATE_KEY -- a dry run without updater artefacts"
+            "signed=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+          $setup = "dist/Sonarune_$($env:VERSION)_x64-setup.exe"
+          if (-not (Test-Path $setup)) { "::error::installer not found at $setup"; exit 1 }
+          $password = "$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          node node_modules/@tauri-apps/cli/tauri.js signer sign --app-version $env:VERSION --password=$password $setup > $null
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (-not (Test-Path "$setup.sig")) { "::error::signature not found at $setup.sig"; exit 1 }
+          "signed $setup"
+          "signed=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # The key only signs; this proves it is the one installed apps trust. A
+      # secret that no longer belongs to the public key in tauri.conf.json would
+      # otherwise make a release no app installs, and the first update to fail
+      # out there would be the first to notice. No key in this step; node's
+      # own crypto, nothing from node_modules.
+      - name: Check the signature against the app's public key
+        if: steps.sign.outputs.signed == '1'
+        shell: pwsh
+        run: |
+          node scripts/verify-update-signature.mjs "dist/Sonarune_$($env:VERSION)_x64-setup.exe" --version $env:VERSION
+          if ($LASTEXITCODE) { "::error::the signature does not check out against the public key in src-tauri/tauri.conf.json"; exit 1 }
+
+      # The signature travels inside latest.json; the .sig file rides along for
+      # checking a release by hand. Both hold what Tauri writes -- the minisign
+      # signature file, base64-encoded once more -- and the public key in
+      # tauri.conf.json is wrapped the same way, so `minisign` needs both
+      # decoded first:
+      #
+      #   certutil -decode Sonarune_<v>_x64-setup.exe.sig setup.minisig
+      #   certutil -decode pubkey.txt minisign.pub   (pubkey.txt: the "pubkey"
+      #                                               string of tauri.conf.json)
+      #   minisign -Vm Sonarune_<v>_x64-setup.exe -x setup.minisig -p minisign.pub
+      - name: Write the updater manifest
+        if: steps.sign.outputs.signed == '1'
+        shell: pwsh
+        run: |
+          $out = "dist"
+          $name = "Sonarune_$($env:VERSION)_x64-setup.exe"
+          $sig = "$out/$name.sig"
+
+          # On a manual run there is no tag; the URL still has to name one,
+          # and the tag a release of this version would carry is known.
+          $tag = if ($env:GITHUB_REF -like "refs/tags/*") { $env:GITHUB_REF_NAME } else { "v$($env:VERSION)" }
+
+          # What the app itself shows when it finds this update, so it has to
+          # say what changed rather than point at a file the dialog cannot
+          # open. The sentence stays as the fallback for a version the
+          # changelog does not name -- a missing section is worth a warning,
+          # not a failed release.
+          $notes = (node scripts/changelog-section.mjs $env:VERSION) -join ([string][char]10)
+          if (-not $notes) {
+            "::warning::CHANGELOG.md has no section for $($env:VERSION); the update notes only point at it"
+            $notes = "See the release notes and CHANGELOG.md for what changed in $($env:VERSION)."
+          }
+
+          $manifest = [ordered]@{
+            version   = $env:VERSION
+            notes     = $notes
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content $sig -Raw).Trim()
+                url       = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$tag/$name"
+              }
+            }
+          }
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) "$out/latest.json"),
+            ($manifest | ConvertTo-Json -Depth 5),
+            (New-Object System.Text.UTF8Encoding $false))
+
+          # Shown for review, but without the signature: the log is public.
+          $manifest.platforms["windows-x86_64"].signature = "(in latest.json, not shown here)"
+          $manifest | ConvertTo-Json -Depth 5
+
+      - name: List what the release carries
+        shell: pwsh
+        run: Get-ChildItem dist | Select-Object Name, Length
+
+      # A tag run only: a manual run hands nothing signed on. The installer
+      # and the zip go to `release` through `unsigned`.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: handover
+        if: steps.sign.outputs.signed == '1' && startsWith(github.ref, 'refs/tags/')
+        with:
+          name: signature
+          path: |
+            dist/latest.json
+            dist/*.sig
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [build, sign]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      # Only for deleting the signature's artifact at the end.
+      actions: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signature
+          path: dist
+
       - name: Draft the release
-        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -203,34 +386,24 @@ jobs:
           $bt = [string][char]96
           $setup = "Sonarune_$($env:VERSION)_x64-setup.exe"
 
-          # Only a signed build can be installed as an update, so these two
-          # paragraphs appear only when there was a key to sign with. Promising
-          # self-updates on a release that carries no latest.json would be a
-          # lie told to everyone who reads the page.
-          $updates = if ($env:SIGNED -eq "1") {
-            @(
-              "**Sonarune keeps itself up to date.** The installed app asks this"
-              "page once per start whether a newer version exists -- that can be"
-              "switched off in Settings -> Updates, where there is also a button"
-              "to check on demand. An update is verified against the project's"
-              "signing key before the installer is opened, and it is never"
-              "installed while a track is playing, because the installer closes"
-              "the app. The portable zip cannot update itself and says so."
-              ""
-            )
-          } else { @() }
-          $signature = if ($env:SIGNED -eq "1") {
-            @(
-              "That is Authenticode, and a different thing from the update"
-              "signature: ${bt}latest.json${bt} and ${bt}$setup.sig${bt} carry a"
-              "minisign signature, which is what the app checks before it opens"
-              "an installer."
-              ""
-            )
-          } else { @() }
+          # `sign` already refuses a tag without the key; this is the same rule
+          # once more, where it matters: promising self-updates on a release
+          # that carries no latest.json would be a lie told to everyone who
+          # reads the page, and publishing it would cut every installed app off
+          # from updates.
+          foreach ($file in @($setup, "$setup.sig", "latest.json")) {
+            if (-not (Test-Path "dist/$file")) { "::error::dist/$file is missing; not drafting a release without it"; exit 1 }
+          }
 
           @(
-            $updates
+            "**Sonarune keeps itself up to date.** The installed app asks this"
+            "page once per start whether a newer version exists -- that can be"
+            "switched off in Settings -> Updates, where there is also a button"
+            "to check on demand. An update is verified against the project's"
+            "signing key before the installer is opened, and it is never"
+            "installed while a track is playing, because the installer closes"
+            "the app. The portable zip cannot update itself and says so."
+            ""
             "Windows 10 or 11, 64-bit. The installer runs for the current user,"
             "so it does not ask for administrator rights, and it needs nothing"
             "else on the machine: WebView2 already ships with Windows."
@@ -241,9 +414,39 @@ jobs:
             "The build is not code-signed, so SmartScreen reports an unknown"
             "publisher: **More info -> Run anyway**."
             ""
-            $signature
+            "That is Authenticode, and a different thing from the update"
+            "signature: ${bt}latest.json${bt} and ${bt}$setup.sig${bt} carry a"
+            "minisign signature, which is what the app checks before it opens"
+            "an installer."
+            ""
             "What changed is in [CHANGELOG.md](https://github.com/$($env:GITHUB_REPOSITORY)/blob/$($env:GITHUB_REF_NAME)/CHANGELOG.md)."
           ) | Out-File -FilePath notes.md -Encoding utf8
 
+          # No checkout in this job, so `gh` is told the repository.
           $assets = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
-          gh release create $env:GITHUB_REF_NAME --draft --title "Sonarune $($env:VERSION)" --notes-file notes.md $assets
+          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --draft --title "Sonarune $($env:VERSION)" --notes-file notes.md $assets
+
+      # The draft holds the signature now, and only the maintainer sees a
+      # draft. Left on the run, it would stay downloadable for a day, which is
+      # the day a thrown-away draft would leave a signed build nobody released
+      # (see the top). Runs whatever happened before it, so a failed draft is
+      # retried with "Re-run all jobs", not this job alone; failing to delete
+      # is worth a warning, not a failed release.
+      - name: Take the signature off the run
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_ID: ${{ needs.sign.outputs.signature-artifact }}
+        run: |
+          if (-not $env:ARTIFACT_ID) {
+            "::warning::the sign job named no signature artifact; delete the artifact 'signature' on this run's page by hand"
+            exit 0
+          }
+          gh api --method DELETE "repos/$($env:GITHUB_REPOSITORY)/actions/artifacts/$($env:ARTIFACT_ID)"
+          if ($LASTEXITCODE) {
+            "::warning::could not delete the artifact 'signature' ($($env:ARTIFACT_ID)); delete it on this run's page by hand"
+          } else {
+            "deleted the artifact 'signature' ($($env:ARTIFACT_ID)) from this run"
+          }
+          exit 0

@@ -24,6 +24,7 @@ import type {
   SearchResults,
   SearchKind,
   SearchPage,
+  ServerCheck,
   SessionInfo,
   TrackAnalysisInfo,
   TrackDto,
@@ -43,9 +44,15 @@ export const api = {
     trustFingerprint?: string;
   }) => invoke<ConnectResult>("connect", input),
   disconnect: () => invoke<void>("disconnect"),
+  /** Where a damaged database was set aside at this start; null normally. */
+  getDatabaseRecovery: () => invoke<string | null>("get_database_recovery"),
   listTrustedCertificates: () => invoke<TrustedCert[]>("list_trusted_certificates"),
   forgetTrustedCertificate: (serverUrl: string, fingerprint: string) =>
     invoke<void>("forget_trusted_certificate", { serverUrl, fingerprint }),
+  /** Trust the certificate the running session's server now presents (after
+   *  the user compared `fingerprint`, from `checkServer`) — no new sign-in. */
+  trustSessionCertificate: (fingerprint: string) =>
+    invoke<void>("trust_session_certificate", { fingerprint }),
   quickConnectStart: (serverUrl: string, acceptInvalidCerts: boolean) =>
     invoke<QuickConnectSession>("quick_connect_start", { serverUrl, acceptInvalidCerts }),
   quickConnectPoll: (serverUrl: string, acceptInvalidCerts: boolean, secret: string) =>
@@ -86,9 +93,14 @@ export const api = {
   getArtist: (artistId: string) => invoke<ArtistDetail>("get_artist", { artistId }),
   getSongs: (startIndex: number, limit: number) =>
     invoke<Page<TrackDto>>("get_songs", { startIndex, limit }),
+  /** Tracks by id, in the order asked for; ids the server no longer has are left out. */
+  getTracks: (trackIds: string[]) => invoke<TrackDto[]>("get_tracks", { trackIds }),
 
   playAlbum: (albumId: string, startIndex = 0) =>
     invoke<void>("play_album", { albumId, startIndex }),
+  /** A track in its album from that track on, or on its own without one. */
+  playTrackInAlbum: (trackId: string, albumId: string | null) =>
+    invoke<void>("play_track_in_album", { trackId, albumId }),
   enqueueAlbum: (albumId: string, next: boolean) =>
     invoke<void>("enqueue_album", { albumId, next }),
   enqueueTracks: (trackIds: string[], next: boolean) =>
@@ -96,8 +108,11 @@ export const api = {
   search: (term: string) => invoke<SearchResults>("search", { term }),
   searchPage: (term: string, kind: SearchKind, startIndex: number, limit: number) =>
     invoke<SearchPage>("search_page", { term, kind, startIndex, limit }),
-  queueRemove: (index: number, itemId: string) =>
-    invoke<void>("queue_remove", { index, itemId }),
+  /** Remove the entry at stored `index`, if that slot still holds it: by
+   *  `entryId`, which tells two copies of a track apart; by `itemId` for an
+   *  entry from a build before entry ids. */
+  queueRemove: (index: number, itemId: string, entryId: string | null = null) =>
+    invoke<void>("queue_remove", { index, itemId, entryId }),
   queueJump: (index: number) => invoke<void>("queue_jump", { index }),
   queueMove: (from: number, to: number) => invoke<void>("queue_move", { from, to }),
   playerToggle: () => invoke<void>("player_toggle"),
@@ -113,14 +128,19 @@ export const api = {
   getAudioSettings: () => invoke<DspParams>("get_audio_settings"),
   setAudioSettings: (params: DspParams) => invoke<void>("set_audio_settings", { params }),
   getPlaybackSettings: () => invoke<PlaybackSettings>("get_playback_settings"),
+  /** Resolves to the settings that apply: an output device the player
+   *  cannot open is refused and the previous one kept. */
   setPlaybackSettings: (settings: PlaybackSettings) =>
-    invoke<void>("set_playback_settings", { settings }),
+    invoke<PlaybackSettings>("set_playback_settings", { settings }),
   listAudioDevices: () => invoke<AudioDeviceSnapshot>("list_audio_devices"),
+  /** After a fallback: play through the configured device again. */
+  restoreOutputDevice: () => invoke<AudioDeviceSnapshot>("restore_output_device"),
   getAudioProfiles: () => invoke<AudioProfilesInfo>("get_audio_profiles"),
   setAudioProfilesEnabled: (enabled: boolean) =>
     invoke<AudioProfilesInfo>("set_audio_profiles_enabled", { enabled }),
-  deleteAudioProfile: (device: string) =>
-    invoke<AudioProfilesInfo>("delete_audio_profile", { device }),
+  /** `deviceId`: the profile's `OutputDevice.id`. */
+  deleteAudioProfile: (deviceId: string) =>
+    invoke<AudioProfilesInfo>("delete_audio_profile", { device: deviceId }),
   getDesktopSettings: () => invoke<DesktopSettings>("get_desktop_settings"),
   setDesktopSettings: (settings: DesktopSettings) =>
     invoke<DesktopSettings>("set_desktop_settings", { settings }),
@@ -142,18 +162,24 @@ export const api = {
   queueRemovePlayed: () => invoke<void>("queue_remove_played"),
   queueRemoveDuplicates: () => invoke<void>("queue_remove_duplicates"),
   queueUndo: () => invoke<void>("queue_undo"),
-  checkLibraryNow: () => invoke<void>("check_library_now"),
-  checkServer: () => invoke<boolean>("check_server"),
+  /** Pokes the library watcher; resolves to how many library changes it has
+   *  found since start (`library:changed` carries the same count). */
+  checkLibraryNow: () => invoke<number>("check_library_now"),
+  checkServer: () => invoke<ServerCheck>("check_server"),
   getLyrics: (itemId: string) => invoke<LyricsDto>("get_lyrics", { itemId }),
   playInstantMix: (itemId: string) => invoke<void>("play_instant_mix", { itemId }),
   playerSetSpeed: (speed: number, preservePitch: boolean) =>
     invoke<void>("player_set_speed", { speed, preservePitch }),
   setSleepTimer: (minutes: number | null, endOfTrack: boolean, fadeSeconds = 30) =>
     invoke<void>("set_sleep_timer", { minutes, endOfTrack, fadeSeconds }),
-  /** Arm "stop after this track / album" on a queue entry, or on what is
-   *  playing when `itemId` is left out. `"off"` clears it. */
-  playerSetStopAfter: (mode: import("./types").StopAfter, itemId: string | null = null) =>
-    invoke<void>("player_set_stop_after", { mode, itemId }),
+  /** Arm "stop after this track / album" on a queue entry (its `entryId`,
+   *  with the `itemId` for an entry from a build before entry ids), or on
+   *  what is playing when both are left out. `"off"` clears it. */
+  playerSetStopAfter: (
+    mode: import("./types").StopAfter,
+    itemId: string | null = null,
+    entryId: string | null = null,
+  ) => invoke<void>("player_set_stop_after", { mode, itemId, entryId }),
   getExtrasSettings: () => invoke<ExtrasSettings>("get_extras_settings"),
   setExtrasSettings: (settings: ExtrasSettings) =>
     invoke<void>("set_extras_settings", { settings }),
@@ -162,6 +188,9 @@ export const api = {
 
   /** Ask the release endpoint what the current version is (updater.rs). */
   checkForUpdate: () => invoke<UpdateInfo>("check_for_update"),
+  /** The last answer a check got (the background one or a check from
+   *  Settings), without asking the endpoint; null before there is one. */
+  getKnownUpdate: () => invoke<UpdateInfo | null>("get_known_update"),
   /**
    * Download the update, verify its signature and start the installer. On
    * Windows this never resolves: the app is closed by the installer. Rejects

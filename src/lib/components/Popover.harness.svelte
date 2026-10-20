@@ -1,13 +1,21 @@
 <!-- Test-only host for Popover.test.ts: the popover sits in an {#if} next to
-     a sibling node of the same block, the case a naive portal breaks. -->
+     a sibling node of the same block, the case a naive portal breaks. With
+     `triggered`, the point-placed popover names the anchor button as its
+     trigger. -->
 <script lang="ts">
   import Popover from "./Popover.svelte";
 
   let {
     anchored = false,
+    triggered = false,
     role = "menu",
     onclose = () => {},
-  }: { anchored?: boolean; role?: "menu" | "dialog"; onclose?: () => void } = $props();
+  }: {
+    anchored?: boolean;
+    triggered?: boolean;
+    role?: "menu" | "dialog";
+    onclose?: () => void;
+  } = $props();
 
   let open = $state(true);
   let anchorEl = $state<HTMLElement | null>(null);
@@ -26,7 +34,7 @@
       <button id="inside">inside</button>
     </Popover>
   {:else}
-    <Popover at={{ x: 5000, y: 5000 }} {role} onclose={close}>
+    <Popover at={{ x: 5000, y: 5000 }} trigger={triggered ? anchorEl : null} {role} onclose={close}>
       <button id="inside">inside</button>
     </Popover>
   {/if}

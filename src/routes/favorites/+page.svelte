@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount } from "svelte";
   import { api, formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
   import { m } from "#lib/paraglide/messages.js";
@@ -11,17 +11,28 @@
   import MetadataEditor from "#lib/components/MetadataEditor.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
   import { player } from "#lib/state/player.svelte.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
   import { contextMenuKey, menuPoint } from "#lib/menu.js";
   import { TRACK_ICON, trackMenuItems } from "#lib/trackMenu.js";
   import { startDrag } from "#lib/dragToPlaylist.js";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import type { FavoritesData, Page, TrackDto } from "#lib/types.js";
 
   type Section = keyof FavoritesData;
 
-  const am = createAlbumMenu();
+  const am = createAlbumMenu({
+    // Every album here is a favorite; taking one away takes it off the page,
+    // the same as "Remove from favorites" on a track.
+    toggleFavorite: (album) => {
+      dropAlbum(album.id);
+      apiLibrary.setFavorite(album.id, false).catch((e) => {
+        player.error = String(e);
+        load();
+      });
+    },
+  });
 
   /** Items per "load more"; the first page of every section comes with `getFavorites`. */
   const PAGE_SIZE = 50;
@@ -60,9 +71,7 @@
   onMount(load);
 
   // Favoriting happens elsewhere; refetch when the library signals a change.
-  $effect(() => {
-    if (library.revision > 0) untrack(load);
-  });
+  onLibraryChange(load);
 
   /** Drop tracks from the list without refetching: they were deleted on the
    *  server, or they are not favorites any more. Either way this page is the
@@ -72,6 +81,14 @@
     const removed = new Set(ids);
     const items = favorites.tracks.items.filter((track) => !removed.has(track.id));
     favorites.tracks = { items, total: Math.max(items.length, favorites.tracks.total - ids.length) };
+  }
+
+  /** The same for an album that is no longer a favorite. */
+  function dropAlbum(id: string) {
+    if (!favorites) return;
+    const items = favorites.albums.items.filter((album) => album.id !== id);
+    const removed = favorites.albums.items.length - items.length;
+    favorites.albums = { items, total: Math.max(items.length, favorites.albums.total - removed) };
   }
 
   function onTrackContextMenu(event: MouseEvent, track: TrackDto) {
@@ -95,8 +112,9 @@
               const ids = tracks.map((t) => t.id);
               dropTracks(ids);
               // Re-sync from the server if it disagrees; the row is gone from
-              // the page either way until then.
-              apiLibrary.setFavorite(ids[0], false).catch((e) => {
+              // the page either way until then. Through the player store, so
+              // the player bar's heart lets go too when this track plays.
+              player.setFavorite(ids[0], false).catch((e) => {
                 player.error = String(e);
                 load();
               });
@@ -143,18 +161,8 @@
     }
   }
 
-  async function playTrack(track: TrackDto) {
-    if (!track.albumId) {
-      player.run(api.enqueueTracks([track.id], false));
-      return;
-    }
-    try {
-      const album = await api.getAlbum(track.albumId);
-      const index = album.tracks.findIndex((t) => t.id === track.id);
-      await api.playAlbum(track.albumId, Math.max(0, index));
-    } catch (e) {
-      player.error = String(e);
-    }
+  function playTrack(track: TrackDto) {
+    player.run(playInAlbum(track.id, track.albumId));
   }
 
   const isEmpty = $derived(

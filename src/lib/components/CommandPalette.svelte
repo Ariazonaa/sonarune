@@ -1,11 +1,15 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { goto } from "$app/navigation";
   import { api } from "#lib/api.js";
+  import { apiLibrary } from "#lib/api/library.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "./Cover.svelte";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import { palette } from "#lib/state/palette.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
+  import { playOrderItemIds } from "#lib/queueOrder.js";
+  import { playlists } from "#lib/state/playlists.svelte.js";
+  import { toast } from "#lib/state/toast.svelte.js";
   import type { SearchResults, TrackDto } from "#lib/types.js";
 
   interface Entry {
@@ -62,24 +66,25 @@
   }
 
   /** Play a searched track in its album context (same as the search page). */
-  async function playTrack(track: TrackDto) {
-    if (!track.albumId) return;
+  function playTrack(track: TrackDto) {
+    player.run(playInAlbum(track.id, track.albumId));
+  }
+
+  /** Same as "Save queue as playlist" in the queue panel. */
+  async function savePlaylist() {
+    const name = playlistName.trim();
+    // In play order, as the queue panel shows it (shuffle included).
+    const trackIds = playOrderItemIds(player.queue);
+    if (!name || trackIds.length === 0) return;
+    close();
     try {
-      const detail = await api.getAlbum(track.albumId);
-      const index = detail.tracks.findIndex((candidate) => candidate.id === track.id);
-      await api.playAlbum(track.albumId, Math.max(0, index));
+      await apiLibrary.createPlaylist(name, trackIds);
+      // The sidebar lists playlists from this store, which nothing polls.
+      playlists.refresh();
+      toast.show(m.playlist_created());
     } catch (e) {
       player.error = String(e);
     }
-  }
-
-  async function savePlaylist() {
-    const name = playlistName.trim();
-    const trackIds = player.queue.tracks.map((t) => t.itemId);
-    if (!name || trackIds.length === 0) return;
-    close();
-    // Command lands with another slice's merge; failures surface as banner.
-    player.run(invoke<string>("create_playlist", { name, trackIds }));
   }
 
   function sleep(minutes: number | null, endOfTrack: boolean) {
@@ -168,9 +173,8 @@
           id: `track-${track.id}`,
           group: "results",
           label: track.name,
-          sub: `${track.artist} · ${track.album}`,
+          sub: track.album ? `${track.artist} · ${track.album}` : track.artist,
           cover: { itemId: track.imageItemId, tag: track.imageTag, blurhash: track.imageBlurHash },
-          disabled: !track.albumId,
           run: () => {
             close();
             playTrack(track);

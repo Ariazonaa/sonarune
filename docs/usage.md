@@ -216,7 +216,7 @@ detection):
 - **Accent**: follows the playing cover by default (kept readable against the
   black), or pick one of 8 presets or a custom color.
 - **Layout presets**: compact/comfortable lists, grid card size, sidebar width —
-  persisted per view.
+  one layout for the whole app.
 - Skeletons, empty states and an offline banner keep the UI honest while things
   load or when the server is unreachable.
 

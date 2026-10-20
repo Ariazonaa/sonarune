@@ -24,18 +24,33 @@ tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util"] }
+# Bounded, order-keeping concurrency over a list of requests
+# (`tracks_for_albums`). Already built for reqwest and hyper.
+futures-util = "0.3.32"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 uuid = { version = "1.23.4", features = ["v4"] }
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
 stream-download = { version = "0.24.1", features = ["reqwest-rustls"] }
+# The stream type under stream-download (player/source/stream.rs) speaks its
+# traits: all three already come with it and with reqwest, same versions.
+bytes = "1.12.0"
+futures-core = "0.3.32"
+tokio-util = "0.7.18"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream", "http2", "query"] }
+# The matcher reqwest reads the system proxy settings with; system_proxy.rs
+# sends nothing through the proxy that it would not. Already in the graph: it
+# is reqwest's own client stack.
+hyper-util = { version = "0.1.20", features = ["client-proxy"] }
 dirs = "6"
 keyring = { version = "4.1.2", features = ["windows-native-keyring-store"] }
 rustls = "0.23"
 rustls-native-certs = "0.8"
+# The OS's own certificate verifier (tls.rs). Already in the graph: it is the
+# verifier of reqwest's rustls backend, which tls.rs replaces with its own.
+rustls-platform-verifier = "0.7"
 sha2 = "0.10"
 # Butterchurn Weekly presets are served gzip-encoded (commands_visualizer.rs).
 # Already in the dependency graph; reqwest's own `gzip` feature would change
@@ -53,7 +68,10 @@ rustfft = "6"
 signalsmith-stretch = "0.1.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation", "Win32_UI_WindowsAndMessaging"] }
+# The proxy settings (system_proxy.rs). Already in the graph: hyper-util reads
+# the same registry keys for reqwest.
+windows-registry = "0.6"
 # Suspending the WebView in the background (see webview_power.rs). Versions
 # follow wry's, or the controller type would not match across crate copies.
 webview2-com = "0.38"

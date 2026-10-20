@@ -1,12 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "projector",
-  "description": "The visualizer projector window: session restore, player state, lyrics, the PCM feed and its own fullscreen/close.",
+  "description": "The visualizer projector window: session restore, player state, lyrics, the PCM feed and its own fullscreen/close. Core permissions are listed one by one instead of core:default, which would also hand preset code the tray and menus; no emit, because an event from here would reach the main window as if the backend had sent it (its settings go through localStorage); internal-toggle-devtools exists in debug builds only.",
   "windows": ["projector"],
   "permissions": [
-    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-is-fullscreen",
     "core:window:allow-close",
     "core:window:allow-set-fullscreen",
+    "core:webview:allow-internal-toggle-devtools",
     "projector-window"
   ]
 }

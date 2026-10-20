@@ -1,22 +1,10 @@
 <script lang="ts">
-  import type { Attachment } from "svelte/attachments";
   import { m } from "#lib/paraglide/messages.js";
+  import { modalFocus } from "#lib/modal.js";
   import { portal } from "#lib/portal.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
 
-  /**
-   * Initial focus goes to Cancel, never to the destructive button.
-   *
-   * It sits on the portaled element and not on the button, and the order
-   * matters: attachments on children run before their parent's, so a focus
-   * taken down there is dropped the moment `portal` re-appends this subtree to
-   * `<body>` — moving a node blurs whatever was focused inside it. Declared
-   * after `portal` on the same element, this runs after the move.
-   */
-  const focusCancel: Attachment<HTMLElement> = (node) => {
-    node.querySelector("button")?.focus();
-  };
-
+  const uid = $props.id();
   const req = $derived(confirm.request);
 
   // Only Escape is bound to a key — a destructive confirm must be an explicit
@@ -38,13 +26,16 @@
      appended to <body>, so at the same `z-50` it ended up *behind* the very
      dialog that had asked: the editor's 75 % black backdrop covered it, the
      click went to that backdrop, and pressing Save looked like it did nothing
-     at all. Hence the portal, and a z above the dialogs that ask. -->
+     at all. Hence the portal, and a z above the dialogs that ask.
+     Focus starts on Cancel, never on the destructive button, stays inside
+     while the request is open and goes back to where it was after — see
+     `modalFocus`, declared after `portal` so it runs after the move. -->
 {#if req}
   <div class="contents">
     <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
     <div
       {@attach portal}
-      {@attach focusCancel}
+      {@attach modalFocus}
       class="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4"
       onclick={(e) => {
         if (e.target === e.currentTarget) confirm.answer(false);
@@ -55,12 +46,14 @@
         role="dialog"
         aria-modal="true"
         aria-label={req.title}
+        aria-describedby="{uid}-body"
       >
         <h2 class="text-md font-bold tracking-tight">{req.title}</h2>
-        <p class="mt-2 text-sm leading-relaxed text-ink-muted">{req.body}</p>
+        <p id="{uid}-body" class="mt-2 text-sm leading-relaxed text-ink-muted">{req.body}</p>
         <div class="mt-5 flex justify-end gap-2">
           <button
             class="rounded-full px-4 py-1.5 text-sm font-semibold text-ink-muted transition-colors hover:bg-panel-2 hover:text-ink"
+            data-autofocus
             onclick={() => confirm.answer(false)}
           >
             {m.cancel()}

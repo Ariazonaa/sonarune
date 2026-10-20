@@ -42,7 +42,7 @@ const MAX_BPM: f32 = 180.0;
 /// Seconds at either end the beat grid is fitted to.
 const GRID_WINDOW_S: f32 = 30.0;
 /// A track this quiet relative to its loudest hop counts as silent there.
-const SILENCE_DB: f32 = -45.0;
+pub(super) const SILENCE_DB: f32 = -45.0;
 /// Acceptance thresholds (see the tests for what clean and noisy input give).
 const MIN_TEMPO_CONFIDENCE: f32 = 0.15;
 const MIN_GRID_CONFIDENCE: f32 = 1.5;
@@ -117,16 +117,41 @@ pub struct TrackAnalysis {
     /// First and last moment above [`SILENCE_DB`].
     pub audible_start_ms: f64,
     pub audible_end_ms: f64,
+    /// The decoded length.
     pub duration_ms: f64,
+    /// The length the server gave the track when it was analysed. The decoded
+    /// length can be seconds off it for good (a VBR MP3 whose length the
+    /// server estimated), so only this one tells a replaced file. Absent in
+    /// analyses stored before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_duration_ms: Option<u64>,
     /// How the track sounds (`timbre.rs`). Absent in analyses stored before it
     /// existed; the library scan fills those in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sonic: Option<super::timbre::SonicFeatures>,
 }
 
+/// A server length further than this from the one an analysis was made for
+/// is another file under the same item id.
+const REPLACED_TOLERANCE_MS: f64 = 2_000.0;
+
 impl TrackAnalysis {
     pub fn camelot(&self) -> Option<String> {
         self.key.map(MusicalKey::camelot)
+    }
+
+    /// Whether the analysis still describes the file the server has under
+    /// the item id, given the length the server reports now (0: unknown). A
+    /// replaced file has a different length. Analyses from before the server
+    /// length was recorded can only be held against the decoded one.
+    pub fn fits(&self, duration_ms: u64) -> bool {
+        if duration_ms == 0 {
+            return true;
+        }
+        let analysed_for = self
+            .server_duration_ms
+            .map_or(self.duration_ms, |ms| ms as f64);
+        (analysed_for - duration_ms as f64).abs() <= REPLACED_TOLERANCE_MS
     }
 }
 
@@ -256,10 +281,9 @@ impl AnalysisCache {
 
     /// [`get`](Self::get), but only while the analysis still fits the
     /// track: a file replaced on the server under the same item id has a
-    /// different length.
+    /// different length ([`TrackAnalysis::fits`]).
     pub fn get_matching(&self, item_id: &str, duration_ms: u64) -> Option<Arc<TrackAnalysis>> {
-        self.get(item_id)
-            .filter(|a| duration_ms == 0 || (a.duration_ms - duration_ms as f64).abs() <= 2_000.0)
+        self.get(item_id).filter(|a| a.fits(duration_ms))
     }
 
     pub fn put(&self, item_id: &str, analysis: TrackAnalysis) -> Arc<TrackAnalysis> {
@@ -307,6 +331,12 @@ pub struct Analyzer {
     /// (beat phase — hats on the offbeat dominate the broadband flux).
     flux: Vec<f32>,
     low_flux: Vec<f32>,
+    /// Onset strength within the fixed band of the sound features
+    /// ([`super::timbre::Timbre::flux_bins`]): the broadband flux reaches up
+    /// to the Nyquist frequency, which moves with the source rate.
+    band_flux: Vec<f32>,
+    /// `None` for a source too low to carry anything above the band.
+    anti_alias: Option<AntiAlias>,
     /// Loudness per hop (dB, unreferenced).
     level_db: Vec<f32>,
     chroma: [f64; 12],
@@ -320,6 +350,91 @@ pub struct Analyzer {
 /// Timbre frames every this many onset hops (~21 frames/s): plenty for
 /// means and spreads, a quarter of the cost of every hop.
 const TIMBRE_EVERY: usize = 4;
+
+/// Cutoff of the low-pass in front of the decimation: the top of the band
+/// the sound features look at (`timbre.rs`).
+const ANTI_ALIAS_HZ: f64 = 5_000.0;
+
+/// Sixth-order Butterworth low-pass (three biquads) at the source rate,
+/// ahead of the boxcar decimation. The boxcar alone lets a hi-hat at 8 kHz
+/// fold down into the analysed band at only -7 to -9 dB, and onto another
+/// frequency for every source rate (3 kHz from 44.1 kHz, 4 kHz from 48 kHz):
+/// a FLAC and its Opus transcode would not sound alike. With the filter in
+/// front, whatever could fold is some 25 dB further down.
+struct AntiAlias {
+    sections: [Biquad; 3],
+}
+
+#[derive(Clone, Copy)]
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl Biquad {
+    fn low_pass(rate: f64, cutoff: f64, q: f64) -> Self {
+        let (sin, cos) = (std::f64::consts::TAU * cutoff / rate).sin_cos();
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: (1.0 - cos) / 2.0 / a0,
+            b1: (1.0 - cos) / a0,
+            b2: (1.0 - cos) / 2.0 / a0,
+            a1: -2.0 * cos / a0,
+            a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f64) -> f64 {
+        // Transposed direct form II.
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        // A long digital silence lets the state decay into subnormal numbers,
+        // which are many times slower to compute with.
+        if self.z1.abs() < 1e-30 && self.z2.abs() < 1e-30 {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+        }
+        y
+    }
+}
+
+impl AntiAlias {
+    /// `None` when the source cannot carry the cutoff anyway: nothing above
+    /// the band to fold.
+    fn new(sample_rate: u32) -> Option<Self> {
+        let rate = f64::from(sample_rate);
+        if ANTI_ALIAS_HZ >= rate * 0.45 {
+            return None;
+        }
+        // The pole pairs of a sixth-order Butterworth: Q = 1 / (2 cos θ) for
+        // θ = 15°, 45°, 75°.
+        let section = |q| Biquad::low_pass(rate, ANTI_ALIAS_HZ, q);
+        Some(Self {
+            sections: [
+                section(0.517_638),
+                section(std::f64::consts::FRAC_1_SQRT_2),
+                section(1.931_852),
+            ],
+        })
+    }
+
+    #[inline]
+    fn process(&mut self, sample: f32) -> f32 {
+        self.sections
+            .iter_mut()
+            .fold(f64::from(sample), |value, section| section.process(value)) as f32
+    }
+}
 
 fn hann(n: usize) -> Vec<f32> {
     (0..n)
@@ -365,6 +480,8 @@ impl Analyzer {
             primed: false,
             flux: Vec::new(),
             low_flux: Vec::new(),
+            band_flux: Vec::new(),
+            anti_alias: AntiAlias::new(sample_rate),
             level_db: Vec::new(),
             chroma: [0.0; 12],
             chroma_bins,
@@ -384,8 +501,13 @@ impl Analyzer {
         let mono = self.frame_sum / self.channels as f32;
         self.channel = 0;
         self.frame_sum = 0.0;
-        // Boxcar decimation: a crude low-pass, but the analysis only looks
-        // below ~2 kHz for pitch and at broadband change for onsets.
+        let mono = match &mut self.anti_alias {
+            Some(filter) => filter.process(mono),
+            None => mono,
+        };
+        // Boxcar decimation: on its own a crude low-pass, which is enough for
+        // pitch (below ~2 kHz) and onsets; the filter above keeps what lies
+        // beyond the band from folding into it.
         self.decimated_sum += mono;
         self.decimated_in += 1;
         if self.decimated_in < self.decimation {
@@ -419,7 +541,8 @@ impl Analyzer {
             self.onset_fft.process(&mut self.scratch[..ONSET_FFT]);
             let bin_hz = self.rate / ONSET_FFT as f32;
             let low_bins = (LOW_BAND_HZ / bin_hz).ceil() as usize;
-            let (mut flux, mut low) = (0.0, 0.0);
+            let band_bins = self.timbre.flux_bins();
+            let (mut flux, mut low, mut band) = (0.0, 0.0, 0.0);
             for (bin, previous) in self.previous_spectrum.iter_mut().enumerate() {
                 // Log compression keeps a loud kick from drowning the hats.
                 let magnitude = (1.0 + 100.0 * self.scratch[bin].norm()).ln();
@@ -428,6 +551,9 @@ impl Analyzer {
                 if bin >= 1 && bin <= low_bins {
                     low += rise;
                 }
+                if band_bins.contains(&bin) {
+                    band += rise;
+                }
                 *previous = magnitude;
             }
             // The first frame has nothing to rise from.
@@ -435,6 +561,7 @@ impl Analyzer {
             self.primed = true;
             self.flux.push(if first { 0.0 } else { flux });
             self.low_flux.push(if first { 0.0 } else { low });
+            self.band_flux.push(if first { 0.0 } else { band });
             if self.hops.is_multiple_of(TIMBRE_EVERY) {
                 for (slot, value) in self.power.iter_mut().zip(&self.scratch) {
                     *slot = value.norm_sqr();
@@ -444,6 +571,7 @@ impl Analyzer {
         } else {
             self.flux.push(0.0);
             self.low_flux.push(0.0);
+            self.band_flux.push(0.0);
         }
 
         self.hops += 1;
@@ -525,14 +653,15 @@ impl Analyzer {
             None => (None, None),
         };
 
+        let band_envelope = onset_envelope(&self.band_flux);
         let sonic = Some(
             self.timbre
                 .finish(
                     start_hop,
                     end_hop,
                     &self.level_db,
-                    &self.flux,
-                    &envelope,
+                    &self.band_flux,
+                    &band_envelope,
                     &low_envelope,
                 )
                 .unwrap_or_else(super::timbre::SonicFeatures::none),
@@ -555,6 +684,8 @@ impl Analyzer {
             audible_start_ms,
             audible_end_ms,
             duration_ms,
+            // Only the caller knows what the server says (`waveform.rs`).
+            server_duration_ms: None,
             sonic,
         }
     }
@@ -881,6 +1012,7 @@ pub(crate) mod tests {
             audible_start_ms: 0.0,
             audible_end_ms: end_ms,
             duration_ms: end_ms + 1_000.0,
+            server_duration_ms: None,
             sonic: None,
         }
     }
@@ -969,6 +1101,66 @@ pub(crate) mod tests {
         assert!(cache.get_matching("u", 180_500).is_some());
         assert!(cache.get_matching("u", 240_000).is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_replaced_file_is_told_by_the_server_length_not_the_decoded_one() {
+        // A VBR MP3 whose length the server estimated: it decodes to 247 s,
+        // the server says 238 s, and it keeps saying so.
+        let mut a = grid_track(120.0, 0.0, 1.0, 246_000.0);
+        a.server_duration_ms = Some(238_000);
+        assert!(a.fits(238_000), "the same file");
+        assert!(a.fits(239_500), "the server rounding its estimate");
+        assert!(
+            !a.fits(247_000),
+            "another file, even one as long as the decode"
+        );
+        assert!(a.fits(0), "length unknown");
+        // Stored before the server length was recorded: only the decode to
+        // go by.
+        a.server_duration_ms = None;
+        assert!(a.fits(247_500) && !a.fits(238_000));
+    }
+
+    /// The sound vector of twelve seconds of `signal`, sampled at `rate`.
+    fn sonic_vector(rate: u32, signal: impl Fn(f32) -> f32) -> Vec<f32> {
+        let samples: Vec<f32> = (0..rate as usize * 12)
+            .map(|i| signal(i as f32 / rate as f32))
+            .collect();
+        let analysis = analyse(&samples, rate);
+        analysis
+            .sonic
+            .filter(|s| !s.vector.is_empty())
+            .expect("a sound vector")
+            .vector
+    }
+
+    #[test]
+    fn the_sound_does_not_depend_on_the_source_rate() {
+        use std::f32::consts::TAU;
+        // A low tone and a loud one far above the analysed band, the way a
+        // hi-hat sits over a bass line. From 44.1 kHz the high one used to
+        // fold down to ~3 kHz, from 48 kHz to ~4 kHz.
+        let signal = |t: f32| 0.4 * (TAU * 220.0 * t).sin() + 0.4 * (TAU * 8_000.0 * t).sin();
+        let cd = sonic_vector(44_100, signal);
+        let dat = sonic_vector(48_000, signal);
+        let low_only = sonic_vector(44_100, |t| 0.4 * (TAU * 220.0 * t).sin());
+        // Spectral centroid (kHz) and rolloff: the same, and the high tone
+        // is gone from both.
+        for (dimension, name) in [(24, "centroid"), (27, "rolloff")] {
+            assert!(
+                (cd[dimension] - dat[dimension]).abs() < 0.02,
+                "{name}: {} vs {}",
+                cd[dimension],
+                dat[dimension]
+            );
+            assert!(
+                (cd[dimension] - low_only[dimension]).abs() < 0.02,
+                "{name} carries the folded tone: {} vs {}",
+                cd[dimension],
+                low_only[dimension]
+            );
+        }
     }
 
     /// Real music: `SONARUNE_ANALYSE_DIR=<folder> cargo test --release

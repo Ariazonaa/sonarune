@@ -1,5 +1,6 @@
 <script lang="ts">
   import { m } from "#lib/paraglide/messages.js";
+  import { hasNext } from "#lib/queueOrder.js";
   import { player } from "#lib/state/player.svelte.js";
 
   interface Props {
@@ -10,7 +11,11 @@
   let { size = "sm" }: Props = $props();
 
   const s = $derived(player.state);
-  const playing = $derived(s.status === "playing" || s.status === "loading");
+  const playing = $derived(player.playing);
+  // Walks the play order, so it follows the queue and the repeat mode only,
+  // not every state tick.
+  const repeat = $derived(player.state.repeat);
+  const canGoNext = $derived(hasNext(player.queue, repeat));
   const lg = $derived(size === "lg");
   const icon = $derived(lg ? "h-6 w-6" : "h-5 w-5");
   const smallIcon = $derived(lg ? "h-5 w-5" : "h-4.5 w-4.5");
@@ -71,7 +76,7 @@
   <button
     class="rounded-full p-2 text-ink-muted transition-colors hover:text-ink disabled:opacity-40"
     onclick={() => player.run(player.next())}
-    disabled={!s.current || (s.index + 1 >= s.queueLen && s.repeat === "off" && !s.shuffle)}
+    disabled={!s.current || !canGoNext}
     aria-label={m.player_next()}
     title={m.player_next()}
   >

@@ -13,7 +13,7 @@ path). Config: [`wdio.conf.mjs`](./wdio.conf.mjs).
 | Spec | Needs a signed-in app? | Covers |
 |------|------------------------|--------|
 | `specs/boot.e2e.js` | no | The app launches, WebView2 loads, the SPA mounts and reaches a known-good landing view (setup screen **or** — if a session was restored — the signed-in shell). Proves the whole build→driver→WebView pipeline. |
-| `specs/visualizer.e2e.js` | yes | The **visualizer mounts (canvas) and tears down** cleanly with no error banner — a Phase-13 GUI core flow. Gets to the signed-in shell via a restored session (dev machine) or, on a clean machine/CI, by signing in with `SONARUNE_TEST_{URL,USER,PASS}`. Skips if it can't reach the shell. |
+| `specs/visualizer.e2e.js` | yes | The **visualizer starts and tears down** cleanly — a Phase-13 GUI core flow. Started means its controller put a first preset on screen (`data-ready` on `visualizer`) without the route's error banner (`visualizer-error`); the canvas alone is static markup. Gets to the signed-in shell via a restored session (dev machine) or, on a clean machine/CI, by signing in with `SONARUNE_TEST_{URL,USER,PASS}`. Skips if it can't reach the shell. |
 
 `ensureSignedIn()` in `helpers.js` encapsulates that restored-session-or-login
 logic. The **dialog focus trap** core flow is covered faster and more reliably
@@ -23,7 +23,8 @@ here.
 Verified green end-to-end on Windows (real app, wdio 10, signed in to the
 dev server via `SONARUNE_TEST_*`). The suite builds under its own identifier
 `io.sonarune.e2e` (`tauri.e2e.conf.json`), so its session lives in its own
-data directory and never touches the installed app's.
+data directory and its own Credential Manager entries (the keyring service is
+named after the identifier), and never touches the installed app's.
 
 **Still manual** (see `docs/testing.md`), by design:
 - **Mini-player** and **projector** — separate `WebviewWindow`s; a single
@@ -85,4 +86,4 @@ redirect in `src-tauri/.cargo/config.toml` is handled automatically.
   Kill stray `sonarune.exe` / `tauri-driver` / `msedgedriver` between runs.
 - Selectors use `data-testid` anchors (`setup-screen`, `setup-server`,
   `setup-username`, `setup-password`, `setup-connect`, `app-shell`,
-  `visualizer`, `visualizer-toggle`). Keep those stable.
+  `visualizer`, `visualizer-toggle`, `visualizer-error`). Keep those stable.

@@ -12,9 +12,13 @@
   import SongInfo from "#lib/components/SongInfo.svelte";
   import MetadataEditor from "#lib/components/MetadataEditor.svelte";
   import { contextMenuKey, menuPoint } from "#lib/menu.js";
+  import { activatesRow } from "#lib/rowKeys.js";
   import { TRACK_ICON, trackMenuItems } from "#lib/trackMenu.js";
   import PlaylistDuplicatesDialog from "#lib/components/PlaylistDuplicatesDialog.svelte";
   import PlaylistTransferDialog from "#lib/components/PlaylistTransferDialog.svelte";
+  import { entryRowKeys, firstOccurrences, sharedEntryIds } from "#lib/playlistEntries.js";
+  import { confirm } from "#lib/state/confirm.svelte.js";
+  import { library } from "#lib/state/library.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { playlists } from "#lib/state/playlists.svelte.js";
@@ -28,7 +32,7 @@
   let renaming = $state(false);
   let renameValue = $state("");
   let confirmDelete = $state(false);
-  let addTo = $state<{ x: number; y: number; trackIds: string[] } | null>(null);
+  let addTo = $state<{ x: number; y: number; trackIds: string[]; trigger?: HTMLElement } | null>(null);
   let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   let info = $state<{ itemId: string; name: string; playCount: number } | null>(null);
   let edit = $state<{ itemId: string; name: string } | null>(null);
@@ -66,6 +70,8 @@
       await apiLibrary.renamePlaylist(id, name);
       playlists.refresh();
     } catch (e) {
+      // Another playlist is open by now: its page shows its own state.
+      if (id !== page.params.id) return;
       error = String(e);
       load(id);
     }
@@ -73,20 +79,26 @@
 
   async function doDelete() {
     confirmDelete = false;
+    // The page is reused for the next playlist: the answer is about this
+    // one, whichever is open by the time it comes.
+    const id = playlistId;
     try {
-      await apiLibrary.deletePlaylist(playlistId);
+      await apiLibrary.deletePlaylist(id);
       playlists.refresh();
-      swrDelete(`playlist:${playlistId}`);
+      swrDelete(`playlist:${id}`);
       toast.show(m.playlist_deleted());
-      goto("/playlists");
+      if (id === page.params.id) goto("/playlists");
     } catch (e) {
-      error = String(e);
+      if (id === page.params.id) error = String(e);
     }
   }
 
+  /** A row button's playlist picker; the button's next click closes it again
+   *  (a press on it does not count as outside). */
   function openAddTo(e: MouseEvent, trackIds: string[]) {
     e.stopPropagation();
-    addTo = { ...menuPoint(e), trackIds };
+    const trigger = e.currentTarget as HTMLElement;
+    addTo = addTo?.trigger === trigger ? null : { ...menuPoint(e), trackIds, trigger };
   }
 
   function load(id: string) {
@@ -120,19 +132,61 @@
     duplicatePreview = false;
     duplicateOpen = false;
     transferOpen = false;
+    // A prompt, an edit or a menu belongs to the playlist it was opened on: a
+    // delete confirmation left open here would otherwise wait, armed, on the
+    // next playlist. The draft name goes first — dropping the rename field
+    // blurs it, and the blur commits whatever the draft holds.
+    confirmDelete = false;
+    renameValue = "";
+    renaming = false;
+    menu = null;
+    addTo = null;
+    info = null;
+    edit = null;
     // `load` snapshots the mutation generation. Keep that synchronous read
     // out of this route-id effect so optimistic edits do not reset the active
     // filter or reopen the cached pre-mutation detail.
     untrack(() => load(id));
   });
 
+  // Nothing to show after a failed load (server down, playlist not cached):
+  // try again when the library is poked — the offline banner's Retry and the
+  // recovery after an outage do that (net.svelte.ts).
+  $effect(() => {
+    void library.revision;
+    untrack(() => {
+      if (!error || detail) return;
+      const id = playlistId;
+      apiLibrary
+        .getPlaylist(id)
+        .then((d) => {
+          swrSet(`playlist:${id}`, d);
+          if (id !== page.params.id || detail) return;
+          detail = d;
+          error = null;
+        })
+        .catch(() => {});
+    });
+  });
+
   const trackCount = $derived(detail?.tracks.length ?? 0);
   const filterActive = $derived(filterQuery.trim().length > 0);
+  // Not the entry id: on Jellyfin 10.11 the two rows of a track that is in the
+  // playlist twice share it, and a repeated key would keep the list from
+  // rendering at all.
+  const rowKeys = $derived(entryRowKeys(detail?.tracks ?? []));
+  /** Entry ids several rows share — the server removes all of them at once
+   *  and moves only the first (see lib/playlistEntries.ts). */
+  const sharedIds = $derived(sharedEntryIds(detail?.tracks ?? []));
+  // A move goes by entry id, so while one is shared the server could move
+  // another row than the one dragged, or drop it next to the wrong copy.
+  const reorderable = $derived(!filterActive && sharedIds.size === 0);
   const visibleTracks = $derived.by(() => {
     const query = filterQuery.trim().toLocaleLowerCase();
     const indexed = (detail?.tracks ?? []).map((entry, originalIndex) => ({
       entry,
       originalIndex,
+      key: rowKeys[originalIndex],
     }));
     if (!query) return indexed;
     return indexed.filter(({ entry }) =>
@@ -154,7 +208,11 @@
   function applyEntryRemoval(entryIds: string[]) {
     if (!detail) return;
     const remove = new Set(entryIds);
-    const tracks = detail.tracks.filter((entry) => !remove.has(entry.entryId));
+    applyTracks(detail.tracks.filter((entry) => !remove.has(entry.entryId)));
+  }
+
+  function applyTracks(tracks: PlaylistTrackDto[]) {
+    if (!detail) return;
     detail = {
       ...detail,
       playlist: { ...detail.playlist, trackCount: tracks.length },
@@ -163,9 +221,20 @@
     swrSet(`playlist:${playlistId}`, detail);
   }
 
-  function removeEntry(entryId: string) {
+  async function removeEntry(entryId: string) {
     if (!detail) return;
     const id = playlistId;
+    // The server removes every entry with this id: say so before it does.
+    const copies = sharedIds.get(entryId) ?? 1;
+    if (copies > 1) {
+      const ok = await confirm.ask({
+        title: m.playlist_remove_track(),
+        body: m.playlist_remove_repeated({ count: copies }),
+        confirmLabel: m.playlist_remove_repeated_confirm({ count: copies }),
+        danger: true,
+      });
+      if (!ok || !detail || id !== page.params.id) return;
+    }
     gen++;
     // Optimistic: drop the row now, re-sync from the server on failure.
     applyEntryRemoval([entryId]);
@@ -190,13 +259,13 @@
         info: (track) =>
           (info = { itemId: track.id, name: track.name, playCount: track.playCount }),
         edit: (track) => (edit = { itemId: track.id, name: track.name }),
-        // Removal goes by entry id: the same track can sit in a playlist twice,
-        // and the item id cannot tell the two rows apart.
+        // Removal goes by entry id, which is what the server removes by — on
+        // Jellyfin 10.11 every copy of a repeated track (removeEntry asks).
         extra: () => [
           {
             label: m.playlist_remove_track(),
             icon: TRACK_ICON.trash,
-            action: () => removeEntry(entry.entryId),
+            action: () => void removeEntry(entry.entryId),
           },
         ],
       }),
@@ -210,27 +279,41 @@
     duplicatePreview = true;
   }
 
-  async function cleanDuplicates(entryIds: string[]) {
-    if (!detail || entryIds.length === 0) return;
+  async function cleanDuplicates() {
+    if (!detail || duplicateEntryCount === 0) return;
     const id = playlistId;
     const previous = detail;
     duplicateBusy = true;
     duplicateError = null;
     gen++;
-    applyEntryRemoval(entryIds);
+    applyTracks(firstOccurrences(detail.tracks));
     try {
-      await apiLibrary.playlistRemove(id, entryIds);
+      const { removed, hidden } = await apiLibrary.removePlaylistDuplicates(id);
+      if (hidden > 0) {
+        // Nothing was changed: the rewrite would have deleted the entries
+        // this user cannot see. The dialog stays open and says so.
+        if (id === page.params.id) {
+          detail = previous;
+          swrSet(`playlist:${id}`, previous);
+          duplicateError = (
+            hidden === 1 ? m.playlist_duplicates_hidden_one : m.playlist_duplicates_hidden_many
+          )({ count: hidden });
+        }
+        return;
+      }
       duplicatePreview = false;
       toast.show(
-        (entryIds.length === 1 ? m.playlist_duplicates_cleaned_one : m.playlist_duplicates_cleaned_many)({
-          count: entryIds.length,
+        (removed === 1 ? m.playlist_duplicates_cleaned_one : m.playlist_duplicates_cleaned_many)({
+          count: removed,
         }),
       );
+      // The server rewrote the playlist; show what it holds now.
+      if (id === page.params.id) load(id);
     } catch (e) {
       if (id === page.params.id) {
         detail = previous;
         swrSet(`playlist:${id}`, previous);
-        duplicateError = String(e);
+        duplicateError = m.error_generic({ message: String(e) });
         load(id);
       }
     } finally {
@@ -268,18 +351,49 @@
     targetId: string;
     targetName: string;
     moved: boolean;
+    added: number | null;
+    removeError: string | null;
   }) {
     transferOpen = false;
     swrDelete(`playlist:${result.targetId}`);
+    const name = result.targetName;
+    if (result.removeError !== null) {
+      // Copied, but this playlist could not be changed (it may not be yours)
+      // — or only in part: the removal goes a hundred entries at a time, and
+      // an answer can be lost after the server acted. Show what it holds now.
+      gen++;
+      load(playlistId);
+      toast.show(m.playlist_transfer_move_partial({ name, message: result.removeError }), {
+        kind: "error",
+      });
+      return;
+    }
     if (result.moved) {
       gen++;
       applyEntryRemoval(result.movedEntryIds);
+      const count = result.movedEntryIds.length;
+      toast.show(
+        (count === 1 ? m.playlist_transfer_done_move_one : m.playlist_transfer_done_move_many)({
+          count,
+          name,
+        }),
+      );
+      return;
     }
-    const count = result.movedEntryIds.length;
-    const done = result.moved
-      ? (count === 1 ? m.playlist_transfer_done_move_one : m.playlist_transfer_done_move_many)
-      : (count === 1 ? m.playlist_transfer_done_copy_one : m.playlist_transfer_done_copy_many);
-    toast.show(done({ count, name: result.targetName }));
+    // What the target gained: Jellyfin skips the tracks it already holds.
+    const count = result.added ?? result.movedEntryIds.length;
+    if (count === 0) {
+      const already =
+        result.movedEntryIds.length === 1 ? m.playlist_already_has_one : m.playlist_already_has_many;
+      toast.show(already({ name }), { kind: "info" });
+      return;
+    }
+    toast.show(
+      (count === 1 ? m.playlist_transfer_done_copy_one : m.playlist_transfer_done_copy_many)({
+        count,
+        name,
+      }),
+    );
   }
 
   function onPageKeydown(event: KeyboardEvent) {
@@ -474,6 +588,8 @@
     </div>
     {#if filterActive}
       <p class="px-6 pb-2 text-xs text-ink-muted">{m.playlist_filter_reorder_disabled()}</p>
+    {:else if !reorderable}
+      <p class="px-6 pb-2 text-xs text-ink-muted">{m.playlist_duplicates_reorder_disabled()}</p>
     {/if}
 
     <div class="px-6 pb-6">
@@ -487,7 +603,7 @@
       {:else}
         <table class="w-full border-collapse text-sm">
           <tbody ondragleave={() => (dropAt = null)}>
-            {#each visibleTracks as visible (visible.entry.entryId)}
+            {#each visibleTracks as visible (visible.key)}
               {@const entry = visible.entry}
               {@const originalIndex = visible.originalIndex}
               <tr
@@ -498,17 +614,17 @@
                 tabindex="0"
                 role="button"
                 aria-label={entry.track.name}
-                draggable={!filterActive}
+                draggable={reorderable}
                 ondragstart={(event) => {
-                  if (filterActive) return;
+                  if (!reorderable) return;
                   dragFrom = originalIndex;
                   if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
                 }}
                 ondragover={(event) => {
-                  if (!filterActive) onDragOver(event, originalIndex);
+                  if (reorderable) onDragOver(event, originalIndex);
                 }}
                 ondrop={() => {
-                  if (!filterActive) onDrop();
+                  if (reorderable) onDrop();
                 }}
                 ondragend={() => {
                   dragFrom = null;
@@ -518,7 +634,7 @@
                 {@attach contextMenuKey}
                 onclick={() => player.run(apiLibrary.playPlaylist(playlistId, originalIndex))}
                 onkeydown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
+                  if (activatesRow(event)) {
                     event.preventDefault();
                     player.run(apiLibrary.playPlaylist(playlistId, originalIndex));
                   }
@@ -569,7 +685,7 @@
                       class="rounded p-1 text-ink-muted hover:text-ink"
                       onclick={(event) => {
                         event.stopPropagation();
-                        removeEntry(entry.entryId);
+                        void removeEntry(entry.entryId);
                       }}
                       aria-label={m.playlist_remove_track()}
                       title={m.playlist_remove_track()}
@@ -621,6 +737,7 @@
     x={addTo.x}
     y={addTo.y}
     trackIds={addTo.trackIds}
+    trigger={addTo.trigger}
     onclose={() => (addTo = null)}
   />
 {/if}

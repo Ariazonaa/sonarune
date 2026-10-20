@@ -12,17 +12,23 @@
   import EmptyState from "#lib/components/EmptyState.svelte";
   import { player } from "#lib/state/player.svelte.js";
   import { session } from "#lib/state/session.svelte.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
+  import { playlists } from "#lib/state/playlists.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
+  import { playInAlbum } from "#lib/playInAlbum.js";
+  import { activatesRow } from "#lib/rowKeys.js";
   import {
     cloneSmartFilter,
     emptySmartFilter,
+    genreIdReplacements,
     loadSmartViews,
     newSmartView,
     persistSmartViews,
+    replaceGenreIds,
     smartYearProblem,
+    unknownGenreIds,
     type SavedSmartView,
     type SmartYearProblem,
   } from "#lib/smartViews.js";
@@ -37,6 +43,12 @@
   let filter = $state<SmartFilter>(emptySmartFilter());
   let genres = $state<GenreDto[] | null>(swrGet<GenreDto[]>("genres") ?? null);
   let genresError = $state<string | null>(null);
+  /** Names of selected genre ids the list lacks (see migrateGenreIds). */
+  let genreNames = $state<Record<string, string>>({});
+  /** Genre lookups in flight. */
+  let genreLookups = $state(0);
+  /** Genre ids already looked up: each is asked about once. */
+  const askedGenreIds = new Set<string>();
 
   let tracks = $state<TrackDto[]>([]);
   let total = $state<number | null>(null);
@@ -60,6 +72,18 @@
   };
   const hasMore = $derived(total === null || tracks.length < total);
   const hasResults = $derived(tracks.length > 0);
+  /** Selected genre ids the list lacks — an older view's genre no name
+   *  matched, or one gone from the library — shown so they can be removed. */
+  const strayGenreIds = $derived.by(() => {
+    if (!genres) return [];
+    const listed = new Set(genres.map((genre) => genre.id));
+    return filter.genreIds.filter((id) => !listed.has(id));
+  });
+
+  function strayGenreLabel(id: string): string {
+    if (Object.hasOwn(genreNames, id)) return genreNames[id];
+    return genreLookups > 0 ? "…" : m.smart_genre_unknown();
+  }
 
   function loadGenres() {
     api
@@ -68,6 +92,7 @@
         genres = result;
         genresError = null;
         swrSet("genres", result);
+        void migrateGenreIds();
       })
       .catch((cause) => {
         if (!genres) genresError = String(cause);
@@ -76,8 +101,51 @@
 
   onMount(() => {
     savedViews = loadSmartViews(session.info);
+    void migrateGenreIds();
     loadGenres();
   });
+
+  // Views saved before 0.6.1 picked genres by the ids of Jellyfin's `Genre`
+  // items; the list now carries the music genres' own ids, so their chips
+  // showed unselected and could not be cleared. Ids the list lacks are looked
+  // up once, replaced by the listed genre of the same name, and the views
+  // saved again. An id no listed genre matches stays (the server still
+  // filters by its name) and gets a chip of its own, see `strayGenreIds`.
+  async function migrateGenreIds() {
+    if (!genres) return;
+    const filters = [filter, ...savedViews.map((view) => view.filter)];
+    const pending = unknownGenreIds(filters, genres).filter((id) => !askedGenreIds.has(id));
+    if (pending.length > 0) {
+      for (const id of pending) askedGenreIds.add(id);
+      genreLookups++;
+      try {
+        const found = await apiDiscovery.getGenresById(pending);
+        genreNames = { ...genreNames, ...Object.fromEntries(found.map((genre) => [genre.id, genre.name])) };
+      } catch {
+        // Asked again with the next genre list.
+        for (const id of pending) askedGenreIds.delete(id);
+        return;
+      } finally {
+        genreLookups--;
+      }
+    }
+    if (!genres) return;
+    const replacements = genreIdReplacements(genreNames, genres);
+    if (replacements.size === 0) return;
+    let changed = false;
+    const migrated = savedViews.map((view) => {
+      const next = replaceGenreIds(view.filter, replacements);
+      if (next === view.filter) return view;
+      changed = true;
+      return { ...view, filter: next };
+    });
+    if (changed) {
+      savedViews = migrated;
+      persistSmartViews(session.info, savedViews);
+    }
+    const current = replaceGenreIds(filter, replacements);
+    if (current !== filter) filter = current;
+  }
 
   function cacheKey(signature: string) {
     return `smart:results:${signature}`;
@@ -140,12 +208,8 @@
     return () => clearTimeout(timer);
   });
 
-  $effect(() => {
-    if (library.revision > 0) {
-      const signature = untrack(() => filterSignature);
-      untrack(() => startQuery(signature));
-    }
-  });
+  // The debounce effect above runs the first query; this one only reruns it.
+  onLibraryChange(() => void startQuery(filterSignature));
 
   function setNumber(field: "yearFrom" | "yearTo" | "minPlayCount", event: Event) {
     const value = (event.currentTarget as HTMLInputElement).valueAsNumber;
@@ -212,6 +276,8 @@
     materializing = true;
     try {
       const playlistId = await apiDiscovery.materializeSmartView(trimmed, cloneSmartFilter(filter));
+      // The sidebar lists playlists from this store, which nothing polls.
+      playlists.refresh();
       toast.show(m.smart_materialized({ name: trimmed }));
       await goto(`/playlist/${playlistId}`);
     } catch (cause) {
@@ -221,18 +287,8 @@
     }
   }
 
-  async function playTrack(track: TrackDto) {
-    if (!track.albumId) {
-      player.run(apiDiscovery.playTracks([track.id], false));
-      return;
-    }
-    try {
-      const album = await api.getAlbum(track.albumId);
-      const index = album.tracks.findIndex((candidate) => candidate.id === track.id);
-      await api.playAlbum(track.albumId, Math.max(0, index));
-    } catch (cause) {
-      player.error = String(cause);
-    }
+  function playTrack(track: TrackDto) {
+    player.run(playInAlbum(track.id, track.albumId));
   }
 </script>
 
@@ -415,9 +471,20 @@
           {#if genresError}
             <p class="mb-2 text-xs text-red-400">{m.error_generic({ message: genresError })}</p>
           {/if}
-          {#if genres?.length}
+          {#if genres?.length || strayGenreIds.length}
             <div class="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto pr-1">
-              {#each genres as genre (genre.id)}
+              {#each strayGenreIds as id (id)}
+                <button
+                  type="button"
+                  class="rounded-full border border-accent bg-accent px-3 py-1 text-xs font-semibold text-(--color-on-accent) transition-colors"
+                  onclick={() => toggleGenre(id)}
+                  aria-pressed="true"
+                  title={m.smart_genre_unknown_hint()}
+                >
+                  {strayGenreLabel(id)}
+                </button>
+              {/each}
+              {#each genres ?? [] as genre (genre.id)}
                 <button
                   type="button"
                   class="rounded-full border px-3 py-1 text-xs font-semibold transition-colors
@@ -490,7 +557,7 @@
                     aria-label={track.name}
                     onclick={() => playTrack(track)}
                     onkeydown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
+                      if (activatesRow(event)) {
                         event.preventDefault();
                         playTrack(track);
                       }

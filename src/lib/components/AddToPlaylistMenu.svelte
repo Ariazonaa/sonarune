@@ -1,5 +1,6 @@
 <script lang="ts">
   import { apiLibrary } from "#lib/api/library.js";
+  import { playlistAddedToast } from "#lib/playlistAdd.js";
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   // Aliased: this file has its own `playlists` — the list it renders.
@@ -12,11 +13,15 @@
     x,
     y,
     trackIds,
+    trigger = null,
     onclose,
   }: {
     x: number;
     y: number;
     trackIds: string[];
+    /** The button that opened it, if any — its click then closes the picker
+     *  again (see Popover). */
+    trigger?: HTMLElement | null;
     onclose: () => void;
   } = $props();
 
@@ -37,8 +42,9 @@
   async function addTo(pl: PlaylistDto) {
     onclose();
     try {
-      await apiLibrary.playlistAdd(pl.id, trackIds);
-      toast.show(m.add_to_playlist_done({ name: pl.name }));
+      const added = await apiLibrary.playlistAdd(pl.id, trackIds);
+      const { message, kind } = playlistAddedToast(pl.name, trackIds, added);
+      toast.show(message, { kind });
     } catch (e) {
       player.error = String(e);
     }
@@ -61,7 +67,7 @@
 <!-- A menu (keys handled by Popover): "New playlist…" and the playlists are
      its items. The name field that replaces "New playlist…" keeps its own
      keys; Enter creates, Escape and Tab close the menu. -->
-<Popover at={{ x, y }} {onclose} label={m.add_to_playlist()} class="flex max-h-80 w-60 flex-col">
+<Popover at={{ x, y }} {trigger} {onclose} label={m.add_to_playlist()} class="flex max-h-80 w-60 flex-col">
   <!-- Visual heading only: the menu's accessible name says the same. -->
   <p class="px-3 pt-1.5 pb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted" aria-hidden="true">
     {m.add_to_playlist()}

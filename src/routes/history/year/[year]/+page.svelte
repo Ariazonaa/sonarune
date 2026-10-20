@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { page } from "$app/state";
-  import { api, formatDuration } from "#lib/api.js";
+  import { formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
@@ -9,6 +9,7 @@
   import Cover from "#lib/components/Cover.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
   import { formatListened } from "#lib/historyTimeline.js";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import { player } from "#lib/state/player.svelte.js";
   import type { HistoryTrack, HistoryYears, YearReview } from "#lib/types.js";
 
@@ -83,19 +84,8 @@
     })),
   );
 
-  async function playTrack(track: HistoryTrack) {
-    if (!track.albumId) {
-      player.run(api.enqueueTracks([track.itemId], false));
-      return;
-    }
-    try {
-      const album = await api.getAlbum(track.albumId);
-      const index = album.tracks.findIndex((t) => t.id === track.itemId);
-      if (index < 0) player.run(api.enqueueTracks([track.itemId], false));
-      else await api.playAlbum(track.albumId, index);
-    } catch (e) {
-      player.error = String(e);
-    }
+  function playTrack(track: HistoryTrack) {
+    player.run(playInAlbum(track.itemId, track.albumId));
   }
 </script>
 
@@ -176,7 +166,8 @@
       <section class="mb-8">
         <h2 class="mb-3 text-lg font-bold tracking-tight">{m.stats_most_played_albums()}</h2>
         <div data-card-row class="flex gap-4 overflow-x-auto pb-2">
-          {#each review.topAlbums as album (album.albumId ?? `${album.name}\u0001${album.artist}`)}
+          {#each review.topAlbums as album, i (album.albumId ?? `\u0001${i}`)}
+            {@const by = album.variousArtists ? m.history_review_various_artists() : album.artist}
             <svelte:element
               this={album.albumId ? "a" : "div"}
               href={album.albumId ? `/album/${album.albumId}` : undefined}
@@ -193,7 +184,7 @@
               </div>
               <p class="mt-3 truncate text-sm font-semibold">{album.name}</p>
               <p class="mt-0.5 truncate text-xs font-medium text-ink-muted">
-                {album.artist} · {m.stats_plays({ count: album.plays })}
+                {by ? `${by} · ` : ""}{m.stats_plays({ count: album.plays })}
               </p>
             </svelte:element>
           {/each}

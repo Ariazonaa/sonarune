@@ -11,8 +11,10 @@ import type {
   HomeData,
   MetadataEdits,
   Page,
+  PlaylistCleanup,
   PlaylistDetail,
   PlaylistDto,
+  PlaylistTransfer,
   StatsData,
   TrackDto,
   YearReview,
@@ -27,13 +29,20 @@ export const apiLibrary = {
   deletePlaylist: (playlistId: string) => invoke<void>("delete_playlist", { playlistId }),
   renamePlaylist: (playlistId: string, name: string) =>
     invoke<void>("rename_playlist", { playlistId, name }),
+  /** Resolves with how many tracks the playlist gained (null: unknown) —
+   *  Jellyfin skips the ones it already holds. */
   playlistAdd: (playlistId: string, trackIds: string[]) =>
-    invoke<void>("playlist_add", { playlistId, trackIds }),
+    invoke<number | null>("playlist_add", { playlistId, trackIds }),
   /** `entryIds` are playlist entry ids (PlaylistTrackDto.entryId), not item ids. */
   playlistRemove: (playlistId: string, entryIds: string[]) =>
     invoke<void>("playlist_remove", { playlistId, entryIds }),
   playlistMove: (playlistId: string, entryId: string, newIndex: number) =>
     invoke<void>("playlist_move", { playlistId, entryId, newIndex }),
+  /** Keep the first entry of every track, drop the later ones — unless the
+   *  playlist holds entries the user cannot see (`hidden`), which the rewrite
+   *  would delete; then nothing is changed. */
+  removePlaylistDuplicates: (playlistId: string) =>
+    invoke<PlaylistCleanup>("remove_playlist_duplicates", { playlistId }),
   duplicatePlaylist: (playlistId: string, name: string) =>
     invoke<string>("duplicate_playlist", { playlistId, name }),
   transferPlaylistEntries: (
@@ -42,7 +51,7 @@ export const apiLibrary = {
     entryIds: string[],
     moveEntries: boolean,
   ) =>
-    invoke<void>("transfer_playlist_entries", {
+    invoke<PlaylistTransfer>("transfer_playlist_entries", {
       sourcePlaylistId,
       targetPlaylistId,
       entryIds,

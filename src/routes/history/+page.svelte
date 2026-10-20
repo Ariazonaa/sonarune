@@ -10,7 +10,8 @@
   import { confirm } from "#lib/state/confirm.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
-  import { dayLabel, groupTimeline, type TimelineRow } from "#lib/historyTimeline.js";
+  import { dayLabel, groupTimeline, msUntilTomorrow, type TimelineRow } from "#lib/historyTimeline.js";
+  import { playInAlbum } from "#lib/playInAlbum.js";
   import type { HistoryEntry, HistoryTrack, HistoryYears } from "#lib/types.js";
 
   const PAGE_SIZE = 100;
@@ -23,6 +24,9 @@
   let exhausted = $state(false);
   let error = $state<string | null>(null);
   let loaded = $state(false);
+  /** What "Today" and "Yesterday" are counted from. The page stays open for
+   *  hours (in the tray, too): it moves on at midnight and with every reload. */
+  let now = $state(new Date());
   let generation = 0;
 
   async function load(reset: boolean) {
@@ -30,6 +34,7 @@
     const seq = reset ? ++generation : generation;
     loading = true;
     error = null;
+    if (reset) now = new Date();
     try {
       const before = reset ? null : (entries.at(-1)?.id ?? null);
       const page = await apiLibrary.historyPage(before, PAGE_SIZE);
@@ -66,31 +71,37 @@
       if (cancelled) fn();
       else unlisten = fn;
     });
+    // A hidden or minimised window's WebView is suspended, and the listens
+    // that ended meanwhile may never have reached it: catch up once it shows
+    // again (the player store resyncs the same way).
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      if (entries.length <= PAGE_SIZE) void load(true);
+      else now = new Date();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    let midnight: ReturnType<typeof setTimeout> | undefined;
+    const untilTomorrow = () => {
+      midnight = setTimeout(() => {
+        now = new Date();
+        untilTomorrow();
+      }, msUntilTomorrow(new Date()));
+    };
+    untilTomorrow();
     return () => {
       cancelled = true;
       unlisten?.();
+      document.removeEventListener("visibilitychange", onVisible);
+      clearTimeout(midnight);
     };
   });
 
   const days = $derived(groupTimeline(entries));
   const locale = $derived(getLocale());
   const time = $derived(new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }));
-  const now = new Date();
 
-  async function playTrack(track: HistoryTrack) {
-    if (!track.albumId) {
-      player.run(api.enqueueTracks([track.itemId], false));
-      return;
-    }
-    try {
-      const album = await api.getAlbum(track.albumId);
-      const index = album.tracks.findIndex((t) => t.id === track.itemId);
-      // A track no longer on its album still plays, on its own.
-      if (index < 0) player.run(api.enqueueTracks([track.itemId], false));
-      else await api.playAlbum(track.albumId, index);
-    } catch (e) {
-      player.error = String(e);
-    }
+  function playTrack(track: HistoryTrack) {
+    player.run(playInAlbum(track.itemId, track.albumId));
   }
 
   async function forget(row: TimelineRow) {

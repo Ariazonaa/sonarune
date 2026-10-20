@@ -12,16 +12,19 @@ export interface SimilarArtistsRow extends DiscoverRow<ArtistDto> {
 
 export interface DecadeDto {
   startYear: number;
+  /** English ("1990s"), not for display: the UI words it per language with
+   *  `m.discover_decade_label({ year: startYear })`. */
   label: string;
 }
 
+/** The hub's rows. "Long not heard" comes from `getLongNotHeard` on its own:
+ *  it scans the play history, and the other rows need not wait for that. */
 export interface DiscoverData {
   randomAlbums: DiscoverRow<AlbumDto>;
   genres: DiscoverRow<GenreDto>;
   instantMixSeeds: DiscoverRow<TrackDto>;
   similarArtists: SimilarArtistsRow;
   decades: DiscoverRow<DecadeDto>;
-  longNotHeard: DiscoverRow<AlbumDto>;
 }
 
 export type SmartPlayed = "all" | "played" | "unplayed";
@@ -61,8 +64,10 @@ export const apiDiscovery = {
   getDecades: () => invoke<DecadeDto[]>("get_discover_decades"),
   getDecadeAlbums: (startYear: number, startIndex: number, limit: number) =>
     invoke<Page<AlbumDto>>("get_discover_decade_albums", { startYear, startIndex, limit }),
-  getLongNotHeard: (startIndex: number, limit: number) =>
-    invoke<Page<AlbumDto>>("get_long_not_heard_albums", { startIndex, limit }),
+  /** `reuseRecent`: a ranking from the last few minutes will do for the first
+   *  page too (the hub row); otherwise the first page ranks afresh. */
+  getLongNotHeard: (startIndex: number, limit: number, reuseRecent = false) =>
+    invoke<Page<AlbumDto>>("get_long_not_heard_albums", { startIndex, limit, reuseRecent }),
   playAlbums: (albumIds: string[], shuffle: boolean) =>
     invoke<void>("play_discover_albums", { albumIds, shuffle }),
   playTracks: (trackIds: string[], shuffle: boolean) =>
@@ -72,6 +77,9 @@ export const apiDiscovery = {
   playDecade: (startYear: number, shuffle: boolean) =>
     invoke<void>("play_discover_decade", { startYear, shuffle }),
 
+  /** The genres among `genreIds`, with their names — for ids the genre list
+   *  lacks (an older smart view's). Ids that name no genre are left out. */
+  getGenresById: (genreIds: string[]) => invoke<GenreDto[]>("get_genres_by_id", { genreIds }),
   querySmartView: (filter: SmartFilter, startIndex: number, limit: number) =>
     invoke<Page<TrackDto>>("query_smart_view", { filter, startIndex, limit }),
   playSmartView: (filter: SmartFilter, shuffle: boolean) =>

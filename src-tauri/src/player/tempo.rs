@@ -128,6 +128,10 @@ enum Mode {
     /// Bypass, fading out over the remaining frames before the stretch
     /// takes over.
     HandOver(u32),
+    /// Bypass, fading in over the remaining frames: after the stretch handed
+    /// back (its last output tapers to silence), or a hand-over called off
+    /// once the bypass had faded out.
+    FadeIn(u32),
     Stretch,
 }
 
@@ -230,10 +234,15 @@ impl<S: Source> TempoSource<S> {
         let ch = self.channels;
         if is_unity(speed) {
             // Move the processing time up to everything pulled so far, at
-            // the old speed, then read the rest: the bypass goes on exactly
-            // where the stretch stopped.
+            // the old speed, and read out what the stretch still holds. The
+            // library's recipe for that is `input_latency` frames of silence
+            // and then a flush: real input there would be taken and never
+            // played, as the processing time only reaches the input before
+            // it. So the bypass goes on with the very next input frame, and
+            // fades in, as the flushed output tapers to silence.
             let in_lat = self.stretch.input_latency();
-            let samples = self.pull(in_lat);
+            let samples = in_lat * ch;
+            self.input[..samples].fill(0.0);
             let tail = (in_lat as f64 / f64::from(self.speed)).round() as usize;
             let out_lat = self.stretch.output_latency();
             self.stretch
@@ -242,7 +251,7 @@ impl<S: Source> TempoSource<S> {
                 .flush(&mut self.output[tail * ch..(tail + out_lat) * ch]);
             self.out_len = (tail + out_lat) * ch;
             self.out_pos = 0;
-            self.mode = Mode::Bypass;
+            self.mode = Mode::FadeIn(HANDOVER_FADE_FRAMES);
             self.speed = 1.0;
             self.channel_idx = 0;
             self.until_check = PARAM_CHECK_INTERVAL;
@@ -283,7 +292,9 @@ impl<S: Source> Iterator for TempoSource<S> {
                 Mode::HandOver(0) => {
                     let (speed, preserve_pitch) = self.wanted();
                     if is_unity(speed) {
-                        self.mode = Mode::Bypass;
+                        // Called off: the bypass is at silence by now, so it
+                        // fades back in rather than jumping to full level.
+                        self.mode = Mode::FadeIn(HANDOVER_FADE_FRAMES);
                     } else {
                         self.start_stretch(speed, preserve_pitch);
                         self.fill();
@@ -291,6 +302,13 @@ impl<S: Source> Iterator for TempoSource<S> {
                     }
                 }
                 Mode::HandOver(left) => self.mode = Mode::HandOver(left - 1),
+                Mode::FadeIn(left) => {
+                    self.mode = if left > 1 {
+                        Mode::FadeIn(left - 1)
+                    } else {
+                        Mode::Bypass
+                    };
+                }
                 _ => {
                     if self.until_check == 0 {
                         self.until_check = PARAM_CHECK_INTERVAL;
@@ -304,6 +322,7 @@ impl<S: Source> Iterator for TempoSource<S> {
         }
         let gain = match self.mode {
             Mode::HandOver(left) => left as f32 / HANDOVER_FADE_FRAMES as f32,
+            Mode::FadeIn(left) => 1.0 - left as f32 / HANDOVER_FADE_FRAMES as f32,
             _ => 1.0,
         };
         self.channel_idx += 1;
@@ -452,32 +471,122 @@ mod tests {
         assert!(gap < 60, "gap of {gap} frames going back to 1x");
     }
 
+    /// A source that counts the samples taken from it.
+    struct Counted {
+        inner: SamplesBuffer,
+        taken: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Iterator for Counted {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<f32> {
+            self.taken.fetch_add(1, Ordering::Relaxed);
+            self.inner.next()
+        }
+    }
+
+    impl Source for Counted {
+        fn current_span_len(&self) -> Option<usize> {
+            self.inner.current_span_len()
+        }
+
+        fn channels(&self) -> rodio::ChannelCount {
+            self.inner.channels()
+        }
+
+        fn sample_rate(&self) -> rodio::SampleRate {
+            self.inner.sample_rate()
+        }
+
+        fn total_duration(&self) -> Option<Duration> {
+            None
+        }
+    }
+
     #[test]
     fn back_to_unity_resumes_the_input_where_the_stretch_stopped() {
-        // A ramp makes every input sample identifiable.
-        let n = RATE as usize * 3;
-        let ramp: Vec<f32> = (0..n).flat_map(|i| [i as f32, i as f32]).collect();
-        let source = SamplesBuffer::new(
-            rodio::ChannelCount::new(2).unwrap(),
-            rodio::SampleRate::new(RATE).unwrap(),
-            ramp,
-        );
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Counted {
+            inner: tone(4.0, 440.0),
+            taken: taken.clone(),
+        };
         let handle = TempoHandle::new(1.25, true);
         let mut tempo = wrap(source, &handle);
-        let first: usize = tempo.by_ref().take(RATE as usize * 2).count() / 2;
+        // Input frames taken once each output frame was out.
+        let mut log = Vec::new();
+        let run = |tempo: &mut TempoSource<Counted>, log: &mut Vec<usize>, frames: usize| {
+            for _ in 0..frames {
+                tempo.next();
+                tempo.next();
+                log.push(taken.load(Ordering::Relaxed) / 2);
+            }
+        };
+        run(&mut tempo, &mut log, RATE as usize * 2);
+        let switch = log.len();
         handle.set(1.0, true);
-        let after: Vec<f32> = tempo.by_ref().take(RATE as usize * 2).collect();
-        let left: Vec<f32> = after.iter().step_by(2).copied().collect();
-        let tail = left.windows(2).rposition(|w| w[1] - w[0] != 1.0).unwrap();
-        // Consumed: the hand-over fade, the start latency, whole blocks at
-        // 1.25x, then one more latency when handing back.
+        run(&mut tempo, &mut log, RATE as usize);
+
         let lat = Stretch::preset_default(2, RATE).input_latency();
-        let low = (first as f64 * 1.25) as usize + 2 * lat;
-        let high = low + HANDOVER_FADE_FRAMES as usize + 2 * BLOCK;
-        let resumed = left[tail + 1] as usize;
+        let out_lat = Stretch::preset_default(2, RATE).output_latency();
+        // The stretch starts where one frame takes the start latency plus a
+        // block's worth of input at once.
+        let start = (1..log.len())
+            .find(|&i| log[i] - log[i - 1] > lat)
+            .expect("the stretch started");
+        // Back in the bypass: one input frame per output frame from here.
+        let junction = (switch.max(start + 1)..log.len())
+            .find(|&i| log[i] - log[i - 1] == 1 && log[i + 1] - log[i] == 1)
+            .expect("the bypass took over again");
+        let resumed = log[junction - 1];
+        // What the stretch played stands for its input up to the processing
+        // time it ended at: its output, less the pre-roll, times the speed.
+        let played_through = log[start - 1] + ((junction - start - out_lat) as f64 * 1.25) as usize;
         assert!(
-            (low..=high).contains(&resumed),
-            "{resumed} not in {low}..={high}"
+            resumed.abs_diff(played_through) <= 4,
+            "the bypass resumed at input frame {resumed}, the stretch played up to \
+             {played_through}: {} frames went unplayed",
+            resumed as i64 - played_through as i64
         );
+    }
+
+    #[test]
+    fn a_called_off_hand_over_fades_back_in() {
+        // Constant input: the output is the stage's gain.
+        let ones = SamplesBuffer::new(
+            rodio::ChannelCount::new(2).unwrap(),
+            rodio::SampleRate::new(RATE).unwrap(),
+            vec![1.0; RATE as usize * 2],
+        );
+        let handle = TempoHandle::new(1.0, true);
+        let mut tempo = wrap(ones, &handle);
+        let _: Vec<f32> = tempo.by_ref().take(2_000).collect();
+        handle.set(1.05, true);
+        // Wait for the hand-over's fade to begin, then change our mind.
+        let mut left = Vec::new();
+        loop {
+            let sample = tempo.next().unwrap();
+            tempo.next();
+            left.push(sample);
+            if sample < 1.0 {
+                break;
+            }
+            assert!(
+                left.len() < 4 * PARAM_CHECK_INTERVAL as usize,
+                "no hand-over"
+            );
+        }
+        handle.set(1.0, true);
+        for _ in 0..2_000 {
+            left.push(tempo.next().unwrap());
+            tempo.next();
+        }
+        let step = 1.0 / HANDOVER_FADE_FRAMES as f32 + 1e-6;
+        let jump = left
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(jump <= step, "the gain jumped by {jump}");
+        assert_eq!(*left.last().unwrap(), 1.0, "back at full level");
     }
 }

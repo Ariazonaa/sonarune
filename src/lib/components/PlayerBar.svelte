@@ -6,6 +6,8 @@
   import { api } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
+  // Perceptual taper, shared with the volume shortcuts (see volume.ts).
+  import { positionToVolume as posToVol, volumeToPosition as volToPos } from "#lib/volume.js";
   import Cover from "./Cover.svelte";
   import PlaybackProgress from "./PlaybackProgress.svelte";
   import Popover from "./Popover.svelte";
@@ -15,23 +17,16 @@
 
   // Closing the visualizer should return to wherever it was opened from (e.g.
   // the album you were viewing), not the landing view. Track the last route
-  // that wasn't the visualizer, however it was opened (button/palette/direct).
+  // that wasn't the visualizer, however it was opened (button/palette/direct)
+  // — with its query, which is where a search keeps its term.
   let lastNonVisualizerPath = $state("/");
   $effect(() => {
-    const path = page.url.pathname;
-    if (path !== "/visualizer") lastNonVisualizerPath = path;
+    const { pathname, search, hash } = page.url;
+    if (pathname !== "/visualizer") lastNonVisualizerPath = pathname + search + hash;
   });
   function toggleVisualizer() {
     goto(page.url.pathname === "/visualizer" ? lastNonVisualizerPath : "/visualizer");
   }
-
-  // Perceptual volume taper: loudness is ~logarithmic, so a linear slider
-  // crams the useful quiet/mid range into a tiny stretch. Map the slider
-  // position through a power curve → more travel (finer control) where it
-  // matters. The stored value stays the linear gain.
-  const VOL_EXP = 2.5;
-  const volToPos = (v: number) => Math.pow(Math.min(1, Math.max(0, v)), 1 / VOL_EXP);
-  const posToVol = (p: number) => Math.pow(Math.min(1, Math.max(0, p)), VOL_EXP);
 
   const HEART_ON =
     "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z";
@@ -74,6 +69,8 @@
     try {
       const existing = await WebviewWindow.getByLabel("mini");
       if (existing) {
+        // Focus alone does nothing for a minimized window (taskbar, Win+D).
+        await existing.unminimize();
         await existing.setFocus();
         return;
       }
@@ -84,6 +81,9 @@
         resizable: false,
         alwaysOnTop: true,
         decorations: false,
+        // Tauri's own drop handler would swallow HTML5 drag and drop on
+        // Windows; see src-tauri/src/webview_drop.rs.
+        dragDropEnabled: false,
         title: "Sonarune Mini",
       });
     } catch (e) {

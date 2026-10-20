@@ -1,13 +1,13 @@
 //! Library-slice commands: playlists, favorites, home page rows.
 
 use crate::api::types::{
-    AlbumDto, ArtistDto, CollectionDto, Page, PlaylistDto, PlaylistTrackDto, TrackDto,
+    AlbumDto, ArtistDto, CollectionDto, Page, PlaylistCleanup, PlaylistDto, PlaylistTrackDto,
+    TrackDto,
 };
 use crate::api::MAX_IDS_PER_REQUEST;
 use crate::commands::{to_queue_tracks, with_retry};
 use crate::commands_discover::{shuffle_items, validate_page};
 use crate::error::{AppError, AppResult};
-use crate::player::PlayerCommand;
 use crate::AppState;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -60,6 +60,7 @@ pub async fn play_collection(
     collection_id: String,
     shuffle: bool,
 ) -> AppResult<()> {
+    let ticket = state.player.play_ticket();
     let queue = with_retry(&state, |client| {
         let collection_id = collection_id.clone();
         async move {
@@ -74,10 +75,7 @@ pub async fn play_collection(
     if queue.is_empty() {
         return Err(AppError::Other("collection has no music tracks".into()));
     }
-    state.player.send(PlayerCommand::PlayQueue {
-        tracks: queue,
-        start_index: 0,
-    })
+    state.player.play_queue(ticket, queue, 0).await
 }
 
 #[tauri::command]
@@ -87,6 +85,7 @@ pub async fn enqueue_collection(
     next: bool,
     shuffle: bool,
 ) -> AppResult<()> {
+    let turn = state.player.enqueue_turn().await;
     let queue = with_retry(&state, |client| {
         let collection_id = collection_id.clone();
         async move {
@@ -101,11 +100,7 @@ pub async fn enqueue_collection(
     if queue.is_empty() {
         return Err(AppError::Other("collection has no music tracks".into()));
     }
-    state.player.send(if next {
-        PlayerCommand::PlayNext(queue)
-    } else {
-        PlayerCommand::PlayLast(queue)
-    })
+    state.player.enqueue(turn, queue, next).await
 }
 
 #[tauri::command]
@@ -129,7 +124,8 @@ pub async fn get_playlist(
         let playlist_id = playlist_id.clone();
         async move {
             let (playlist, tracks) =
-                tokio::try_join!(c.playlist(&playlist_id), c.playlist_tracks(&playlist_id))?;
+                crate::api::join_detail(c.playlist(&playlist_id), c.playlist_tracks(&playlist_id))
+                    .await?;
             Ok(PlaylistDetail { playlist, tracks })
         }
     })
@@ -192,11 +188,17 @@ pub async fn rename_playlist(
 /// Add in request-sized chunks, in order, each chunk its own retry scope:
 /// adding is not idempotent, and retrying the whole list after a re-login
 /// would re-send the chunks the server had already applied.
+///
+/// Returns how many tracks the playlist gained, or `None` when that could not
+/// be read. Jellyfin 10.11 skips tracks the playlist already holds (and
+/// repeats within a request) and still answers 204, so what it took shows only
+/// in the playlist's size before and after.
 async fn add_to_playlist(
     state: &AppState,
     playlist_id: &str,
     item_ids: &[String],
-) -> AppResult<()> {
+) -> AppResult<Option<usize>> {
+    let before = playlist_size(state, playlist_id).await;
     for chunk in item_ids.chunks(MAX_IDS_PER_REQUEST) {
         with_retry(state, |c| {
             let playlist_id = playlist_id.to_string();
@@ -205,19 +207,44 @@ async fn add_to_playlist(
         })
         .await?;
     }
-    Ok(())
+    let after = playlist_size(state, playlist_id).await;
+    Ok(before
+        .zip(after)
+        .map(|(before, after)| after.saturating_sub(before)))
 }
 
+/// How many distinct tracks a playlist holds (its `ChildCount`). Only for
+/// counting what an add did, so a failure is logged and ends up as "unknown"
+/// rather than failing the add itself.
+async fn playlist_size(state: &AppState, playlist_id: &str) -> Option<usize> {
+    let size = with_retry(state, |c| {
+        let playlist_id = playlist_id.to_string();
+        async move { Ok(c.playlist(&playlist_id).await?.track_count) }
+    })
+    .await;
+    match size {
+        Ok(size) => Some(usize::try_from(size).unwrap_or(0)),
+        Err(e) => {
+            tracing::warn!("could not read the playlist size: {e}");
+            None
+        }
+    }
+}
+
+/// Returns how many tracks the playlist gained (`None`: unknown) — fewer than
+/// were sent when it already held some of them.
 #[tauri::command]
 pub async fn playlist_add(
     state: State<'_, AppState>,
     playlist_id: String,
     track_ids: Vec<String>,
-) -> AppResult<()> {
+) -> AppResult<Option<usize>> {
     add_to_playlist(&state, &playlist_id, &track_ids).await
 }
 
-/// `entry_ids` are playlist entry ids (PlaylistItemId), not item ids.
+/// `entry_ids` are playlist entry ids (PlaylistItemId), not item ids. On
+/// Jellyfin 10.11 an entry id is the track's id, so removing one removes every
+/// copy of a track that is in the playlist more than once.
 #[tauri::command]
 pub async fn playlist_remove(
     state: State<'_, AppState>,
@@ -232,6 +259,7 @@ pub async fn playlist_remove(
     .await
 }
 
+/// `new_index` is a position among the tracks `get_playlist` lists.
 #[tauri::command]
 pub async fn playlist_move(
     state: State<'_, AppState>,
@@ -242,9 +270,40 @@ pub async fn playlist_move(
     with_retry(&state, |c| {
         let playlist_id = playlist_id.clone();
         let entry_id = entry_id.clone();
-        async move { c.playlist_move(&playlist_id, &entry_id, new_index).await }
+        async move {
+            c.playlist_move_audio(&playlist_id, &entry_id, new_index)
+                .await
+        }
     })
     .await
+}
+
+/// Keep the first entry of every track in a playlist and drop the later ones —
+/// unless the playlist holds entries the user cannot see, which the rewrite
+/// would delete (see `JellyfinClient::remove_playlist_duplicates`).
+#[tauri::command]
+pub async fn remove_playlist_duplicates(
+    state: State<'_, AppState>,
+    playlist_id: String,
+) -> AppResult<PlaylistCleanup> {
+    with_retry(&state, |c| {
+        let playlist_id = playlist_id.clone();
+        async move { c.remove_playlist_duplicates(&playlist_id).await }
+    })
+    .await
+}
+
+/// What a copy or move between playlists did.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistTransfer {
+    /// How many tracks the target gained (see [`add_to_playlist`]): fewer than
+    /// were selected when it already held some. `None` when unknown.
+    pub added: Option<usize>,
+    /// A move whose copy went through but whose removal from the source
+    /// failed — a playlist the user may read but not change, say. The tracks
+    /// are in the target either way, so this is reported, not an error.
+    pub remove_error: Option<String>,
 }
 
 /// Copy or move exact entries between two playlists. Resolution is performed
@@ -257,7 +316,7 @@ pub async fn transfer_playlist_entries(
     target_playlist_id: String,
     entry_ids: Vec<String>,
     move_entries: bool,
-) -> AppResult<()> {
+) -> AppResult<PlaylistTransfer> {
     if source_playlist_id.trim().is_empty() {
         return Err(AppError::Other(
             "source playlist id must not be empty".into(),
@@ -284,18 +343,26 @@ pub async fn transfer_playlist_entries(
     })
     .await?;
 
-    add_to_playlist(&state, &target_playlist_id, &item_ids).await?;
+    let added = add_to_playlist(&state, &target_playlist_id, &item_ids).await?;
 
+    let mut remove_error = None;
     if move_entries {
-        with_retry(&state, |c| {
+        let removed = with_retry(&state, |c| {
             let source_playlist_id = source_playlist_id.clone();
             let entry_ids = entry_ids.clone();
             async move { c.playlist_remove(&source_playlist_id, &entry_ids).await }
         })
-        .await?;
+        .await;
+        if let Err(e) = removed {
+            tracing::warn!("moved tracks were copied but not removed from the source: {e}");
+            remove_error = Some(e.to_string());
+        }
     }
 
-    Ok(())
+    Ok(PlaylistTransfer {
+        added,
+        remove_error,
+    })
 }
 
 /// Replace the queue with the playlist's tracks, starting at `start_index`.
@@ -305,6 +372,7 @@ pub async fn play_playlist(
     playlist_id: String,
     start_index: usize,
 ) -> AppResult<()> {
+    let ticket = state.player.play_ticket();
     let mut queue = with_retry(&state, |c| {
         let playlist_id = playlist_id.clone();
         async move {
@@ -324,10 +392,7 @@ pub async fn play_playlist(
     if queue.is_empty() {
         return Err(AppError::Other("playlist has no tracks".into()));
     }
-    state.player.send(PlayerCommand::PlayQueue {
-        tracks: queue,
-        start_index,
-    })
+    state.player.play_queue(ticket, queue, start_index).await
 }
 
 /// Permanently delete items (tracks or whole albums) on the server. The files
@@ -477,6 +542,28 @@ pub fn top_artists(tracks: &[TrackDto], limit: usize) -> Vec<ArtistPlays> {
             entry.plays += plays;
         }
     }
+    // A track without linkable artists shows its album artist's name. When
+    // exactly one linked artist goes by that name, it is that artist: one
+    // bar, not two with the same label.
+    let unlinked: Vec<String> = by_artist
+        .iter()
+        .filter(|(_, artist)| artist.id.is_none())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in unlinked {
+        let namesakes: Vec<String> = by_artist
+            .iter()
+            .filter(|(_, artist)| artist.id.is_some() && artist.name.to_lowercase() == key)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let [linked] = namesakes.as_slice() {
+            if let Some(credit) = by_artist.remove(&key) {
+                if let Some(artist) = by_artist.get_mut(linked) {
+                    artist.plays += credit.plays;
+                }
+            }
+        }
+    }
     let mut out: Vec<ArtistPlays> = by_artist.into_values().collect();
     // Ties sort by name, so the chart does not reshuffle itself between two
     // visits that saw the same numbers.
@@ -615,36 +702,52 @@ pub async fn get_stats(state: State<'_, AppState>) -> AppResult<StatsData> {
 // --- Play history (history.rs) ---
 // Local reads and writes only; no server round trip, so no retry either.
 
+/// Run a history query on a blocking thread. A sync command would run on the
+/// main thread, which drives every window: a year of plays is a moment of
+/// SQLite and JSON, and the player waits for the same store meanwhile.
+async fn off_the_main_thread<T: Send + 'static>(
+    state: &AppState,
+    query: impl FnOnce(&crate::store::Store) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || query(&store))
+        .await
+        .map_err(|e| AppError::Other(format!("history: {e}")))?
+}
+
 #[tauri::command]
-pub fn history_page(
+pub async fn history_page(
     state: State<'_, AppState>,
     before: Option<i64>,
     limit: u32,
 ) -> AppResult<Vec<crate::history::HistoryEntry>> {
-    crate::history::page(&state.store, before, limit)
+    off_the_main_thread(&state, move |store| {
+        crate::history::page(store, before, limit)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn history_years(state: State<'_, AppState>) -> AppResult<crate::history::HistoryYears> {
-    crate::history::years(&state.store)
+pub async fn history_years(state: State<'_, AppState>) -> AppResult<crate::history::HistoryYears> {
+    off_the_main_thread(&state, crate::history::years).await
 }
 
 #[tauri::command]
-pub fn history_year(
+pub async fn history_year(
     state: State<'_, AppState>,
     year: i32,
 ) -> AppResult<crate::history::YearReview> {
-    crate::history::year(&state.store, year)
+    off_the_main_thread(&state, move |store| crate::history::year(store, year)).await
 }
 
 #[tauri::command]
-pub fn history_delete(state: State<'_, AppState>, id: i64) -> AppResult<bool> {
-    crate::history::delete(&state.store, id)
+pub async fn history_delete(state: State<'_, AppState>, id: i64) -> AppResult<bool> {
+    off_the_main_thread(&state, move |store| crate::history::delete(store, id)).await
 }
 
 #[tauri::command]
-pub fn history_clear(state: State<'_, AppState>) -> AppResult<usize> {
-    crate::history::clear(&state.store)
+pub async fn history_clear(state: State<'_, AppState>) -> AppResult<usize> {
+    off_the_main_thread(&state, crate::history::clear).await
 }
 
 #[cfg(test)]
@@ -716,6 +819,24 @@ mod tests {
         assert_eq!(top[0].name, "Nameless Band");
         assert_eq!(top[0].plays, 5);
         assert_eq!(top[0].id, None);
+    }
+
+    #[test]
+    fn an_untagged_track_counts_for_the_linked_artist_of_its_name() {
+        let tracks = vec![
+            track("a", "Queen", &[("q", "Queen")], 4),
+            // Only an album-artist tag: no linkable artist, the same name.
+            track("b", "queen", &[], 2),
+            // Two linked artists of one name: which one is anyone's guess.
+            track("c", "John Williams", &[("j1", "John Williams")], 3),
+            track("d", "John Williams", &[("j2", "John Williams")], 1),
+            track("e", "John Williams", &[], 1),
+        ];
+        let top = top_artists(&tracks, 8);
+        let queen: Vec<_> = top.iter().filter(|a| a.name == "Queen").collect();
+        assert_eq!(queen.len(), 1);
+        assert_eq!((queen[0].id.as_deref(), queen[0].plays), (Some("q"), 6));
+        assert_eq!(top.iter().filter(|a| a.name == "John Williams").count(), 3);
     }
 
     #[test]

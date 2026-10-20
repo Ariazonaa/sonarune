@@ -1,11 +1,12 @@
 //! Per-server certificate trust.
 //!
 //! Instead of blanket-accepting invalid certificates, connections are validated
-//! against the OS trust store (the normal, public-CA path) and, additionally,
-//! against explicit SHA-256 fingerprints the user has confirmed for a given
-//! server. That lets self-signed home servers work without disabling all
-//! verification: only the exact certificate the user pinned is accepted, and a
-//! silently changed certificate is rejected until re-confirmed.
+//! by the operating system's own certificate verifier (the normal, public-CA
+//! path) and, additionally, against explicit SHA-256 fingerprints the user has
+//! confirmed for a given server. That lets self-signed home servers work
+//! without disabling all verification: only the exact certificate the user
+//! pinned is accepted, and a silently changed certificate is rejected until
+//! re-confirmed.
 //!
 //! The custom [`ServerCertVerifier`] records the fingerprint of every leaf it is
 //! shown, so the caller can read back which certificate a failed handshake
@@ -63,10 +64,10 @@ pub fn is_valid_fingerprint(raw: &str) -> bool {
 
 #[derive(Debug)]
 struct PinningVerifier {
-    /// Normal OS-trust-store verification (public CAs). `None` when the OS
-    /// store has no anchors at all (a Linux/macOS system without a CA bundle):
-    /// webpki refuses to build then, and only pinned certificates can pass.
-    inner: Option<Arc<WebPkiServerVerifier>>,
+    /// Normal verification of public certificates by the OS ([`os_verifier`]).
+    /// `None` when the OS has no trust anchors at all (a Linux/macOS system
+    /// without a CA bundle): then only pinned certificates can pass.
+    inner: Option<Arc<dyn ServerCertVerifier>>,
     /// Signature algorithms for the handshake when there is no `inner`.
     provider: Arc<CryptoProvider>,
     /// User-confirmed fingerprints for this server, normalized.
@@ -175,8 +176,18 @@ impl ServerCertVerifier for PinningVerifier {
     }
 }
 
-/// The OS trust store, loaded once per process: every client build (each
-/// track open included) would otherwise read it again.
+/// The crypto provider of every client, created once. Matches reqwest's
+/// rustls backend (aws-lc-rs) so there is one provider in the process and no
+/// default-provider ambiguity.
+fn provider() -> Arc<CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .clone()
+}
+
+/// The OS trust store, loaded once per process. Only the fallback verifier
+/// reads it (see [`os_verifier`]).
 fn root_store() -> Arc<RootCertStore> {
     static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
     ROOTS
@@ -195,26 +206,53 @@ fn root_store() -> Arc<RootCertStore> {
         .clone()
 }
 
-fn client_config(trusted: &[String]) -> AppResult<(ClientConfig, ObservedFingerprint)> {
-    client_config_with_roots(trusted, root_store())
+/// webpki over `roots`, or `None` when there is nothing to verify against:
+/// webpki refuses to build over an empty store.
+fn webpki_verifier(
+    roots: Arc<RootCertStore>,
+    provider: Arc<CryptoProvider>,
+) -> Result<Option<Arc<dyn ServerCertVerifier>>, String> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let verifier = WebPkiServerVerifier::builder_with_provider(roots, provider)
+        .build()
+        .map_err(|e| format!("cannot build certificate verifier: {e}"))?;
+    Ok(Some(verifier as Arc<dyn ServerCertVerifier>))
 }
 
-fn client_config_with_roots(
+/// How public certificates are checked: by the operating system's own
+/// verifier (rustls-platform-verifier), built once per process. On Windows
+/// that is CryptoAPI's chain engine, which the rest of the system trusts too:
+/// it fetches a root that is not on disk yet when a chain needs it, honours
+/// distrusted roots and sees roots added while the app runs. A snapshot of
+/// the ROOT store checked by webpki does none of that, so a perfectly valid
+/// certificate could be offered for pinning — and a pinned leaf breaks at the
+/// server's next renewal. Where no platform verifier can be built, the OS
+/// trust store goes through webpki instead.
+fn os_verifier() -> Result<Option<Arc<dyn ServerCertVerifier>>, String> {
+    static OS: OnceLock<Result<Option<Arc<dyn ServerCertVerifier>>, String>> = OnceLock::new();
+    OS.get_or_init(
+        || match rustls_platform_verifier::Verifier::new(provider()) {
+            Ok(verifier) => Ok(Some(Arc::new(verifier) as Arc<dyn ServerCertVerifier>)),
+            Err(e) => {
+                tracing::warn!("no platform certificate verifier ({e}), using the OS trust store");
+                webpki_verifier(root_store(), provider())
+            }
+        },
+    )
+    .clone()
+}
+
+fn client_config(trusted: &[String]) -> AppResult<(ClientConfig, ObservedFingerprint)> {
+    client_config_with(trusted, os_verifier().map_err(AppError::Other)?)
+}
+
+fn client_config_with(
     trusted: &[String],
-    roots: Arc<RootCertStore>,
+    inner: Option<Arc<dyn ServerCertVerifier>>,
 ) -> AppResult<(ClientConfig, ObservedFingerprint)> {
-    // Match reqwest's rustls backend (aws-lc-rs) so there is one provider in
-    // the process and no default-provider ambiguity.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let inner = if roots.is_empty() {
-        None
-    } else {
-        Some(
-            WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
-                .build()
-                .map_err(|e| AppError::Other(format!("cannot build certificate verifier: {e}")))?,
-        )
-    };
+    let provider = provider();
     let observed: ObservedFingerprint = Arc::new(Mutex::new(None));
     let verifier = PinningVerifier {
         inner,
@@ -232,14 +270,16 @@ fn client_config_with_roots(
     Ok((config, observed))
 }
 
-/// Install the pinning TLS backend on a reqwest builder. Returns the builder and
-/// the shared cell that will hold the fingerprint the next handshake presents.
+/// Install the pinning TLS backend and the proxy policy
+/// ([`crate::system_proxy`]) on a reqwest builder. Returns the builder and the
+/// shared cell that will hold the fingerprint the next handshake presents.
 pub fn apply(
     builder: reqwest::ClientBuilder,
     trusted: &[String],
 ) -> AppResult<(reqwest::ClientBuilder, ObservedFingerprint)> {
     let (config, observed) = client_config(trusted)?;
-    Ok((builder.tls_backend_preconfigured(config), observed))
+    let builder = crate::system_proxy::apply(builder.tls_backend_preconfigured(config));
+    Ok((builder, observed))
 }
 
 #[cfg(test)]
@@ -260,9 +300,143 @@ mod tests {
     fn a_client_builds_without_os_trust_anchors() {
         // A system without a CA bundle must still reach plain-HTTP and pinned
         // servers; webpki alone refuses to build over an empty store.
+        let inner = webpki_verifier(Arc::new(RootCertStore::empty()), provider());
+        assert!(matches!(inner, Ok(None)));
         let pinned = [fingerprint(b"pinned")];
-        assert!(client_config_with_roots(&pinned, Arc::new(RootCertStore::empty())).is_ok());
-        assert!(client_config_with_roots(&[], Arc::new(RootCertStore::empty())).is_ok());
+        assert!(client_config_with(&pinned, None).is_ok());
+        assert!(client_config_with(&[], None).is_ok());
+    }
+
+    #[test]
+    fn public_certificates_are_checked_by_the_os_verifier() {
+        let inner = os_verifier().expect("the OS verifier builds");
+        // The platform verifier exists on every system the app ships for;
+        // only a Unix without any CA bundle is left with pinned leaves alone.
+        #[cfg(windows)]
+        assert!(inner.is_some());
+        assert!(client_config_with(&[], inner).is_ok());
+    }
+
+    /// An OS verifier with a fixed answer.
+    #[derive(Debug)]
+    struct Fixed(bool);
+
+    impl ServerCertVerifier for Fixed {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            if self.0 {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(TlsError::InvalidCertificate(
+                    CertificateError::UnknownIssuer,
+                ))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn pinning(inner: Arc<dyn ServerCertVerifier>, trusted: Vec<String>) -> PinningVerifier {
+        PinningVerifier {
+            inner: Some(inner),
+            provider: provider(),
+            trusted,
+            observed: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn a_publicly_valid_certificate_leaves_nothing_to_confirm() {
+        let leaf = CertificateDer::from(b"publicly valid".to_vec());
+        let verifier = pinning(Arc::new(Fixed(true)), Vec::new());
+        // A fingerprint left over from an earlier failed handshake must not
+        // turn the next unrelated network error into a trust prompt.
+        *verifier.observed.lock().unwrap() = Some(fingerprint(b"earlier"));
+        let name = ServerName::try_from("music.example.com").unwrap();
+        assert!(verifier
+            .verify_server_cert(&leaf, &[], &name, &[], UnixTime::now())
+            .is_ok());
+        assert_eq!(*verifier.observed.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn a_rejected_certificate_passes_only_when_pinned() {
+        let leaf = CertificateDer::from(b"self-signed".to_vec());
+        let name = ServerName::try_from("music.home").unwrap();
+        let now = UnixTime::now();
+
+        let unpinned = pinning(Arc::new(Fixed(false)), Vec::new());
+        assert!(matches!(
+            unpinned.verify_server_cert(&leaf, &[], &name, &[], now),
+            Err(TlsError::InvalidCertificate(
+                CertificateError::UnknownIssuer
+            ))
+        ));
+        assert_eq!(
+            unpinned.observed.lock().unwrap().as_deref(),
+            Some(fingerprint(leaf.as_ref()).as_str()),
+            "the fingerprint is offered for confirmation"
+        );
+
+        let other = pinning(
+            Arc::new(Fixed(false)),
+            vec![normalize(&fingerprint(b"other"))],
+        );
+        assert!(other
+            .verify_server_cert(&leaf, &[], &name, &[], now)
+            .is_err());
+
+        let pinned = pinning(
+            Arc::new(Fixed(false)),
+            vec![normalize(&fingerprint(leaf.as_ref()))],
+        );
+        assert!(pinned
+            .verify_server_cert(&leaf, &[], &name, &[], now)
+            .is_ok());
+    }
+
+    #[test]
+    fn the_os_verifier_rejects_what_it_cannot_validate_and_a_pin_still_passes() {
+        let Some(os) = os_verifier().expect("the OS verifier builds") else {
+            return;
+        };
+        let leaf = CertificateDer::from(b"not really a certificate".to_vec());
+        let name = ServerName::try_from("music.home").unwrap();
+        let now = UnixTime::now();
+        assert!(pinning(os.clone(), Vec::new())
+            .verify_server_cert(&leaf, &[], &name, &[], now)
+            .is_err());
+        assert!(pinning(os, vec![normalize(&fingerprint(leaf.as_ref()))])
+            .verify_server_cert(&leaf, &[], &name, &[], now)
+            .is_ok());
     }
 
     #[test]

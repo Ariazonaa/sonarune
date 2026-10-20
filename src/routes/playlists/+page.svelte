@@ -7,7 +7,7 @@
   import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
   import { contextMenuKey } from "#lib/menu.js";
   import EmptyState from "#lib/components/EmptyState.svelte";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
   // Aliased: this file has its own `playlists` — the list it renders.
   import { playlists as playlistStore } from "#lib/state/playlists.svelte.js";
@@ -16,7 +16,11 @@
   import type { PlaylistDto } from "#lib/types.js";
 
   let playlists = $state<PlaylistDto[] | null>(null);
+  /** Why the list could not be loaded. It takes the grid's place, so a
+   *  failed action goes to the banner instead. */
   let error = $state<string | null>(null);
+  /** Discards a load that a newer one overtook. */
+  let loadSeq = 0;
   let creating = $state(false);
   let newName = $state("");
   let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
@@ -50,7 +54,7 @@
                 toast.show(m.playlist_deleted());
                 load();
               })
-              .catch((err) => (error = String(err)));
+              .catch((err) => (player.error = String(err)));
           },
         },
       ],
@@ -58,19 +62,25 @@
   }
 
   function load() {
+    const seq = ++loadSeq;
     apiLibrary
       .getPlaylists()
-      .then((p) => (playlists = p))
-      .catch((e) => (error = String(e)));
+      .then((p) => {
+        if (seq !== loadSeq) return;
+        playlists = p;
+        error = null;
+      })
+      .catch((e) => {
+        // A failed refetch leaves the grid that is up standing.
+        if (seq === loadSeq && !playlists) error = String(e);
+      });
   }
 
   onMount(load);
 
   // Refetch when the server library changes (a playlist may have been
   // created/removed server-side).
-  $effect(() => {
-    if (library.revision > 0) load();
-  });
+  onLibraryChange(load);
 
   async function createPlaylist() {
     const name = newName.trim();
@@ -83,7 +93,7 @@
       toast.show(m.playlist_created());
       goto(`/playlist/${id}`);
     } catch (e) {
-      error = String(e);
+      player.error = String(e);
     }
   }
 </script>

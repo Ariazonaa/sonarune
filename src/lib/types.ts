@@ -23,14 +23,15 @@ export interface EditableMetadata {
   isAudio: boolean;
 }
 
-/** The six whitelisted fields the metadata editor can write. */
+/** The whitelisted fields the metadata editor changed. A field left out stays
+ *  as it is on the server; `null` clears a number. */
 export interface MetadataEdits {
-  name: string;
-  albumArtists: string[];
-  year: number | null;
-  genres: string[];
-  trackNumber: number | null;
-  discNumber: number | null;
+  name?: string;
+  albumArtists?: string[];
+  year?: number | null;
+  genres?: string[];
+  trackNumber?: number | null;
+  discNumber?: number | null;
 }
 
 /** Edits for many tracks at once. A field left out stays as it is on every
@@ -48,6 +49,8 @@ export interface BulkMetadataEdits {
 export interface BulkMetadataResult {
   changed: number;
   failed: number;
+  /** Never tried: the run stopped once the server could not be reached. */
+  skipped: number;
   /** The first failure; the others are only counted. */
   error: string | null;
 }
@@ -58,6 +61,8 @@ export interface ArtistDto {
   imageTag: string | null;
   imageBlurHash: string | null;
   overview: string | null;
+  /** Asked for explicitly where it is shown: the Artists grid, the artist page. */
+  isFavorite: boolean;
 }
 
 export interface ArtistDetail {
@@ -83,6 +88,27 @@ export interface TrustedCert {
   fingerprint: string;
   /** Unix milliseconds; null for pins stored before dates were recorded. */
   pinnedAt: number | null;
+}
+
+/**
+ * `session:ended` — the backend dropped a session that only a new sign-in
+ * brings back (mirrors the Rust `commands::SessionEnded`). `rejected`: the
+ * server refused the stored credentials, or there are none to renew a dead
+ * token with (Quick Connect). `moved`: the stored address now redirects to
+ * https, and `serverUrl` is the new one.
+ */
+export interface SessionEnded {
+  reason: "rejected" | "moved";
+  serverUrl: string;
+  username: string;
+}
+
+/** Result of `check_server` (mirrors the Rust `commands::ServerCheck`). */
+export interface ServerCheck {
+  /** Whether the session reaches the server — the offline banner. */
+  online: boolean;
+  /** The certificate the server presents when it is not trusted. */
+  untrustedCertificate: string | null;
 }
 
 /** A linkable artist reference (navigate to /artist/{id}). */
@@ -114,6 +140,8 @@ export interface TrackDto {
   artist: string;
   album: string;
   albumId: string | null;
+  /** The album's artist as the track is tagged (Jellyfin's AlbumArtist). */
+  albumArtist?: string | null;
   indexNumber: number | null;
   discNumber: number | null;
   durationMs: number;
@@ -157,6 +185,9 @@ export interface QueueTrack {
   artist: string;
   album: string;
   albumId: string | null;
+  /** The album's artist as the track is tagged; null in queues from older
+   *  builds. */
+  albumArtist?: string | null;
   trackNumber: number | null;
   discNumber: number | null;
   durationMs: number;
@@ -182,9 +213,16 @@ export type PlaybackStatus = "idle" | "loading" | "playing" | "paused";
 export type RepeatMode = "off" | "all" | "one";
 export type ShuffleMode = "off" | "tracks" | "albums";
 
+/** What an Auto-DJ mix grows from (Rust `AutoDjSeedMode`): the setting, and
+ *  the kind every appended track remembers. */
+export type AutoDjSeedMode = "track" | "artist" | "genre" | "album" | "playlist" | "sonic";
+
 export interface AutoDjReason {
-  kind: "track" | "artist" | "genre" | "album" | "playlist";
+  kind: AutoDjSeedMode;
   label: string;
+  /** Seeded by Sonarune's own sonic similarity. `kind` is then "track",
+   *  which is what older builds read it as. */
+  bySound?: boolean;
 }
 
 export interface DspParams {
@@ -199,7 +237,11 @@ export interface DspParams {
 export interface PlaybackSettings {
   crossfadeMode: "off" | "smart" | "always";
   crossfadeSeconds: number;
+  /** Device id (`OutputDevice.id`); null = system default. Builds before
+   *  0.6.1 stored the device name here, until the device opens again. */
   outputDevice: string | null;
+  /** The chosen device's name as last seen, shown while it is away. */
+  outputDeviceName: string | null;
   /** Land crossfades on the beat (needs both tracks analysed). */
   beatTransitions: boolean;
 }
@@ -219,22 +261,34 @@ export interface TrackAnalysisInfo {
   key: MusicalKey | null;
 }
 
+/** An output device (see audio_devices.rs). */
+export interface OutputDevice {
+  /** Stable and unique, where names are not (two devices can both be
+   *  "Speakers"): what the output setting and the profiles store. */
+  id: string;
+  /** What the system's sound settings call it. */
+  name: string;
+}
+
 export interface AudioDeviceSnapshot {
-  devices: string[];
-  /** Requested output currently routed through the system default. */
+  devices: OutputDevice[];
+  /** Requested output (its stored id) currently routed through the system
+   *  default. */
   fallbackDevice: string | null;
   /** The device the output actually plays through right now. */
-  activeDevice: string | null;
+  activeDevice: OutputDevice | null;
 }
 
 /** Sound settings remembered per output device (see audio_profiles.rs). */
 export interface AudioProfilesInfo {
   enabled: boolean;
-  activeDevice: string | null;
-  devices: string[];
+  activeDevice: OutputDevice | null;
+  /** Devices with a saved profile; deleted by id. */
+  devices: OutputDevice[];
 }
 
 export interface AudioOutputFallbackEvent {
+  /** Name of the configured device. */
   requestedDevice: string;
 }
 
@@ -245,7 +299,7 @@ export interface ExtrasSettings {
    */
   listenbrainzToken: string | null;
   autoDjEnabled: boolean;
-  autoDjSeedMode: "track" | "artist" | "genre" | "album" | "playlist" | "sonic";
+  autoDjSeedMode: AutoDjSeedMode;
   autoDjMaxTracks: number;
   autoDjRecentTracks: number;
   /** Keep the local play history (one row per listen, on this machine). */
@@ -259,10 +313,16 @@ export type StopAfter = "off" | "track" | "album";
 
 export interface PlayerState {
   status: PlaybackStatus;
+  /** Only while loading: Pause was pressed (or it was paused before a
+   *  reopen), so the source arrives paused instead of playing. */
+  pendingPause: boolean;
   current: QueueTrack | null;
   sleepRemainingMs: number | null;
   stopAfter: StopAfter;
-  /** The queue entry the stop is armed on (item id), so the row can say so. */
+  /** The queue entry the music stops after, so the row can say so: the armed
+   *  row for a track, the album's last row for an album. Its entry id, and
+   *  its item id for an entry from a build before entry ids. */
+  stopAfterEntry: string | null;
   stopAfterItem: string | null;
   index: number;
   queueLen: number;
@@ -288,6 +348,9 @@ export interface WaveformEvent {
 }
 
 export interface QueueSnapshot {
+  /** Names this track list and order; a `QueuePosition` applies to the
+   *  snapshot with the same revision only. */
+  revision: number;
   tracks: QueueTrack[];
   index: number;
   /** Shuffle play order as indices into `tracks`; empty while shuffle is off.
@@ -297,6 +360,13 @@ export interface QueueSnapshot {
   playedCount: number;
   duplicateCount: number;
 }
+
+/** `player:queue-index` — the queue moved on, its track list did not. Sent
+ *  on a track change instead of the whole `QueueSnapshot`. */
+export type QueuePosition = Pick<
+  QueueSnapshot,
+  "revision" | "index" | "canUndo" | "playedCount" | "duplicateCount"
+>;
 
 export type CloseBehavior = "quit" | "tray";
 
@@ -399,13 +469,33 @@ export interface PlaylistDto {
 
 export interface PlaylistTrackDto {
   track: TrackDto;
-  /** Playlist entry id — removal/reorder use this, not the item id. */
+  /** Playlist entry id — removal/reorder use this, not the item id. Not a row
+   *  key: Jellyfin 10.11 makes it the track's id, so a track that is in the
+   *  playlist twice has two entries with the same one (`lib/playlistEntries.ts`). */
   entryId: string;
 }
 
 export interface PlaylistDetail {
   playlist: PlaylistDto;
   tracks: PlaylistTrackDto[];
+}
+
+/** What a copy or move between playlists did (`transfer_playlist_entries`). */
+export interface PlaylistTransfer {
+  /** Tracks the target gained — fewer than selected when it already held some;
+   *  null when unknown. */
+  added: number | null;
+  /** A move whose copy went through but whose removal from the source failed. */
+  removeError: string | null;
+}
+
+/** What cleaning up a playlist's duplicates did (`remove_playlist_duplicates`). */
+export interface PlaylistCleanup {
+  /** Later entries of repeated tracks that went. */
+  removed: number;
+  /** Entries the user cannot see. Cleaning up rewrites the playlist with what
+   *  the user may see, so while there are any nothing is changed. */
+  hidden: number;
 }
 
 export interface HomeData {
@@ -443,8 +533,11 @@ export interface ArtistPlays {
 export interface SonicScanStatus {
   enabled: boolean;
   running: boolean;
-  /** Tracks with a sound vector, out of `total` (null until listed). */
+  /** Tracks the sound analysis is done with (a few too short or quiet to
+   *  have a sound vector included), out of `total`. */
   analysed: number;
+  /** Tracks of the library the analysis covers (all but very long ones);
+   *  null until a listing of this library is known. */
   total: number | null;
   current: string | null;
   lastError: string | null;
@@ -457,6 +550,9 @@ export interface HistoryTrack {
   artist: string;
   album: string;
   albumId: string | null;
+  /** The album's artist as the track was tagged; null in rows from before
+   *  it was kept. */
+  albumArtist?: string | null;
   artists: ArtistRef[];
   durationMs: number;
   imageItemId: string | null;
@@ -489,7 +585,12 @@ export interface TrackPlays {
 export interface AlbumPlays {
   albumId: string | null;
   name: string;
+  /** The album artist its tracks are tagged with, or else the artist most of
+   *  its played tracks name; empty when none is credited or for a
+   *  compilation (`variousArtists`). */
   artist: string;
+  /** No artist is named by most of its played tracks: a compilation. */
+  variousArtists: boolean;
   imageItemId: string | null;
   imageTag: string | null;
   imageBlurHash: string | null;
@@ -513,6 +614,7 @@ export interface YearReview {
 
 export interface DecadeAlbums {
   startYear: number;
+  /** English ("1990s"), not for display: see `DecadeDto.label`. */
   label: string;
   albums: number;
 }

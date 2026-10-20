@@ -28,11 +28,37 @@ caveat that a minor bump may still change behaviour.
   many different tracks and artists, the most played artists, albums and
   tracks, and plays per month. A year the history only started in says so.
 
+### Changed
+
+- **Output devices are told apart by their Windows id**, so two devices with
+  the same name keep their own selection and sound profile; 0.6.0 settings move
+  over by themselves. *System default* now follows the Windows default device.
+- **A limiter** catches peaks that normalization, preamp or equalizer push past
+  full scale, instead of clipping them.
+- **Signing out also removes the ListenBrainz token** and cancels running
+  downloads; the search history is kept per account.
+- Certificates are checked by **Windows' own verifier**; pinned self-signed
+  servers work as before. The Windows proxy bypass list is honoured.
+
 ### Fixed
 
 - **The visualizer did not start in 0.6.0** ("createVisualizer is not a
   function"). Since the move to Vite 8 the built app wraps the butterchurn
   module once more than the dev server does; it is now found either way.
+- Clicking an artist name reloaded the app; drag and drop did nothing on
+  Windows; Space on a clicked track row restarted it instead of pausing; menus
+  closed while the lyrics scrolled.
+- Jellyfin 10.11: genres were missing on music-only servers and genre playback
+  found no tracks; a playlist with a track twice did not open, and cleaning up
+  its duplicates removed every copy.
+- The metadata editor split artists with a comma in their name.
+- The sleep timer's fade-out was lost at a track change; a broken stream could
+  freeze playback.
+- Sonic similarity: Auto-DJ rows read "undefined", radios and paths were
+  shuffled, tracks were downloaded again on every scan.
+- Shuffle order survives a restart; *Stop after this album* waits for its last
+  track; a Windows shutdown saves the last history entry.
+- Many smaller fixes from a full code review.
 
 ## [0.6.0] — 2026-10-18
 

@@ -163,7 +163,7 @@ fn analyse(mut file: File, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)>
     file.seek(SeekFrom::Start(0)).ok()?;
     let len = file.metadata().ok()?.len();
     let reader = BufReader::new(file);
-    match super::opus::probe(reader, true) {
+    let (peaks, analysis) = match super::opus::probe(reader, true) {
         Ok(opus) => fold(opus, duration_ms),
         Err((reader, _)) => {
             let decoder = rodio::Decoder::builder()
@@ -174,7 +174,15 @@ fn analyse(mut file: File, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)>
                 .ok()?;
             fold(decoder, duration_ms)
         }
-    }
+    }?;
+    Some((peaks, made_for(analysis, duration_ms)))
+}
+
+/// Remember the length the server gave the track, which is what tells a
+/// replaced file later ([`TrackAnalysis::fits`]).
+fn made_for(mut analysis: TrackAnalysis, duration_ms: u64) -> TrackAnalysis {
+    analysis.server_duration_ms = (duration_ms > 0).then_some(duration_ms);
+    analysis
 }
 
 /// Only the tempo/key/sound analysis of a track held in memory (the library
@@ -196,9 +204,11 @@ pub fn analyse_bytes(bytes: Vec<u8>, duration_ms: u64) -> Option<TrackAnalysis> 
     }
     .filter(|analysis| {
         // A transcode that came back much shorter than the track is a
-        // broken download, not the track.
+        // broken download, not the track. Longer, or a few seconds short, is
+        // the decode being right where the server only estimated.
         duration_ms == 0 || analysis.duration_ms + 5_000.0 >= duration_ms as f64
     })
+    .map(|analysis| made_for(analysis, duration_ms))
 }
 
 fn analysis_only<S: Source>(source: S) -> Option<TrackAnalysis> {
@@ -310,6 +320,11 @@ mod tests {
         assert!(
             (analysis.audible_start_ms - 500.0).abs() < 30.0,
             "{analysis:?}"
+        );
+        assert_eq!(
+            analysis.server_duration_ms,
+            Some(1000),
+            "what it was made for"
         );
         assert_eq!(p.len(), BUCKETS);
         assert!(p[..BUCKETS / 2 - 2].iter().all(|v| *v == 0), "silent half");

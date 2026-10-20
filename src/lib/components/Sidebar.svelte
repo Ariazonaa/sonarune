@@ -11,6 +11,7 @@
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { isOurDrag, readDrag } from "#lib/dragToPlaylist.js";
+  import { playlistAddedToast } from "#lib/playlistAdd.js";
   import type { PlaylistDto } from "#lib/types.js";
 
   const links = [
@@ -123,9 +124,10 @@
       const trackIds =
         payload.trackIds ?? (await api.getAlbum(payload.albumId!)).tracks.map((track) => track.id);
       if (trackIds.length === 0) return;
-      await apiLibrary.playlistAdd(playlist.id, trackIds);
+      const added = await apiLibrary.playlistAdd(playlist.id, trackIds);
       playlists.refresh();
-      toast.show(m.add_to_playlist_done({ name: playlist.name }));
+      const { message, kind } = playlistAddedToast(playlist.name, trackIds, added);
+      toast.show(message, { kind });
     } catch (e) {
       player.error = String(e);
     }

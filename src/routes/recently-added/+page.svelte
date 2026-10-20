@@ -1,12 +1,14 @@
 <script lang="ts">
-  import { onMount, tick, untrack } from "svelte";
+  import { onMount, tick } from "svelte";
   import { api } from "#lib/api.js";
+  import { appendPage } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import CardSkeleton from "#lib/components/CardSkeleton.svelte";
   import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
+  import NewContentPill from "#lib/components/NewContentPill.svelte";
   import { player } from "#lib/state/player.svelte.js";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { createAlbumMenu } from "#lib/state/albumMenu.svelte.js";
   import { contextMenuKey } from "#lib/menu.js";
   import type { AlbumDto } from "#lib/types.js";
@@ -20,6 +22,8 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let scroller = $state<HTMLElement | null>(null);
+  /** The library changed while scrolled down; a refresh pill is offered. */
+  let staleHint = $state(false);
 
   const hasMore = $derived(total === null || albums.length < total);
   /** Bumped on reset so a page fetch still in flight discards itself. */
@@ -34,12 +38,12 @@
     try {
       const page = await api.getAlbums(albums.length, PAGE, null, "dateAdded", false);
       if (seq !== requestSeq) return false; // reset happened mid-flight
-      const seen = new Set(albums.map((a) => a.id));
-      const fresh = page.items.filter((i) => !seen.has(i.id));
-      albums = [...albums, ...fresh];
-      total = page.total;
-      // A page of nothing new would request the same offset forever.
-      return fresh.length > 0;
+      // A page of nothing new ends paging; scrolling would otherwise request
+      // the same offset again.
+      const merged = appendPage(albums, page.items, page.total, (album) => album.id);
+      albums = merged.items;
+      total = merged.total;
+      return merged.grew;
     } catch (e) {
       if (seq === requestSeq) error = String(e);
       return false;
@@ -69,23 +73,24 @@
   // Reset to the top and reload the first page. `requestSeq` invalidates any
   // page still in flight; clearing `loading` lets the fresh load through.
   function reload() {
+    staleHint = false;
     requestSeq++;
     albums = [];
     total = null;
     loading = false;
+    if (scroller) scroller.scrollTop = 0;
     loadAndFill();
   }
 
   onMount(loadAndFill);
 
-  // New albums land at the top — reload when the library changes. Only
-  // `library.revision` is a dependency (the reset reads are untracked, so a
-  // loading/total change can't re-trigger this effect).
-  $effect(() => {
-    const rev = library.revision;
-    untrack(() => {
-      if (rev > 0) reload();
-    });
+  // New albums land at the top: reload when the library changes, live near
+  // the top, else through a pill. An import changes the library on every
+  // 30 s poll, and each reload empties the grid, so a user scrolled down
+  // would be thrown back to the top again and again.
+  onLibraryChange(() => {
+    if (!scroller || scroller.scrollTop < 400) reload();
+    else staleHint = true;
   });
 </script>
 
@@ -144,4 +149,7 @@
   </div>
 </div>
 
+{#if staleHint}
+  <NewContentPill onrefresh={reload} />
+{/if}
 <AlbumContextMenu menu={am} />

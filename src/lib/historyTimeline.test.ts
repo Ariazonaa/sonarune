@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { HistoryEntry } from "#lib/types.js";
-import { dayLabel, formatListened, groupTimeline } from "./historyTimeline";
+import { dayLabel, formatListened, groupTimeline, msUntilTomorrow } from "./historyTimeline";
 
 let nextId = 1000;
 function play(itemId: string, at: Date): HistoryEntry {
@@ -45,6 +45,39 @@ describe("groupTimeline", () => {
 
   it("is empty for no plays", () => {
     expect(groupTimeline([])).toEqual([]);
+  });
+
+  it("keeps each day once when the clock went back across midnight", () => {
+    // In the order they were recorded, newest first: the evening of the
+    // 20th after the clock was put right, a play while it ran five hours
+    // ahead, and an earlier one on the 20th.
+    const days = groupTimeline([
+      play("c", new Date(2026, 9, 20, 20, 15)),
+      play("b", new Date(2026, 9, 21, 1, 5)),
+      play("a", new Date(2026, 9, 20, 19, 30)),
+    ]);
+    expect(days.map((day) => day.key)).toEqual(["2026-10-20", "2026-10-21"]);
+    expect(days[0].rows.map((row) => row.entry.track.itemId)).toEqual(["c", "a"]);
+  });
+
+  it("folds only plays that followed each other", () => {
+    // The same track either side of a play on another day: heard twice, not
+    // twice in a row.
+    const days = groupTimeline([
+      play("a", new Date(2026, 9, 20, 20, 15)),
+      play("b", new Date(2026, 9, 21, 1, 5)),
+      play("a", new Date(2026, 9, 20, 19, 30)),
+    ]);
+    expect(days[0].rows.map((row) => row.entries.length)).toEqual([1, 1]);
+  });
+});
+
+describe("msUntilTomorrow", () => {
+  it("ends just past the next local midnight", () => {
+    const now = new Date(2026, 9, 19, 23, 59, 30);
+    expect(msUntilTomorrow(now)).toBe(31_000);
+    const then = new Date(now.getTime() + msUntilTomorrow(now));
+    expect([then.getDate(), then.getHours()]).toEqual([20, 0]);
   });
 });
 

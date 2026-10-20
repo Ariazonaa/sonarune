@@ -5,10 +5,18 @@ use tracing_subscriber::fmt::MakeWriter;
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_LINE_BYTES: usize = 2_000;
+/// What a line becomes when it is dropped wholesale (see [`redact_log_line`]).
+const REDACTED_LINE: &str = "[redacted sensitive log entry]";
 
-static LOGS: OnceLock<Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
+/// One slot of the ring: a line, and how many times in a row it came.
+struct LogEntry {
+    line: String,
+    repeats: usize,
+}
 
-fn logs() -> &'static Arc<Mutex<VecDeque<String>>> {
+static LOGS: OnceLock<Arc<Mutex<VecDeque<LogEntry>>>> = OnceLock::new();
+
+fn logs() -> &'static Arc<Mutex<VecDeque<LogEntry>>> {
     LOGS.get_or_init(|| Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))))
 }
 
@@ -21,7 +29,33 @@ pub fn writer() -> DiagnosticMakeWriter {
 }
 
 pub fn recent_logs() -> Vec<String> {
-    logs().lock().unwrap().iter().cloned().collect()
+    logs().lock().unwrap().iter().map(render).collect()
+}
+
+/// Add a (redacted) line. One that repeats the line before it only counts up:
+/// lines are timestamped, so in practice that is a run of wholesale-redacted
+/// ones — per-item failures carry a 32-hex Jellyfin id, and a failing cover
+/// grid or sonic scan would otherwise fill all 500 slots with placeholders and
+/// push out the lines that explain the failure.
+fn push_line(logs: &mut VecDeque<LogEntry>, line: String) {
+    if let Some(last) = logs.back_mut() {
+        if last.line == line {
+            last.repeats += 1;
+            return;
+        }
+    }
+    if logs.len() == MAX_LOG_LINES {
+        logs.pop_front();
+    }
+    logs.push_back(LogEntry { line, repeats: 1 });
+}
+
+fn render(entry: &LogEntry) -> String {
+    if entry.repeats > 1 {
+        format!("{} (×{})", entry.line, entry.repeats)
+    } else {
+        entry.line.clone()
+    }
 }
 
 impl<'a> MakeWriter<'a> for DiagnosticMakeWriter {
@@ -54,11 +88,7 @@ impl Drop for DiagnosticWriter {
     fn drop(&mut self) {
         let line = String::from_utf8_lossy(&self.buffer);
         for line in line.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let mut logs = logs().lock().unwrap();
-            if logs.len() == MAX_LOG_LINES {
-                logs.pop_front();
-            }
-            logs.push_back(redact_log_line(line));
+            push_line(&mut logs().lock().unwrap(), redact_log_line(line));
         }
     }
 }
@@ -66,7 +96,7 @@ impl Drop for DiagnosticWriter {
 /// Logs are sanitized before they enter the in-memory ring. Entries containing
 /// a URL, credential marker, or absolute path are replaced wholesale so a
 /// partially parsed value can never leak into a diagnostic export.
-fn redact_log_line(line: &str) -> String {
+pub(crate) fn redact_log_line(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
     let sensitive = [
         "http://",
@@ -93,7 +123,7 @@ fn redact_log_line(line: &str) -> String {
         || contains_windows_path(line)
         || contains_long_hex_identifier(line);
     if sensitive {
-        return "[redacted sensitive log entry]".to_string();
+        return REDACTED_LINE.to_string();
     }
 
     redact_quoted_values(line)
@@ -262,7 +292,41 @@ pub fn os_version() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_log_line;
+    use super::{push_line, redact_log_line, render, MAX_LOG_LINES};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn a_run_of_redacted_lines_takes_one_slot() {
+        let mut logs = VecDeque::new();
+        push_line(&mut logs, redact_log_line("audio output opened"));
+        for n in 0..MAX_LOG_LINES * 2 {
+            let id = format!("{n:032x}");
+            push_line(
+                &mut logs,
+                redact_log_line(&format!("cover fetch failed for {id}: 401")),
+            );
+        }
+        push_line(&mut logs, redact_log_line("tls handshake failed"));
+        let lines: Vec<String> = logs.iter().map(render).collect();
+        assert_eq!(
+            lines,
+            [
+                "audio output opened",
+                "[redacted sensitive log entry] (×1000)",
+                "tls handshake failed",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_ring_still_holds_only_the_newest_lines() {
+        let mut logs = VecDeque::new();
+        for n in 0..MAX_LOG_LINES + 10 {
+            push_line(&mut logs, format!("line {n}"));
+        }
+        assert_eq!(logs.len(), MAX_LOG_LINES);
+        assert_eq!(render(&logs[0]), "line 10");
+    }
 
     #[test]
     fn redacts_urls_credentials_and_paths_wholesale() {

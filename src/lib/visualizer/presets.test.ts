@@ -226,11 +226,19 @@ describe("Weekly preset pins", () => {
     import: "default",
     eager: true,
   });
+  // Files the bucket no longer has (`--allow-missing`); absent while none are.
+  const missingSources = import.meta.glob<string>("/src-tauri/src/weekly_presets_missing.json", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
 
   it("pin every Weekly preset the installed package lists", async () => {
     const [manifestRaw] = Object.values(manifestSources);
     expect(manifestRaw).toBeTypeOf("string");
     const pins = JSON.parse(manifestRaw) as Record<string, string>;
+    const [missingRaw] = Object.values(missingSources);
+    const gone = new Set(missingRaw ? (JSON.parse(missingRaw) as string[]) : []);
 
     const module = (await import("butterchurn-presets-weekly")) as {
       default?: Record<string, unknown>;
@@ -241,13 +249,19 @@ describe("Weekly preset pins", () => {
     expect(urls.length).toBeGreaterThan(0);
 
     // A failure here means the package changed: re-run the pin script.
-    const unpinned = urls.filter(
-      (url) => !url.startsWith(WEEKLY_ORIGIN) || !(url.slice(WEEKLY_ORIGIN.length) in pins),
-    );
+    const unpinned = urls.filter((url) => {
+      if (!url.startsWith(WEEKLY_ORIGIN)) return true;
+      const file = url.slice(WEEKLY_ORIGIN.length);
+      return !(file in pins) && !gone.has(file);
+    });
     expect(unpinned).toEqual([]);
     for (const [file, hash] of Object.entries(pins)) {
       expect(file).toMatch(/^[a-f0-9]{32}\.json$/);
       expect(hash).toMatch(/^[a-f0-9]{64}$/);
+    }
+    for (const file of gone) {
+      expect(file).toMatch(/^[a-f0-9]{32}\.json$/);
+      expect(file in pins, `${file} is pinned and listed as gone`).toBe(false);
     }
   });
 });
@@ -265,6 +279,39 @@ describe("PresetRotation remote entries", () => {
 
     rotation.setRemoteEnabled(false);
     expect(picks(rotation, 20)).toEqual(new Set(["local"]));
+  });
+});
+
+describe("PresetRotation same-named entries", () => {
+  const ranked = (base: PresetEntry, priority: number): PresetEntry => ({ ...base, priority });
+
+  it("keeps a bundled preset over a same-named Weekly one, whichever pack loads first", () => {
+    // "martin - move this body" ships in Butterchurn Extra (20) and is also
+    // listed in Weekly (50): the remote copy must not shadow the bundled one.
+    const bundled = ranked(entry("martin - move this body"), 20);
+    const weekly = ranked(entry("martin - move this body", weeklyUrl("f")), 50);
+
+    for (const order of [[bundled, weekly], [weekly, bundled]]) {
+      const rotation = new PresetRotation([]);
+      for (const pack of order) rotation.addEntries([pack]);
+      expect(rotation.entries()).toEqual([bundled]);
+      // Online presets are off: the bundled preset still rotates.
+      expect(rotation.next()?.preset).toBe(bundled.preset);
+    }
+  });
+
+  it("lets the higher priority win between two of a kind", () => {
+    const full = ranked(entry("Geiss - Reaction Diffusion"), 100);
+    const rotation = new PresetRotation([full]);
+    rotation.addEntries([ranked(full, 0)]);
+    expect(rotation.entryByName(full.name)).toBe(full);
+    rotation.addEntries([ranked(full, 200)]);
+    expect(rotation.entryByName(full.name)?.priority).toBe(200);
+
+    const later = ranked(entry("remote", weeklyUrl("2")), 60);
+    const remote = new PresetRotation([ranked(entry("remote", weeklyUrl("1")), 50)]);
+    remote.addEntries([later]);
+    expect(remote.entryByName("remote")).toBe(later);
   });
 });
 

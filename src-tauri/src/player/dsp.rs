@@ -1,6 +1,8 @@
 //! Per-track DSP chain: volume normalization (Jellyfin NormalizationGain +
-//! preamp), optional 10-band peaking EQ, and a hard [-1, 1] output clamp as
-//! clipping protection. Standalone besides rodio/serde/std.
+//! preamp) and an optional 10-band peaking EQ. A boost may take a track past
+//! full scale here; the output limiter (`limiter.rs`) turns the mix down
+//! after the volume instead of this stage clipping it. Standalone besides
+//! rodio/serde/std.
 
 use rodio::source::SeekError;
 use rodio::{ChannelCount, Sample, SampleRate, Source};
@@ -24,6 +26,10 @@ const NORM_LIMIT_DB: f32 = 30.0;
 /// Params are also re-checked at every span boundary; this bounds the
 /// reaction latency to a settings change inside a long span.
 const PARAM_CHECK_INTERVAL: u32 = 1024;
+/// A settings change glides over this long: a gain that steps, or an EQ
+/// switched on or off from one sample to the next, clicks on sustained
+/// sound.
+const RAMP: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,15 +154,63 @@ struct BiquadState {
     z2: f32,
 }
 
-/// A [`Source`] adapter applying, in order: normalization gain, peaking EQ,
-/// hard clamp to [-1, 1].
+/// A value that moves to its target in equal steps, one per frame.
+#[derive(Debug, Clone, Copy)]
+struct Ramp {
+    value: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Ramp {
+    fn at(value: f32) -> Self {
+        Self {
+            value,
+            target: value,
+            step: 0.0,
+        }
+    }
+
+    fn glide(&mut self, target: f32, frames: u32) {
+        self.target = target;
+        self.step = (target - self.value) / frames.max(1) as f32;
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        if self.step == 0.0 {
+            return;
+        }
+        self.value += self.step;
+        if (self.step > 0.0 && self.value >= self.target)
+            || (self.step < 0.0 && self.value <= self.target)
+        {
+            // Exactly on target, so the stage is bit-exact again afterwards.
+            self.value = self.target;
+            self.step = 0.0;
+        }
+    }
+}
+
+fn ramp_frames(sample_rate: SampleRate) -> u32 {
+    (sample_rate.get() as f32 * RAMP.as_secs_f32()) as u32
+}
+
+/// A [`Source`] adapter applying, in order: normalization gain, peaking EQ.
 pub struct DspSource<S> {
     inner: S,
     dsp: Arc<AudioDsp>,
     track_gain_db: Option<f32>,
     params: DspParams,
     revision: u64,
-    norm_factor: f32,
+    /// Normalization factor (gain and preamp as a multiplier).
+    norm: Ramp,
+    /// How much of the filtered signal plays: 1 with the EQ on, 0 with it
+    /// off. The filters only run while it is above 0.
+    eq_mix: Ramp,
+    /// Nothing handed out yet: a settings change applies at once, there is
+    /// nothing to glide from.
+    fresh: bool,
     /// Shared per band across channels; `None` bypasses the band.
     coeffs: [Option<BiquadCoeffs>; BAND_COUNT],
     /// One state set per channel (interleaved input).
@@ -182,22 +236,28 @@ where
     let channels = source.channels();
     let sample_rate = source.sample_rate();
     let span_remaining = source.current_span_len();
+    let norm = Ramp::at(norm_factor(&params, track_gain_db));
+    let eq_mix = Ramp::at(if params.eq_enabled { 1.0 } else { 0.0 });
     let mut wrapped = DspSource {
         inner: source,
         dsp,
         track_gain_db,
         params,
         revision,
-        norm_factor: 1.0,
+        norm,
+        eq_mix,
+        fresh: true,
         coeffs: [None; BAND_COUNT],
         filter_state: vec![Default::default(); channels.get() as usize],
         channels,
         sample_rate,
         channel_idx: 0,
         span_remaining,
-        until_param_check: PARAM_CHECK_INTERVAL,
+        // The first sample looks at the settings again: a next track is
+        // opened up to a minute ahead and must not start on the ones it was
+        // opened with.
+        until_param_check: 0,
     };
-    wrapped.norm_factor = norm_factor(&wrapped.params, track_gain_db);
     wrapped.recompute_coeffs();
     wrapped
 }
@@ -245,9 +305,24 @@ where
             return;
         }
         let (params, revision) = self.dsp.snapshot();
+        let norm = norm_factor(&params, self.track_gain_db);
+        let eq_mix = if params.eq_enabled { 1.0 } else { 0.0 };
+        if self.fresh {
+            self.norm = Ramp::at(norm);
+            self.eq_mix = Ramp::at(eq_mix);
+        } else {
+            if params.eq_enabled && self.eq_mix.value == 0.0 {
+                // The filters stood still while the EQ was off. What they
+                // still hold is the tail of long-gone audio, and it would
+                // ring out as a thump.
+                self.clear_filter_memory();
+            }
+            let frames = ramp_frames(self.sample_rate);
+            self.norm.glide(norm, frames);
+            self.eq_mix.glide(eq_mix, frames);
+        }
         self.params = params;
         self.revision = revision;
-        self.norm_factor = norm_factor(&self.params, self.track_gain_db);
         // Filter state is deliberately kept: pure gain changes must not click.
         self.recompute_coeffs();
     }
@@ -275,6 +350,14 @@ where
             .resize(self.channels.get() as usize, Default::default());
         self.channel_idx = 0;
     }
+
+    /// Zero the filters' memory but keep the position in the frame: a
+    /// settings change can land between two channels of one frame.
+    fn clear_filter_memory(&mut self) {
+        for state in &mut self.filter_state {
+            *state = Default::default();
+        }
+    }
 }
 
 impl<S> Iterator for DspSource<S>
@@ -293,12 +376,18 @@ where
         }
 
         let sample = self.inner.next()?;
+        self.fresh = false;
         if let Some(remaining) = self.span_remaining.as_mut() {
             *remaining = remaining.saturating_sub(1);
         }
         self.until_param_check -= 1;
+        if self.channel_idx == 0 {
+            // One step per frame, so all channels of a frame get one gain.
+            self.norm.advance();
+            self.eq_mix.advance();
+        }
 
-        let mut out = sample * self.norm_factor;
+        let mut out = sample * self.norm.value;
         // Sanitize BEFORE the biquad, not after: the filter is recursive, so a
         // single non-finite sample would be written into `state.z1`/`z2` and
         // every later sample would come back out as NaN. A guard on the return
@@ -307,26 +396,27 @@ where
         if !out.is_finite() {
             out = 0.0;
         }
-        if self.params.eq_enabled {
+        let mix = self.eq_mix.value;
+        if mix > 0.0 {
+            let dry = out;
             let state = &mut self.filter_state[self.channel_idx];
             for (coeff, state) in self.coeffs.iter().zip(state.iter_mut()) {
                 if let Some(coeff) = coeff {
                     out = coeff.process(state, out);
                 }
             }
+            if mix < 1.0 {
+                // The EQ is being switched on or off: blend the two.
+                out = dry + (out - dry) * mix;
+            }
         }
         self.channel_idx += 1;
         if self.channel_idx >= self.channels.get() as usize {
             self.channel_idx = 0;
         }
-        // `clamp` propagates NaN, and a single NaN would poison the EQ biquad
-        // state permanently (every later sample feeds back through it). Map a
-        // non-finite sample to silence instead.
-        Some(if out.is_finite() {
-            out.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        })
+        // The filters can still overflow on absurd input; never hand on a
+        // non-finite sample.
+        Some(if out.is_finite() { out } else { 0.0 })
     }
 
     #[inline]
@@ -528,23 +618,126 @@ mod tests {
     }
 
     #[test]
-    fn output_is_clamped() {
+    fn levels_past_full_scale_are_left_to_the_output_limiter() {
+        // Clipping here would flatten every peak of a boosted track before
+        // the volume; the output limiter turns the mix down instead.
         let out: Vec<f32> = wrap(
             buffer(1, 44100, vec![1.5, -3.0, 0.25]),
             dsp(all_off()),
             None,
         )
         .collect();
-        assert_eq!(out, vec![1.0, -1.0, 0.25]);
+        assert_eq!(out, vec![1.5, -3.0, 0.25]);
 
-        // Normalization boost beyond full scale clamps too.
         let boosted: Vec<f32> = wrap(
             buffer(1, 44100, vec![0.9; 8]),
             dsp(DspParams::default()),
             Some(12.0),
         )
         .collect();
-        assert!(boosted.iter().all(|s| *s == 1.0));
+        assert!(boosted.iter().all(|s| (s - 0.9 * 3.981).abs() < 1e-2));
+    }
+
+    #[test]
+    fn a_source_opened_ahead_starts_on_the_latest_settings() {
+        // The next track is opened well before it plays; settings changed
+        // in between apply from its first sample, not after 1024 of them.
+        let shared = dsp(DspParams::default());
+        let mut source = wrap(buffer(1, 44100, vec![0.25; 64]), shared.clone(), Some(0.0));
+        shared.update(DspParams {
+            preamp_db: 6.02,
+            ..DspParams::default()
+        });
+        let first = source.next().unwrap();
+        assert!((first - 0.5).abs() < 1e-3, "first sample {first}");
+    }
+
+    #[test]
+    fn a_gain_change_glides_instead_of_stepping() {
+        let shared = dsp(all_off());
+        let mut source = wrap(
+            buffer(1, 44100, vec![0.5; 8192]),
+            shared.clone(),
+            Some(-6.02),
+        );
+        for _ in 0..2048 {
+            assert_eq!(source.next(), Some(0.5));
+        }
+        // Normalization on: the track's -6 dB halve the level.
+        shared.update(DspParams::default());
+        let rest: Vec<f32> = source.collect();
+        let largest_step = rest
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(largest_step < 0.01, "level stepped by {largest_step}");
+        assert!((rest[rest.len() - 1] - 0.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn switching_the_eq_glides_both_ways() {
+        // +12 dB at 1 kHz on a 1 kHz tone: on is four times off.
+        let sample_rate = 44100;
+        let mut params = DspParams {
+            eq_enabled: true,
+            normalization_enabled: false,
+            ..DspParams::default()
+        };
+        params.eq_gains_db[5] = 12.0;
+        let shared = dsp(params.clone());
+        let input = sine(1000.0, sample_rate, 0.1, sample_rate as usize * 2);
+        let mut source = wrap(buffer(1, sample_rate, input), shared.clone(), None);
+        let _: Vec<f32> = source.by_ref().take(22_050).collect();
+        shared.update(DspParams {
+            eq_enabled: false,
+            ..params.clone()
+        });
+        let off: Vec<f32> = source.by_ref().take(22_050).collect();
+        shared.update(params);
+        let on: Vec<f32> = source.collect();
+        // Peak level per millisecond: it may change gradually, never jump.
+        for part in [&off, &on] {
+            let peaks: Vec<f32> = part
+                .chunks(44)
+                .map(|c| c.iter().fold(0.0f32, |m, s| m.max(s.abs())))
+                .collect();
+            for w in peaks.windows(2) {
+                let ratio = w[1].min(w[0]) / w[1].max(w[0]);
+                assert!(ratio > 0.75, "level jumped {} -> {}", w[0], w[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn reenabling_the_eq_starts_from_clean_filters() {
+        // Bass boost on a loud 40 Hz tone fills the filters; switched off,
+        // they stand still. Switched on again over silence, nothing may ring
+        // out of them.
+        let sample_rate = 44100;
+        let params = DspParams {
+            eq_enabled: true,
+            normalization_enabled: false,
+            eq_gains_db: [12.0, 12.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..DspParams::default()
+        };
+        let mut input = sine(40.0, sample_rate, 0.5, 8192);
+        input.extend(std::iter::repeat_n(0.0, 16_384));
+        let shared = dsp(params.clone());
+        let mut source = wrap(buffer(1, sample_rate, input), shared.clone(), None);
+        let _: Vec<f32> = source.by_ref().take(8192).collect();
+        shared.update(DspParams {
+            eq_enabled: false,
+            ..params.clone()
+        });
+        // Long enough for the switch to land and the glide to finish.
+        let _: Vec<f32> = source.by_ref().take(4096).collect();
+        shared.update(params);
+        let after: Vec<f32> = source.collect();
+        assert!(
+            after.iter().all(|s| *s == 0.0),
+            "stale filter state rang out: {:?}",
+            after.iter().find(|s| **s != 0.0)
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { untrack } from "svelte";
+  import { page } from "$app/state";
   import { api } from "#lib/api.js";
   import { apiDiscovery, type SimilarArtistsRow } from "#lib/api/discovery.js";
   import { m } from "#lib/paraglide/messages.js";
@@ -9,25 +10,42 @@
   import { player } from "#lib/state/player.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
 
-  let row = $state<SimilarArtistsRow | null>(
-    swrGet<SimilarArtistsRow>("discover:all:artists") ?? null,
-  );
+  // The hub's "See all" names the artist its row was built from, so this page
+  // expands that very row. Without a seed the server picks one at random, and
+  // a list cached for an earlier pick would only flash up before it: that
+  // case starts from the skeleton.
+  const seed = $derived(page.url.searchParams.get("seed"));
+  const cacheKey = (artistId: string) => `discover:all:artists:${artistId}`;
+
+  let row = $state<SimilarArtistsRow | null>(null);
   let error = $state<string | null>(null);
   let generation = 0;
 
   async function load() {
     const seq = ++generation;
+    const artistId = seed;
     try {
-      const result = await apiDiscovery.getSimilarArtists(null, 100);
+      const result = await apiDiscovery.getSimilarArtists(artistId, 100);
       if (seq !== generation) return;
       row = result;
       error = result.error;
-      if (result.items.length || !result.error) swrSet("discover:all:artists", { ...result, error: null });
+      const key = result.seed?.id ?? artistId;
+      if (key && (result.items.length || !result.error)) swrSet(cacheKey(key), { ...result, error: null });
     } catch (cause) {
       if (seq === generation) error = String(cause);
     }
   }
-  onMount(load);
+
+  // On mount and whenever the seed in the URL changes: a same-route
+  // navigation keeps this page mounted.
+  $effect(() => {
+    const artistId = seed;
+    untrack(() => {
+      row = artistId ? (swrGet<SimilarArtistsRow>(cacheKey(artistId)) ?? null) : null;
+      error = null;
+      void load();
+    });
+  });
 </script>
 
 <div class="p-6">
