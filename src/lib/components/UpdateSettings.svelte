@@ -120,5 +120,24 @@
         onchange={onsave}
       />
     </label>
+
+    <label class="mt-5 block">
+      <span class="mb-1 block text-sm font-medium">{m.settings_update_channel()}</span>
+      <select
+        class="w-full max-w-xs rounded-md border border-edge bg-base px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-40"
+        bind:value={desktop.updateChannel}
+        disabled={updates.checking || updates.installing}
+        onchange={() => {
+          onsave();
+          updates.forget();
+        }}
+      >
+        <option value="stable">{m.settings_update_channel_stable()}</option>
+        <option value="beta">{m.settings_update_channel_beta()}</option>
+      </select>
+      <p class="mt-1.5 max-w-md text-xs text-ink-muted">
+        {desktop.updateChannel === "beta" ? m.settings_update_channel_beta_hint() : m.settings_update_channel_hint()}
+      </p>
+    </label>
   {/if}
 </section>

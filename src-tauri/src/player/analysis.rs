@@ -286,9 +286,16 @@ impl AnalysisCache {
         self.get(item_id).filter(|a| a.fits(duration_ms))
     }
 
-    pub fn put(&self, item_id: &str, analysis: TrackAnalysis) -> Arc<TrackAnalysis> {
+    /// Keep an analysis of audio that came from `server` (see
+    /// `Store::put_analysis_from`).
+    pub fn put(
+        &self,
+        server: Option<&crate::identity::Server>,
+        item_id: &str,
+        analysis: TrackAnalysis,
+    ) -> Arc<TrackAnalysis> {
         if let (Some(store), Ok(json)) = (&self.store, serde_json::to_string(&analysis)) {
-            if let Err(e) = store.put_analysis(item_id, &json) {
+            if let Err(e) = store.put_analysis_from(server, item_id, &json) {
                 tracing::warn!("cannot store the analysis of {item_id}: {e}");
             }
         }
@@ -1084,7 +1091,7 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("sonarune-analysis-{}", uuid::Uuid::new_v4()));
         let store = Arc::new(crate::store::Store::open(&dir).unwrap());
         let a = grid_track(120.0, 0.0, 1.0, 2.0);
-        AnalysisCache::new(Some(store.clone())).put("t", a.clone());
+        AnalysisCache::new(Some(store.clone())).put(None, "t", a.clone());
         assert_eq!(
             AnalysisCache::new(Some(store.clone())).get("t").as_deref(),
             Some(&a)
@@ -1092,12 +1099,12 @@ pub(crate) mod tests {
         let mut old = a;
         old.version = VERSION + 1;
         store
-            .put_analysis("t", &serde_json::to_string(&old).unwrap())
+            .put_analysis_from(None, "t", &serde_json::to_string(&old).unwrap())
             .unwrap();
         assert!(AnalysisCache::new(Some(store.clone())).get("t").is_none());
         // A replaced file: same id, other length.
         let cache = AnalysisCache::new(Some(store));
-        cache.put("u", grid_track(120.0, 0.0, 1.0, 179_000.0));
+        cache.put(None, "u", grid_track(120.0, 0.0, 1.0, 179_000.0));
         assert!(cache.get_matching("u", 180_500).is_some());
         assert!(cache.get_matching("u", 240_000).is_none());
         let _ = std::fs::remove_dir_all(dir);

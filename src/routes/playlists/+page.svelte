@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause, errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
@@ -54,7 +55,7 @@
                 toast.show(m.playlist_deleted());
                 load();
               })
-              .catch((err) => (player.error = String(err)));
+              .catch((err) => (player.error = errorMessage(err)));
           },
         },
       ],
@@ -72,7 +73,7 @@
       })
       .catch((e) => {
         // A failed refetch leaves the grid that is up standing.
-        if (seq === loadSeq && !playlists) error = String(e);
+        if (seq === loadSeq && !playlists) error = errorCause(e);
       });
   }
 
@@ -93,7 +94,7 @@
       toast.show(m.playlist_created());
       goto(`/playlist/${id}`);
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 </script>

@@ -26,6 +26,7 @@ const task: DownloadTask = {
   totalBytes: null,
   path: null,
   error: null,
+  revision: 1,
 };
 
 beforeEach(() => {

@@ -780,3 +780,37 @@ fn the_request_stand_in_parses_what_it_needs() {
     assert_eq!(request.query("missing"), None);
     assert_eq!(request.header("user-agent"), Some("x"));
 }
+
+#[tokio::test]
+async fn the_server_says_its_id_and_nothing_else_stands_in_for_one() {
+    let answer = Arc::new(Mutex::new(serde_json::json!({})));
+    let reply = answer.clone();
+    let url = serve(move |request| match request.path() {
+        "/System/Info/Public" => Reply::json(reply.lock().unwrap().clone()),
+        _ => Reply::status("404 Not Found"),
+    });
+    let client = JellyfinClient::new(&url, "test-device", Vec::new()).expect("client");
+    // Jellyfin's own form; a dashed or upper-case spelling is the same id.
+    for id in [
+        "c8f6b7e2a1d94f0b9c3e5a7d1b2c4e6f",
+        "C8F6B7E2-A1D9-4F0B-9C3E-5A7D1B2C4E6F",
+    ] {
+        *answer.lock().unwrap() =
+            serde_json::json!({ "Version": "10.11.0", "ServerName": "Home", "Id": id });
+        assert_eq!(
+            client.public_server_id().await.unwrap(),
+            "c8f6b7e2a1d94f0b9c3e5a7d1b2c4e6f"
+        );
+    }
+    // A server that does not say, or says nothing usable: no id at all,
+    // rather than one every such server would share.
+    for answer_without in [
+        serde_json::json!({ "Version": "10.11.0" }),
+        serde_json::json!({ "Version": "10.11.0", "Id": "" }),
+        serde_json::json!({ "Version": "10.11.0", "Id": "not an id" }),
+    ] {
+        *answer.lock().unwrap() = answer_without;
+        assert!(client.public_server_id().await.is_err());
+    }
+    assert_eq!(client.server_id(), None, "asking does not set it");
+}

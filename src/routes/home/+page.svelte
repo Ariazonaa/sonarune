@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { api } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
@@ -39,7 +40,7 @@
       })
       .catch((e) => {
         if (id !== requestId) return;
-        if (!home) error = String(e);
+        if (!home) error = errorCause(e);
       });
   }
 

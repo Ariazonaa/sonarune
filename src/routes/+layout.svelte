@@ -27,6 +27,7 @@
   import { layoutPreferences } from "#lib/state/layout.svelte.js";
   import { installShortcuts } from "#lib/shortcuts.js";
   import { isTextField } from "#lib/controls.js";
+  import { guardDrops } from "#lib/dropGuard.js";
   import { syncTrayLabels } from "#lib/tray.js";
   import { coverUrl } from "#lib/api.js";
   import { ambientColors } from "#lib/ambient.js";
@@ -78,6 +79,9 @@
       if (isTextField(e.target)) return;
       e.preventDefault();
     });
+    // A link or file dropped where nothing takes it must not navigate the
+    // window away from the app (dropGuard.ts).
+    guardDrops(window, isTextField);
 
     if (isStandalone) {
       if (isProjector) {

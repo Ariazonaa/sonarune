@@ -3,6 +3,7 @@
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { availableMonitors, type Monitor } from "@tauri-apps/api/window";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import {
     PROJECTOR_SETTINGS_EVENT,
@@ -96,7 +97,7 @@
       await window.setFullscreen(settings.fullscreen);
       await window.setFocus();
     } catch (cause) {
-      error = String(cause);
+      error = errorCause(cause);
     }
   }
 
@@ -150,7 +151,7 @@
       watchProjector(projector);
     } catch (cause) {
       opening = false;
-      error = String(cause);
+      error = errorCause(cause);
     }
   }
 
@@ -160,7 +161,7 @@
       await projector?.close();
       projectorOpen = false;
     } catch (cause) {
-      error = String(cause);
+      error = errorCause(cause);
     }
   }
 
@@ -181,7 +182,7 @@
           persist({ ...settings, monitorKey: monitorKey(available[0]) });
         }
       })
-      .catch((cause) => (error = String(cause)));
+      .catch((cause) => (error = errorCause(cause)));
     void WebviewWindow.getByLabel(PROJECTOR_WINDOW_LABEL)
       .then((window) => {
         if (cancelled) return;

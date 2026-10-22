@@ -8,67 +8,93 @@
 //! and albums onto a playlist in the sidebar. Nothing listens for its file
 //! drops either.
 //!
-//! Without it, though, WebView2 takes drops from outside again, and a file
-//! dropped where the page does not handle it opens by navigating the window to
-//! that file — the app would be gone from the window. The handler used to rule
-//! that out by switching external drops off as well; this does the same on
-//! every webview, without the replaced drop target. Drags within the page are
-//! not affected by it.
-//!
-//! WebKitGTK and WKWebView have no such switch, and neither has a WebView2
-//! runtime from before 2022. There a dropped file still becomes a navigation
-//! to its `file:` URL, so every webview also refuses those: no page of the app
-//! is a file.
+//! Without it, though, WebView2 takes drops from outside again, and a file or a
+//! link dropped where the page does not handle it navigates the window there —
+//! the app would be gone from the window. WebView2's own switch for that,
+//! `ICoreWebView2Controller4::SetAllowExternalDrop(false)`, cannot be used: with
+//! it, a drag *within* the page starts but never reaches a drop target — no
+//! `dragenter`, `dragover` or `drop`, only `dragend` (WebView2 155, checked with
+//! a real mouse on 22.10.2026) — so every drag of the app would be dead again.
+//! Drops from outside therefore stay possible, and what they would do is
+//! refused twice. The frontend swallows every drop that no element of the app
+//! takes (`src/lib/dropGuard.ts`), so a dropped link or file does not navigate
+//! at all — that also covers a URL this side never sees: Tauri lets a
+//! navigation through without asking its hooks when the URL does not parse
+//! (`http://xn--a.example.com/` is one Chromium accepts and `url` refuses).
+//! And here, a webview may only navigate to the app's own pages: Tauri's asset
+//! protocol (`http://tauri.localhost` on Windows, `tauri://localhost` on macOS
+//! and Linux) and, under `tauri dev`, the dev server. Not "the origin of the
+//! page it shows": a window's first page is asked about too, while the webview
+//! still shows `about:blank` (checked on 22.10.2026). The same rules cover
+//! WebKitGTK and WKWebView, which have no switch at all. A dropped link that
+//! asks for a new window is denied by wry already, since no new-window handler
+//! is registered.
 
-/// Registers the hooks on every webview, including the ones the frontend
-/// opens later (mini player, projector): external drops switched off where
-/// the webview can, and no navigation to a dropped file anywhere.
+/// Registers the rule on every webview, including the ones the frontend opens
+/// later (mini player, projector).
 pub fn init() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("webview-drop")
-        .on_webview_ready(|webview| refuse_external_drops(&webview))
-        .on_navigation(|_, url| navigation_allowed(url))
+        .on_navigation(|webview, url| {
+            use tauri::Manager;
+            let dev = if tauri::is_dev() {
+                webview.config().build.dev_url.clone()
+            } else {
+                None
+            };
+            navigation_allowed(url, &app_origins(dev))
+        })
         .build()
 }
 
-/// The app's pages come from Tauri's own protocol (or the dev server); a
-/// `file:` URL is what a file dropped onto the window turns into.
-fn navigation_allowed(url: &tauri::Url) -> bool {
-    url.scheme() != "file"
+/// Where the app's pages come from, as Tauri resolves `WebviewUrl::App`: its
+/// asset protocol — on Windows plain http, since `useHttpsScheme` is off — and
+/// the dev server when there is one.
+fn app_origins(dev: Option<tauri::Url>) -> Vec<tauri::Url> {
+    let protocol = if cfg!(windows) || cfg!(target_os = "android") {
+        "http://tauri.localhost/"
+    } else {
+        "tauri://localhost/"
+    };
+    let mut origins = vec![tauri::Url::parse(protocol).expect("a valid URL")];
+    origins.extend(dev);
+    origins
 }
 
-#[cfg(windows)]
-fn refuse_external_drops(webview: &tauri::Webview) {
-    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller4;
-    use windows::core::Interface;
-
-    let result = webview.with_webview(|webview| unsafe {
-        // `AllowExternalDrop` needs a WebView2 runtime from 2022 or later; an
-        // older one keeps accepting drops, and `navigation_allowed` keeps a
-        // dropped file from replacing the app.
-        match webview.controller().cast::<ICoreWebView2Controller4>() {
-            Ok(controller) => {
-                if let Err(e) = controller.SetAllowExternalDrop(false) {
-                    tracing::debug!("webview SetAllowExternalDrop(false) failed: {e}");
-                }
-            }
-            Err(e) => tracing::debug!("webview has no ICoreWebView2Controller4: {e}"),
-        }
-    });
-    if let Err(e) = result {
-        tracing::debug!("cannot reach the webview to refuse external drops: {e}");
-    }
+/// Whether `url` lies within one of `origins`: same scheme, host and port.
+/// Compared by hand because `url` gives `tauri://` an opaque origin, which
+/// equals nothing. A dropped file turns into a `file:` URL and a dropped link
+/// into its own address; neither may replace the app.
+fn navigation_allowed(url: &tauri::Url, origins: &[tauri::Url]) -> bool {
+    url.host_str().is_some()
+        && origins.iter().any(|origin| {
+            url.scheme() == origin.scheme()
+                && url.host_str() == origin.host_str()
+                && url.port_or_known_default() == origin.port_or_known_default()
+        })
 }
-
-#[cfg(not(windows))]
-fn refuse_external_drops(_webview: &tauri::Webview) {}
 
 #[cfg(test)]
 mod tests {
-    use super::navigation_allowed;
+    use super::{app_origins, navigation_allowed};
     use tauri::Url;
 
+    /// Where the app's pages come from: Windows (http, as configured),
+    /// macOS/Linux, and `tauri dev`.
+    const ORIGINS: [&str; 3] = [
+        "http://tauri.localhost/",
+        "tauri://localhost/",
+        "http://localhost:1420/",
+    ];
+
+    fn origins() -> Vec<Url> {
+        ORIGINS
+            .iter()
+            .map(|origin| Url::parse(origin).unwrap())
+            .collect()
+    }
+
     fn allowed(url: &str) -> bool {
-        navigation_allowed(&Url::parse(url).expect(url))
+        navigation_allowed(&Url::parse(url).expect(url), &origins())
     }
 
     #[test]
@@ -77,6 +103,7 @@ mod tests {
             "file:///C:/Users/me/Music/Song.flac",
             "FILE:///C:/Users/me/Music/Song.flac",
             "file://nas/music/Song.flac",
+            "file://tauri.localhost/Song.flac",
             "file:///home/me/Music/Song.flac",
         ] {
             assert!(!allowed(dropped), "{dropped}");
@@ -84,14 +111,66 @@ mod tests {
     }
 
     #[test]
-    fn the_apps_own_pages_still_load() {
-        for page in [
-            "http://tauri.localhost/",
-            "https://tauri.localhost/mini",
-            "tauri://localhost/projector",
-            "http://localhost:1420/settings",
+    fn a_dropped_link_cannot_replace_the_app() {
+        for dropped in [
+            "https://example.com/",
+            "http://example.com/?tauri.localhost",
+            "http://tauri.localhost.example.com/",
+            "http://tauri.localhost@example.com/",
+            "http://tauri.localhost./",
+            "https://localhost/",
+            "http://localhost:8096/web/index.html",
+            "http://127.0.0.1:1420/",
+            "http://jfimg.localhost/Items/1/Images/Primary",
+            "data:text/html,<p>hi</p>",
+            "about:blank",
+            "about:srcdoc",
+            "ftp://example.com/song.flac",
+            "tauri://example.com/",
         ] {
-            assert!(allowed(page), "{page}");
+            assert!(!allowed(dropped), "{dropped}");
         }
+    }
+
+    #[test]
+    fn the_apps_own_pages_still_load() {
+        for origin in ORIGINS {
+            let base = Url::parse(origin).unwrap();
+            for path in ["", "mini", "history/year/2026?from=stats", "projector#top"] {
+                let page = base.join(path).unwrap();
+                assert!(allowed(page.as_str()), "{page}");
+            }
+        }
+    }
+
+    #[test]
+    fn another_scheme_or_port_of_the_same_host_is_another_origin() {
+        assert!(!allowed("https://tauri.localhost/"));
+        assert!(!allowed("http://tauri.localhost:8080/"));
+        assert!(!allowed("tauri://tauri.localhost/"));
+        assert!(!allowed("http://localhost:1421/"));
+        assert!(!allowed("http://localhost/"));
+        assert!(allowed("http://tauri.localhost:80/x"));
+    }
+
+    /// `app_origins` takes plain http on Windows; a window with
+    /// `useHttpsScheme` would be refused its very first page.
+    #[test]
+    fn no_window_serves_the_app_over_https() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        for window in config["app"]["windows"].as_array().unwrap() {
+            assert_ne!(window["useHttpsScheme"], true, "{window}");
+        }
+    }
+
+    #[test]
+    fn the_dev_server_counts_only_under_tauri_dev() {
+        let dev = Url::parse("http://localhost:1420/").unwrap();
+        let page = Url::parse("http://localhost:1420/mini").unwrap();
+        assert!(navigation_allowed(&page, &app_origins(Some(dev))));
+        assert!(!navigation_allowed(&page, &app_origins(None)));
+        let app = app_origins(None).remove(0).join("mini").unwrap();
+        assert!(navigation_allowed(&app, &app_origins(None)));
     }
 }

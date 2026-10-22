@@ -1,15 +1,23 @@
-//! Whether an MP3's bytes say where its time is. Symphonia seeks an MP3 one
-//! of two ways. Accurately: it reads every frame from the start (backwards)
-//! or from the current one up to the target — on the audio callback for a
-//! native seek, waiting for the download up to there for a reopen. Coarsely:
-//! it jumps to the byte the target's share of the file points at and takes
-//! the time from that same share. The jump is right only at a constant
-//! bitrate. In a variable-bitrate file the assumed time is off by however much
-//! the bitrate before the landing point differs from the file's average —
-//! seconds, in a track with a quiet intro or fade-out — and it stays off: the
-//! position and the lyrics run that far from the audio, and the gapless trim,
-//! which goes by those times, cuts the end of the track or plays the
-//! encoder's padding. So only a file that is constant is seeked coarsely.
+//! Whether an MP3's bytes say where its time is, and how a seek finds its
+//! way in one whose bytes do not. Symphonia seeks an MP3 one of two ways.
+//! Accurately: it reads every frame from the start (backwards) or from the
+//! current one up to the target — on the decoder thread, the source silent
+//! meanwhile, waiting for the download up to there. Coarsely: it jumps to the
+//! byte the target's share of the file points at and takes the time from that
+//! same share. The jump is right only at a constant bitrate. In a
+//! variable-bitrate file the assumed time is off by however much the bitrate
+//! before the landing point differs from the file's average — seconds, in a
+//! track with a quiet intro or fade-out — and it stays off: the position and
+//! the lyrics run that far from the audio, and the gapless trim, which goes
+//! by those times, cuts the end of the track or plays the encoder's padding.
+//! So only a file that is constant is seeked coarsely (by Symphonia). Every
+//! other one is read by a demuxer of our own that notes where its frames
+//! start as it goes ([`demux`]): a seek back jumps to a frame it has seen
+//! instead of reading the file again from its start.
+
+mod demux;
+
+pub(super) use demux::IndexedMp3;
 
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -22,23 +30,43 @@ const FRAMES_TO_COMPARE: usize = 16;
 /// How much is read at a time.
 const STEP: usize = 4 * 1024;
 
-/// Whether `reader`, an MPEG audio stream of `len` bytes, has a constant
-/// bitrate that holds to the end of the file, so its byte share is its time:
-///
-/// - an `Info` frame (what LAME and FFmpeg write into a constant-bitrate
-///   file) whose byte count, if it has one, covers the rest of the file;
-/// - no header frame at all, and the first frames keep one bitrate.
-///
-/// A `Xing` or `VBRI` frame (variable bitrate), or anything not recognised,
-/// is not. Reads only from the start, in order: on a download that is how the
-/// bytes arrive. Leaves the reader at the start.
-pub(super) fn constant_bitrate<R: Read + Seek>(reader: &mut R, len: u64) -> bool {
-    let constant = check(reader, len).unwrap_or(false);
-    // The decoder reads from where this leaves the reader.
-    reader.seek(SeekFrom::Start(0)).is_ok() && constant
+/// What the first frames of an MPEG audio stream say about seeking in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Bitrate {
+    /// A constant bitrate that holds to the end of the file, so its byte
+    /// share is its time: Symphonia seeks it coarsely.
+    Constant,
+    /// Anything else that has frames: read and seeked by [`IndexedMp3`].
+    /// `start` is where the first frame (a header frame, if there is one)
+    /// begins; `counted`, whether a header frame is there to count the
+    /// stream's frames, so that Symphonia does not estimate them.
+    Variable { start: u64, counted: bool },
+    /// No MPEG audio recognised, or too short to tell — and too short to
+    /// seek in anyway.
+    Unknown,
 }
 
-fn check<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result<bool> {
+/// What `reader`, an MPEG audio stream of `len` bytes, is:
+///
+/// - constant: an `Info` frame (what LAME and FFmpeg write into a
+///   constant-bitrate file) whose byte count, if it has one, covers the rest
+///   of the file; or no header frame at all, and the first frames keep one
+///   bitrate;
+/// - variable: a `Xing` or `VBRI` frame, an `Info` frame that does not count
+///   to the end, or no header frame and frames of more than one bitrate.
+///
+/// Reads only from the start, in order: on a download that is how the bytes
+/// arrive. Leaves the reader at the start.
+pub(super) fn bitrate<R: Read + Seek>(reader: &mut R, len: u64) -> Bitrate {
+    let verdict = check(reader, len).unwrap_or(Bitrate::Unknown);
+    // The decoder reads from where this leaves the reader.
+    match reader.seek(SeekFrom::Start(0)) {
+        Ok(_) => verdict,
+        Err(_) => Bitrate::Unknown,
+    }
+}
+
+fn check<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result<Bitrate> {
     reader.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     // Where `buf` starts in the stream.
@@ -47,12 +75,12 @@ fn check<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result<bool> {
     // jump ahead would point a download elsewhere).
     for _ in 0..4 {
         if !fill(reader, &mut buf, 10)? {
-            return Ok(false);
+            return Ok(Bitrate::Unknown);
         }
         let Some(tag) = id3v2_len(&buf) else { break };
         if let Some(rest) = tag.checked_sub(buf.len() as u64) {
             if io::copy(&mut reader.by_ref().take(rest), &mut io::sink())? != rest {
-                return Ok(false);
+                return Ok(Bitrate::Unknown);
             }
             buf.clear();
         } else {
@@ -65,7 +93,7 @@ fn check<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result<bool> {
     let mut at = 0;
     let first = loop {
         if at > SYNC_WINDOW || !fill(reader, &mut buf, at + 4)? {
-            return Ok(false);
+            return Ok(Bitrate::Unknown);
         }
         if let Some(frame) = Frame::parse(word(&buf, at)) {
             let next = at + frame.len;
@@ -77,21 +105,26 @@ fn check<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result<bool> {
         }
         at += 1;
     };
+    let start = base + at as u64;
+    let variable = |counted| Ok(Bitrate::Variable { start, counted });
 
     if first.layer3 {
         if !fill(reader, &mut buf, at + first.len)? {
-            return Ok(false);
+            return Ok(Bitrate::Unknown);
         }
         let frame = &buf[at..at + first.len];
         let id = |offset: usize| frame.get(offset..offset + 4);
         // Where Symphonia looks for them, so the verdict matches what it saw.
         let tag = first.side_info_len() + 4;
         if id(36) == Some(b"VBRI".as_slice()) || id(tag) == Some(b"Xing".as_slice()) {
-            return Ok(false);
+            return variable(true);
         }
         if id(tag) == Some(b"Info".as_slice()) {
-            let rest = len.saturating_sub(base + at as u64);
-            return Ok(info_covers_the_rest(&frame[tag + 4..], rest, first.len));
+            let rest = len.saturating_sub(start);
+            if info_covers_the_rest(&frame[tag + 4..], rest, first.len) {
+                return Ok(Bitrate::Constant);
+            }
+            return variable(true);
         }
     }
 
@@ -100,14 +133,14 @@ fn check<R: Read + Seek>(reader: &mut R, len: u64) -> io::Result<bool> {
     for _ in 1..FRAMES_TO_COMPARE {
         at += frame.len;
         if !fill(reader, &mut buf, at + 4)? {
-            return Ok(false);
+            return Ok(Bitrate::Unknown);
         }
         match Frame::parse(word(&buf, at)) {
             Some(next) if next.like(&first) && next.bitrate == first.bitrate => frame = next,
-            _ => return Ok(false),
+            _ => return variable(false),
         }
     }
-    Ok(true)
+    Ok(Bitrate::Constant)
 }
 
 /// An `Info` frame's fields after its id (flags, then the counts they name)
@@ -165,7 +198,8 @@ fn id3v2_len(head: &[u8]) -> Option<u64> {
     Some(10 + size + footer)
 }
 
-/// What a frame header says, as far as telling frames apart goes.
+/// What a frame header says, as far as telling frames apart and reading
+/// them goes.
 #[derive(Debug, Clone, Copy)]
 struct Frame {
     /// Version, layer and sample rate bits: the same in every frame.
@@ -177,14 +211,18 @@ struct Frame {
     bitrate: u32,
     /// The whole frame, header included.
     len: usize,
+    /// A CRC follows the header.
+    crc: bool,
+    /// Samples per channel it holds.
+    samples: u64,
 }
 
 impl Frame {
-    /// The header `word`, if it is a valid one (free-format bitrates are
-    /// not: Symphonia cannot play them).
+    /// The header `word`, if it is a valid one — by Symphonia's rules
+    /// (free-format bitrates are not: it cannot play them).
     fn parse(word: u32) -> Option<Self> {
         // By layer: III, II, I.
-        const KBPS_V1: [[u32; 15]; 3] = [
+        static KBPS_V1: [[u32; 15]; 3] = [
             [
                 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
             ],
@@ -195,7 +233,7 @@ impl Frame {
                 0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
             ],
         ];
-        const KBPS_V2: [[u32; 15]; 3] = [
+        static KBPS_V2: [[u32; 15]; 3] = [
             [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
             [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
             [
@@ -216,6 +254,19 @@ impl Frame {
         let mpeg1 = version == 3;
         let table = if mpeg1 { &KBPS_V1 } else { &KBPS_V2 };
         let bits_per_second = table[layer as usize - 1][bitrate as usize] * 1000;
+        let mono = word >> 6 & 3 == 3;
+        // Layer II leaves out some bitrates for mono, and others for two
+        // channels.
+        let kbps = bits_per_second / 1000;
+        if layer == 2
+            && if mono {
+                matches!(kbps, 224 | 256 | 320 | 384)
+            } else {
+                matches!(kbps, 32 | 48 | 56 | 80)
+            }
+        {
+            return None;
+        }
         let sample_rate = [44_100, 48_000, 32_000][rate as usize]
             >> match version {
                 3 => 0,
@@ -230,11 +281,18 @@ impl Frame {
         };
         Some(Self {
             kind: word & 0x001e_0c00,
-            mono: word >> 6 & 3 == 3,
+            mono,
             mpeg1,
             layer3: layer == 1,
             bitrate,
             len: len as usize,
+            crc: word >> 16 & 1 == 0,
+            samples: match layer {
+                3 => 384,
+                2 => 1152,
+                _ if mpeg1 => 1152,
+                _ => 576,
+            },
         })
     }
 
@@ -262,11 +320,11 @@ mod tests {
     use std::time::Duration;
 
     /// Bitrate indices of MPEG-1 layer III.
-    const KBPS_32: u32 = 1;
-    const KBPS_128: u32 = 9;
-    const KBPS_320: u32 = 14;
+    pub(super) const KBPS_32: u32 = 1;
+    pub(super) const KBPS_128: u32 = 9;
+    pub(super) const KBPS_320: u32 = 14;
     /// Samples per channel in a frame.
-    const FRAME: usize = 1152;
+    pub(super) const FRAME: usize = 1152;
 
     /// A frame of silence: MPEG-1 layer III, 44.1 kHz, stereo, no CRC;
     /// zeroed side information, so no main data.
@@ -297,7 +355,7 @@ mod tests {
 
     /// A stream: an optional header frame (with the right counts), then
     /// frames at these bitrates.
-    fn stream(header: Option<&[u8; 4]>, bitrates: &[u32]) -> Vec<u8> {
+    pub(super) fn stream(header: Option<&[u8; 4]>, bitrates: &[u32]) -> Vec<u8> {
         let audio: Vec<u8> = bitrates
             .iter()
             .flat_map(|&bitrate| frame(bitrate))
@@ -318,12 +376,16 @@ mod tests {
         tag
     }
 
-    fn verdict(data: Vec<u8>) -> bool {
+    fn bitrate_of(data: Vec<u8>) -> Bitrate {
         let len = data.len() as u64;
         let mut reader = Cursor::new(data);
-        let verdict = constant_bitrate(&mut reader, len);
+        let verdict = bitrate(&mut reader, len);
         assert_eq!(reader.position(), 0, "the reader is left at the start");
         verdict
+    }
+
+    fn verdict(data: Vec<u8>) -> bool {
+        bitrate_of(data) == Bitrate::Constant
     }
 
     #[test]
@@ -341,8 +403,46 @@ mod tests {
             "no header frame, bitrates vary"
         );
         // Too short to tell, and nothing to seek in anyway.
-        assert!(!verdict(stream(None, &cbr[..4])));
-        assert!(!verdict(b"not an mp3 at all".repeat(100)));
+        assert_eq!(bitrate_of(stream(None, &cbr[..4])), Bitrate::Unknown);
+        assert_eq!(
+            bitrate_of(b"not an mp3 at all".repeat(100)),
+            Bitrate::Unknown
+        );
+    }
+
+    #[test]
+    fn a_variable_stream_says_where_its_first_frame_is_and_whether_it_is_counted() {
+        let vbr: Vec<u32> = (0..40).map(|i| [KBPS_32, KBPS_320][i % 2]).collect();
+        let mut data = id3v2(500);
+        let tag = data.len() as u64;
+        data.extend(stream(Some(b"Xing"), &vbr));
+        assert_eq!(
+            bitrate_of(data),
+            Bitrate::Variable {
+                start: tag,
+                counted: true
+            }
+        );
+        // Junk in front of the first frame is skipped.
+        let mut data = vec![0u8; 100];
+        data.extend(stream(None, &vbr));
+        assert_eq!(
+            bitrate_of(data),
+            Bitrate::Variable {
+                start: 100,
+                counted: false
+            }
+        );
+        // An Info frame that does not count to the end.
+        let mut data = stream(Some(b"Info"), &[KBPS_128; 400]);
+        data.extend(vec![0u8; 50_000]);
+        assert_eq!(
+            bitrate_of(data),
+            Bitrate::Variable {
+                start: 0,
+                counted: true
+            }
+        );
     }
 
     #[test]

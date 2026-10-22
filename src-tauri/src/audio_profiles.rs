@@ -13,7 +13,7 @@ use crate::audio_devices::OutputDevice;
 use crate::error::{AppError, AppResult};
 use crate::player::DspParams;
 use crate::store::{keys, Store};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -36,11 +36,76 @@ pub struct DeviceProfile {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+/// The stored profiles: `{"enabled": …, "profiles": {device id: profile}}`.
+/// Each profile is read on its own, so one this build cannot read — damaged,
+/// hand-edited, or written by a build that knows more — costs only itself.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioProfiles {
     pub enabled: bool,
     pub profiles: BTreeMap<String, DeviceProfile>,
+    /// The entries that could not be read, as they are stored. They are
+    /// written back untouched, until a profile of this build takes the
+    /// device over.
+    unreadable: BTreeMap<String, serde_json::Value>,
+}
+
+impl Serialize for AudioProfiles {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeStruct};
+        let mut profiles: serde_json::Map<String, serde_json::Value> = self
+            .unreadable
+            .iter()
+            .filter(|(id, _)| !self.profiles.contains_key(*id))
+            .map(|(id, raw)| (id.clone(), raw.clone()))
+            .collect();
+        for (id, profile) in &self.profiles {
+            profiles.insert(
+                id.clone(),
+                serde_json::to_value(profile).map_err(S::Error::custom)?,
+            );
+        }
+        let mut out = serializer.serialize_struct("AudioProfiles", 2)?;
+        out.serialize_field("enabled", &self.enabled)?;
+        out.serialize_field("profiles", &profiles)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AudioProfiles {
+    /// Fails only when nothing can be read: not an object, or one whose
+    /// `profiles` is not a map. A missing field takes its default, as it
+    /// always did; an `enabled` that is not a flag reads as off.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        use serde_json::Value;
+        let Value::Object(mut stored) = Value::deserialize(deserializer)? else {
+            return Err(D::Error::custom("the sound profiles are not an object"));
+        };
+        let mut read = Self {
+            enabled: stored
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or_default(),
+            ..Self::default()
+        };
+        match stored.remove("profiles") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(entries)) => {
+                for (id, raw) in entries {
+                    match DeviceProfile::deserialize(&raw) {
+                        Ok(profile) => {
+                            read.profiles.insert(id, profile);
+                        }
+                        Err(_) => {
+                            read.unreadable.insert(id, raw);
+                        }
+                    }
+                }
+            }
+            Some(_) => return Err(D::Error::custom("the sound profiles are not a map")),
+        }
+        Ok(read)
+    }
 }
 
 /// What Settings shows: the switch, the device playing right now and the
@@ -63,10 +128,16 @@ pub struct ProfileAppliedEvent {
 }
 
 pub fn load(store: &Store) -> AudioProfiles {
-    store
-        .get(keys::AUDIO_PROFILES)
-        .and_then(|json| serde_json::from_str::<AudioProfiles>(&json).ok())
-        .unwrap_or_default()
+    read(store).unwrap_or_default()
+}
+
+/// The stored profiles; `Err` with the stored value when nothing in it can
+/// be read.
+fn read(store: &Store) -> Result<AudioProfiles, String> {
+    match store.get(keys::AUDIO_PROFILES) {
+        None => Ok(AudioProfiles::default()),
+        Some(json) => serde_json::from_str(&json).map_err(|_| json),
+    }
 }
 
 fn save(store: &Store, profiles: &AudioProfiles) -> AppResult<()> {
@@ -77,10 +148,22 @@ fn save(store: &Store, profiles: &AudioProfiles) -> AppResult<()> {
 
 fn update(store: &Store, change: impl FnOnce(&mut AudioProfiles)) -> AppResult<AudioProfiles> {
     let _guard = WRITE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut profiles = load(store);
+    let (mut profiles, unreadable) = match read(store) {
+        Ok(profiles) => (profiles, None),
+        Err(raw) => (AudioProfiles::default(), Some(raw)),
+    };
     let before = profiles.clone();
     change(&mut profiles);
     if profiles != before {
+        // Nothing in what is stored could be read: it is set aside before
+        // the first profile is saved over it, not lost. A value set aside
+        // before stays: the first is the likelier to hold the profiles.
+        if let Some(raw) = unreadable {
+            tracing::warn!("the stored sound profiles cannot be read; set aside, starting over");
+            if store.get(keys::AUDIO_PROFILES_UNREADABLE).is_none() {
+                store.set(keys::AUDIO_PROFILES_UNREADABLE, &raw)?;
+            }
+        }
         save(store, &profiles)?;
     }
     Ok(profiles)
@@ -135,6 +218,7 @@ pub fn set_enabled(
 pub fn delete(store: &Store, device_id: &str) -> AppResult<()> {
     update(store, |p| {
         p.profiles.remove(device_id);
+        p.unreadable.remove(device_id);
     })
     .map(|_| ())
 }
@@ -505,6 +589,106 @@ mod tests {
             None
         );
         assert_eq!(load(&store).profiles[&dac.id].dsp, eq(0.0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_profile_costs_only_itself() {
+        let (store, dir) = store();
+        let broken = device("wasapi:{broken}", "Broken DAC");
+        let stored = serde_json::json!({
+            "enabled": true,
+            "profiles": {
+                speakers().id: { "dsp": eq(2.0), "volume": 0.5 },
+                // A curve of the wrong length: hand-edited, or damaged.
+                broken.id.clone(): { "dsp": { "eqGainsDb": [1.0] } },
+            },
+        });
+        store
+            .set(keys::AUDIO_PROFILES, &stored.to_string())
+            .unwrap();
+        let loaded = load(&store);
+        assert!(loaded.enabled);
+        assert_eq!(loaded.profiles.keys().collect::<Vec<_>>(), [&speakers().id]);
+        // The readable one works as ever.
+        let applied = on_device_opened(&store, &speakers(), None, None, &eq(0.0), 1.0)
+            .unwrap()
+            .expect("the speakers' own sound");
+        assert_eq!((applied.dsp, applied.volume), (eq(2.0), Some(0.5)));
+        // Saving keeps the unreadable one as it was.
+        remember_dsp(&store, &speakers(), &eq(3.0)).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&store.get(keys::AUDIO_PROFILES).unwrap()).unwrap();
+        assert_eq!(
+            saved["profiles"][&broken.id],
+            stored["profiles"][&broken.id]
+        );
+        // Its device starts over with what plays.
+        assert_eq!(
+            on_device_opened(&store, &broken, None, None, &eq(1.0), 0.7).unwrap(),
+            None
+        );
+        assert_eq!(load(&store).profiles[&broken.id].dsp, eq(1.0));
+        assert_eq!(load(&store).profiles[&speakers().id].dsp, eq(3.0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_value_nothing_can_be_read_from_is_set_aside_before_it_is_saved_over() {
+        let (store, dir) = store();
+        store.set(keys::AUDIO_PROFILES, "{\"enabled\":tru").unwrap();
+        assert_eq!(load(&store), AudioProfiles::default());
+        // Looking changes nothing.
+        let _ = info(&store, None);
+        on_device_opened(&store, &speakers(), None, None, &eq(0.0), 1.0).unwrap();
+        assert_eq!(store.get(keys::AUDIO_PROFILES_UNREADABLE), None);
+        // The first profile saved puts it aside.
+        set_enabled(&store, true, Some(&speakers()), &eq(1.0), 0.8).unwrap();
+        assert_eq!(
+            store.get(keys::AUDIO_PROFILES_UNREADABLE).as_deref(),
+            Some("{\"enabled\":tru")
+        );
+        assert!(load(&store).enabled);
+        // A second such value does not push the first one out.
+        store.set(keys::AUDIO_PROFILES, "[]").unwrap();
+        set_enabled(&store, true, Some(&speakers()), &eq(1.0), 0.8).unwrap();
+        assert_eq!(
+            store.get(keys::AUDIO_PROFILES_UNREADABLE).as_deref(),
+            Some("{\"enabled\":tru")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saved_profiles_read_in_older_builds() {
+        // 0.6.0 and 0.6.1 read the value whole, as this type.
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(rename_all = "camelCase", default)]
+        struct Before {
+            enabled: bool,
+            profiles: BTreeMap<String, DeviceProfile>,
+        }
+        let (store, dir) = store();
+        set_enabled(&store, true, Some(&speakers()), &eq(1.0), 0.8).unwrap();
+        remember_volume(&store, &headphones(), 0.3, &eq(-2.0)).unwrap();
+        let before: Before = serde_json::from_str(&store.get(keys::AUDIO_PROFILES).unwrap())
+            .expect("an older build reads it");
+        assert!(before.enabled);
+        assert_eq!(before.profiles, load(&store).profiles);
+        // An entry this build could not read either is kept as it was: an
+        // older build reads none of the value then, which is how it read
+        // that value before.
+        let mut stored: serde_json::Value =
+            serde_json::from_str(&store.get(keys::AUDIO_PROFILES).unwrap()).unwrap();
+        stored["profiles"]["wasapi:{broken}"] = serde_json::json!({ "dsp": 1 });
+        store
+            .set(keys::AUDIO_PROFILES, &stored.to_string())
+            .unwrap();
+        remember_dsp(&store, &speakers(), &eq(4.0)).unwrap();
+        let saved = store.get(keys::AUDIO_PROFILES).unwrap();
+        assert!(saved.contains(r#""wasapi:{broken}":{"dsp":1}"#), "{saved}");
+        assert!(serde_json::from_str::<Before>(&saved).is_err());
+        assert_eq!(load(&store).profiles[&speakers().id].dsp, eq(4.0));
         let _ = std::fs::remove_dir_all(dir);
     }
 

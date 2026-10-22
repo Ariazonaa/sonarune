@@ -12,12 +12,14 @@ export default defineConfig({
   resolve: {
     conditions: ["browser"],
     // `$app/*` comes from SvelteKit's Vite plugin, which the tests leave out:
-    // a component that navigates gets a stand-in (src/lib/testing), for its
-    // test to mock (see ArtistLinks.test.ts).
+    // a component that navigates, or a page that reads its route, gets a
+    // stand-in (src/lib/testing), for its test to mock or set (see
+    // ArtistLinks.test.ts, the playlist page's test).
     alias: {
       "$app/navigation": fileURLToPath(
         new URL("./src/lib/testing/appNavigation.ts", import.meta.url),
       ),
+      "$app/state": fileURLToPath(new URL("./src/lib/testing/appState.ts", import.meta.url)),
     },
   },
   test: {

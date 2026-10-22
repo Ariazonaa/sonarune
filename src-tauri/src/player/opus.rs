@@ -39,7 +39,7 @@ const OUTPUT_GAIN_LIMIT_DB: f32 = 24.0;
 /// Damaged pages or packets in a row after which a stream counts as
 /// unreadable and ends. One is skipped, as Symphonia does for the other
 /// formats; a run this long is no longer damage but garbage, and reading on
-/// through it would hold up the audio callback.
+/// through it would keep the decoder busy with nothing to play.
 const MAX_BAD_RUN: u32 = 32;
 
 /// Bytes the demuxer consumed since the last completed packet, and how many it
@@ -158,9 +158,9 @@ fn parse_opus_head(data: &[u8]) -> Result<OpusHead, OpusProbeError> {
 ///
 /// `seekable`: whether the underlying byte stream has a known end and random
 /// access. A live transcode wrapped in StreamDownload claims Seek but would
-/// BLOCK on reads at not-yet-downloaded offsets — and rodio runs try_seek on
-/// the audio callback thread, so a bisection over such a stream stalls all
-/// audio. Callers must pass false when the content length is unknown.
+/// BLOCK on reads at not-yet-downloaded offsets, and a bisection over such a
+/// stream would wait for ranges that never come. Callers must pass false
+/// when the content length is unknown.
 pub fn probe<R>(reader: R, seekable: bool) -> Result<OggOpusSource<R>, (R, OpusProbeError)>
 where
     R: Read + Seek + Send + Sync + 'static,
@@ -252,8 +252,8 @@ pub struct OggOpusSource<R: Read + Seek> {
     ended: bool,
     /// Damaged pages or packets since the last good packet ([`MAX_BAD_RUN`]).
     bad_run: u32,
-    /// Damaged spots got over so far. Counted, not logged: this runs on the
-    /// audio callback; the count is logged when the source is dropped.
+    /// Damaged spots got over so far, logged once when the source is
+    /// dropped rather than one line each.
     damage: u32,
     seekable: bool,
 }
@@ -404,7 +404,7 @@ impl<R: Read + Seek> OggOpusSource<R> {
 }
 
 impl<R: Read + Seek> Drop for OggOpusSource<R> {
-    // Off the callback: finished sources go to the reaper thread.
+    // On the decoder thread, which owns the decoder.
     fn drop(&mut self) {
         if self.damage > 0 {
             tracing::debug!("opus stream played over {} damaged spot(s)", self.damage);
@@ -460,8 +460,8 @@ impl<R: Read + Seek> rodio::Source for OggOpusSource<R> {
         use rodio::source::SeekError;
 
         // Live transcodes must not be bisected: StreamDownload's Seek would
-        // BLOCK (not fail) on undownloaded offsets, and rodio runs this on
-        // the audio callback thread. NotSupported leaves the source intact.
+        // BLOCK (not fail) on undownloaded offsets that never come.
+        // NotSupported leaves the source intact.
         if !self.seekable {
             return Err(SeekError::NotSupported {
                 underlying_source: std::any::type_name::<Self>(),

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
   import { api } from "#lib/api.js";
+  import { errorMessage } from "#lib/appErrors.js";
   import BrandMark from "#lib/components/BrandMark.svelte";
   import { normalizeServerUrl } from "#lib/serverUrl.js";
   import { session } from "#lib/state/session.svelte.js";
@@ -71,7 +72,7 @@
       pendingFingerprint =
         result.status === "certUntrusted" ? result.fingerprint : null;
     } catch (e) {
-      error = String(e);
+      error = errorMessage(e);
     } finally {
       busy = false;
     }
@@ -116,14 +117,14 @@
           failures += 1;
           if (failures >= MAX_CONSECUTIVE_POLL_FAILURES) {
             stopQuickConnect();
-            error = String(e);
+            error = errorMessage(e);
           }
         } finally {
           pollInFlight = false;
         }
       }, 2000);
     } catch (e) {
-      error = String(e);
+      error = errorMessage(e);
     } finally {
       busy = false;
     }

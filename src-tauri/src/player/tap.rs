@@ -698,7 +698,7 @@ impl<S: Source> Source for TapSource<S> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         encode_frame_into, wire_rate, wrap, ChunkPool, StereoFold, TapConsumer, TapShared,
         VisualizerTap, CHUNK_FRAMES, CHUNK_SAMPLES, HEADER_BYTES, POOL_SLOTS, SLOT_CLAIMED,
@@ -761,7 +761,7 @@ mod tests {
 
     /// Runs `f`; returns how many allocations, reallocations and frees this
     /// thread made meanwhile.
-    fn count_heap_ops(f: impl FnOnce()) -> usize {
+    pub(in crate::player) fn count_heap_ops(f: impl FnOnce()) -> usize {
         HEAP_OPS.with(|ops| ops.set(Some(0)));
         f();
         HEAP_OPS.with(Cell::take).unwrap_or(0)

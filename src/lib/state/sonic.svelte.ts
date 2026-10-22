@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { errorDetail, errorMessage } from "#lib/appErrors.js";
 import { m } from "#lib/paraglide/messages.js";
 import { player } from "#lib/state/player.svelte.js";
 import { session } from "#lib/state/session.svelte.js";
@@ -69,7 +70,7 @@ class SonicStore {
 
   /** `noSound`: what to say when a track it needs has no sound to compare. */
   #fail(e: unknown, noSound: () => string) {
-    const message = String(e);
+    const message = errorDetail(e);
     if (message.includes(NO_SOUND)) {
       toast.show(noSound(), { kind: "info", ms: 6000 });
     } else if (message.includes(NOT_ANALYSED)) {
@@ -77,7 +78,7 @@ class SonicStore {
     } else if (message.includes(TOO_FEW_ANALYSED)) {
       toast.show(m.sonic_too_few(), { kind: "info", ms: 6000 });
     } else {
-      player.error = message;
+      player.error = errorMessage(e);
     }
   }
 

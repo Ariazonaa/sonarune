@@ -1,8 +1,13 @@
 //! Opening a queue track as a playable, DSP-wrapped rodio source.
 //! Runs on short-lived background threads (never on the player thread) so a
-//! slow or stalled server can never freeze the player command loop.
+//! slow or stalled server can never freeze the player command loop. The
+//! source then decodes on a thread of its own (`source/feed.rs`), resampled
+//! there to the output's rate (`source/resample.rs`); what the mixer pulls
+//! only reads what that thread decoded.
 
+mod feed;
 mod mp3;
+mod resample;
 mod stream;
 
 use super::dsp::{self, AudioDsp, DspSource};
@@ -18,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Duration;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 
 /// Cap for streams that never announce a length (live transcodes). Such a
 /// stream is treated as unseekable anyway, so a circular buffer costs nothing
@@ -204,6 +209,10 @@ pub struct StreamAuth {
     /// queue left over from another server would receive the current server's
     /// token.
     pub base_url: String,
+    /// The server the audio comes from, as stored data names it: what an
+    /// analysis of it is filed under, whatever is signed in by the time
+    /// that is done.
+    pub server: crate::identity::Server,
 }
 
 impl StreamAuth {
@@ -212,6 +221,7 @@ impl StreamAuth {
             auth_header: client.auth_header(),
             trusted: client.trusted_fingerprints().to_vec(),
             base_url: client.base_url().to_string(),
+            server: crate::identity::Server::of(client),
         }
     }
 }
@@ -235,11 +245,74 @@ fn same_origin(a: &str, b: &str) -> bool {
 /// The Opus variant is boxed: its inline state dwarfs the Symphonia handle.
 pub enum EitherSource {
     /// The flag mirrors what `OggOpusSource` tracks internally: whether the
-    /// byte stream has a known end and real random access. rodio runs
-    /// `try_seek` on the audio callback thread, so seeking a live transcode
-    /// would block on not-yet-downloaded ranges and stall all audio.
-    Symphonia(rodio::Decoder<Reader>, bool),
+    /// byte stream has a known end and real random access. A live transcode
+    /// has neither: a seek in it would wait for ranges that never come. It
+    /// is reopened at the target instead (`startTimeTicks`).
+    Symphonia(SymphoniaSource<Reader>, bool),
     Opus(Box<OggOpusSource<Reader>>),
+}
+
+/// What decodes with Symphonia: rodio's decoder, or — for an MP3 whose
+/// bitrate varies — our own demuxer with a frame index around Symphonia's
+/// MP3 decoder (`source/mp3.rs`). Boxed: it is the larger of the two.
+pub enum SymphoniaSource<R: std::io::Read + std::io::Seek> {
+    Rodio(rodio::Decoder<R>),
+    Indexed(Box<mp3::IndexedMp3>),
+}
+
+impl<R> Iterator for SymphoniaSource<R>
+where
+    R: std::io::Read + std::io::Seek + Send + Sync + 'static,
+{
+    type Item = f32;
+
+    #[inline]
+    fn next(&mut self) -> Option<f32> {
+        match self {
+            Self::Rodio(s) => s.next(),
+            Self::Indexed(s) => s.next(),
+        }
+    }
+}
+
+impl<R> Source for SymphoniaSource<R>
+where
+    R: std::io::Read + std::io::Seek + Send + Sync + 'static,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        match self {
+            Self::Rodio(s) => s.current_span_len(),
+            Self::Indexed(s) => s.current_span_len(),
+        }
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        match self {
+            Self::Rodio(s) => s.channels(),
+            Self::Indexed(s) => s.channels(),
+        }
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        match self {
+            Self::Rodio(s) => s.sample_rate(),
+            Self::Indexed(s) => s.sample_rate(),
+        }
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        match self {
+            Self::Rodio(s) => s.total_duration(),
+            Self::Indexed(s) => s.total_duration(),
+        }
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        match self {
+            Self::Rodio(s) => s.try_seek(pos),
+            Self::Indexed(s) => s.try_seek(pos),
+        }
+    }
 }
 
 impl Iterator for EitherSource {
@@ -294,7 +367,9 @@ impl Source for EitherSource {
     }
 }
 
-pub type TrackSource = Reaped<TapSource<FadeSource<DspSource<EitherSource>>>>;
+/// What the mixer pulls. The decoder is not in it: it runs on the source's
+/// decoder thread, and this reads its ring (`feed::RingSource`).
+pub type TrackSource = Reaped<TapSource<FadeSource<DspSource<feed::RingSource>>>>;
 
 /// Reaper slots: two or three sources go per track change at most, and the
 /// reaper empties them several times a second.
@@ -305,12 +380,13 @@ const REAP_FREE: u8 = 0;
 const REAP_CLAIMED: u8 = 1;
 const REAP_FULL: u8 = 2;
 
-/// Where finished sources go to be dropped. Dropping one deletes its temp file
-/// and frees its decoder, and rodio drops a source that ended or was stopped
-/// inside the audio callback. The hand-over works like the visualizer tap's
-/// chunk pool (`tap.rs`): one compare-and-swap claims a slot, its mutex is
-/// only ever `try_lock`ed by the claimant (so it never has a waiter to wake),
-/// and the reaper polls instead of being woken.
+/// Where finished sources go to be dropped. Dropping one frees its ring and
+/// its buffers (its decoder and temp file go with its decoder thread), and
+/// rodio drops a source that ended or was stopped inside the audio callback.
+/// The hand-over works like the visualizer tap's chunk pool (`tap.rs`): one
+/// compare-and-swap claims a slot, its mutex is only ever `try_lock`ed by the
+/// claimant (so it never has a waiter to wake), and the reaper polls instead
+/// of being woken.
 struct ReapSlot {
     state: AtomicU8,
     item: Mutex<Option<Box<dyn Send>>>,
@@ -639,12 +715,25 @@ fn disk_run(ranges: &[std::ops::Range<u64>], pos: u64, want: u64) -> u64 {
 
 /// The player's hold on a source's download, with the life cycle of the
 /// source: dropping it stops the download, and that also wakes a decoder
-/// waiting for it. Which matters most when that decoder is the audio
-/// callback: rodio drops a stopped source only on the callback, so a callback
-/// stuck waiting for a stalled server would never drop it.
+/// waiting for it and ends the decoder's thread. Through it the player also
+/// steers that thread (see `feed::FeedHandle`).
 pub struct DownloadProgress {
     state: Arc<DownloadState>,
-    _stop: DropGuard,
+    /// Cancelled when this is dropped.
+    stop: CancellationToken,
+    /// The source's decoder thread (None only in tests).
+    feed: Option<feed::FeedHandle>,
+}
+
+impl Drop for DownloadProgress {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        // The decoder thread may be asleep: it ends on the stop now, not at
+        // its next look.
+        if let Some(feed) = &self.feed {
+            feed.wake();
+        }
+    }
 }
 
 impl DownloadProgress {
@@ -662,6 +751,46 @@ impl DownloadProgress {
     /// dry then has not reached the end of its track: its stream broke off.
     pub fn broke_off(&self) -> bool {
         self.state.is_broken()
+    }
+
+    /// The silence the source played since its last seek, while its decoder
+    /// had nothing for it. rodio counts it as played; it is no media time.
+    pub fn silence(&self) -> Duration {
+        self.feed
+            .as_ref()
+            .map_or(Duration::ZERO, feed::FeedHandle::silence)
+    }
+
+    /// The source can seek, on its decoder thread: the stream has a length.
+    /// A live transcode cannot.
+    pub fn seekable(&self) -> bool {
+        self.feed.as_ref().is_some_and(feed::FeedHandle::seekable)
+    }
+
+    /// The target of a seek the decoder could not carry out, once: the
+    /// source stays silent, and the track is better reopened there.
+    pub fn take_seek_failure(&self) -> Option<Duration> {
+        self.feed.as_ref()?.take_seek_failure()
+    }
+
+    /// The decoder crashed: the source ended early.
+    pub fn decoder_failed(&self) -> bool {
+        self.feed.as_ref().is_some_and(feed::FeedHandle::failed)
+    }
+
+    /// Why the source ended early (see [`Self::decoder_failed`]).
+    pub fn decoder_failure(&self) -> Option<String> {
+        self.feed.as_ref()?.failure()
+    }
+
+    /// Have the decoder thread see to a seek right away: the source asked
+    /// for it from the audio callback, which wakes nobody. Also ends a wait
+    /// for the download early.
+    pub fn wake_decoder(&self) {
+        self.state.wake();
+        if let Some(feed) = &self.feed {
+            feed.wake();
+        }
     }
 }
 
@@ -800,6 +929,9 @@ pub struct Attempt<'a> {
     /// Start somewhere other than the beginning: a seek in a live transcode,
     /// or a reopen after the output device changed.
     pub start_ms: Option<u64>,
+    /// The output's rate: the source is resampled to it on its decoder
+    /// thread.
+    pub rate: rodio::SampleRate,
     /// Stops the open, and later the source's download (see
     /// [`OpenTicket::stop_token`]).
     pub stop: CancellationToken,
@@ -818,6 +950,7 @@ pub fn open_track_source(
         play_session,
         gain_db,
         start_ms,
+        rate,
         stop,
     } = attempt;
     use stream_download::source::SourceStream;
@@ -870,10 +1003,11 @@ pub fn open_track_source(
     let state = Arc::new(DownloadState::default());
     // From here on, dropping this stops the download: on an error below, when
     // the player throws the open away, or when it lets go of the source.
-    let download = Arc::new(DownloadProgress {
+    let mut download = DownloadProgress {
         state: state.clone(),
-        _stop: stop.clone().drop_guard(),
-    });
+        stop: stop.clone(),
+        feed: None,
+    };
 
     // Waveform: once per track, from any play whose download ends up whole.
     // A reopen of a direct-play file counts too: Jellyfin ignores
@@ -885,6 +1019,7 @@ pub fn open_track_source(
         .map(|request| WaveformJob {
             item_id: track.item_id.clone(),
             duration_ms: track.duration_ms,
+            server: auth.server.clone(),
             request,
             file: wave_file.clone(),
         });
@@ -924,10 +1059,14 @@ pub fn open_track_source(
         Ok::<_, AppError>(opened)
     })?;
     let mpeg = opened.mpeg;
-    let reader = opened.reader;
+    let mut reader = opened.reader;
+    // What the decoder thread cuts a wait for the download short with, to
+    // seek elsewhere.
+    let interrupt = Arc::<feed::Interrupt>::default();
+    reader.cut_short_by(interrupt.clone());
 
     // Unknown content length = live transcode: seeking such a stream would
-    // block the audio thread on undownloaded byte ranges.
+    // wait for byte ranges that never come.
     let byte_len = reader.content_length();
     let seekable = byte_len.is_some();
     let mut source = match super::opus::probe(reader, seekable) {
@@ -945,11 +1084,19 @@ pub fn open_track_source(
             EitherSource::Symphonia(symphonia_decoder(reader, byte_len, mpeg)?, seekable)
         }
     };
+    // A rate no music has, from a broken header, is not resampled: that
+    // would take a resampler of no bounded size (see `resample::plan`).
+    let source_rate = source.sample_rate().get();
+    if !resample::convertible(source_rate, rate.get()) {
+        return Err(AppError::Audio(format!(
+            "cannot decode the stream: a sample rate of {source_rate} Hz"
+        )));
+    }
 
     // Jellyfin honours startTimeTicks only when it transcodes; a direct-play
     // file comes back whole, with a known length, and would play from 0 while
-    // the UI shows the target. Position that one here, before it reaches the
-    // audio graph — rodio would run the seek on the audio callback thread.
+    // the UI shows the target. Position that one here, before it is handed
+    // over: the player shows Loading until then, not a silent Playing.
     let start_ms = match start_ms {
         Some(ms) if seekable => match source.try_seek(Duration::from_millis(ms)) {
             Ok(()) => ms,
@@ -962,15 +1109,145 @@ pub fn open_track_source(
         None => 0,
     };
 
-    let (faded, fade) = fade::wrap(dsp::wrap(source, dsp_state, gain_db));
-    let (tapped, tap_enabled) = tap::wrap(faded, tap_state);
+    let from = Duration::from_millis(start_ms);
+    let (ring, handle) = feed::start(source, from, seekable, stop, interrupt, rate)
+        .map_err(|e| AppError::Audio(format!("cannot start the decoder thread: {e}")))?;
+    download.feed = Some(handle);
+    let (source, fade, tap_enabled) = chain(ring, dsp_state, gain_db, tap_state);
     Ok(OpenedSource {
-        source: Reaped::new(tapped),
+        source,
         fade,
         tap_enabled,
-        download,
+        download: Arc::new(download),
         start_ms,
     })
+}
+
+/// The stages behind the ring: normalization and EQ, the gain ramps, the
+/// visualizer feed. All of them steered live, on the audio callback.
+fn chain(
+    ring: feed::RingSource,
+    dsp_state: Arc<AudioDsp>,
+    gain_db: Option<f32>,
+    tap_state: Arc<VisualizerTap>,
+) -> (TrackSource, FadeHandle, Arc<AtomicBool>) {
+    let (faded, fade) = fade::wrap(dsp::wrap(ring, dsp_state, gain_db));
+    let (tapped, tap_enabled) = tap::wrap(faded, tap_state);
+    (Reaped::new(tapped), fade, tap_enabled)
+}
+
+/// The source of `download` once more, starting at `position_ms`, for a
+/// player on another output (or one without a lead-in), at that output's
+/// `rate`: its decoder thread seeks there and fills the new source's ring,
+/// resampled for the new rate, and the old source plays what its ring holds
+/// and ends. The download and the temp file go on as they are: nothing is
+/// asked of the server again. None when the decoder cannot be positioned (a
+/// live transcode, a stream that broke off, a decoder that crashed or failed
+/// a seek) or its thread has ended; the track is opened anew then.
+pub fn reposition(
+    download: &Arc<DownloadProgress>,
+    position_ms: u64,
+    rate: rodio::SampleRate,
+    dsp_state: Arc<AudioDsp>,
+    gain_db: Option<f32>,
+    tap_state: Arc<VisualizerTap>,
+) -> Option<OpenedSource> {
+    if download.broke_off() {
+        return None;
+    }
+    let ring = download
+        .feed
+        .as_ref()?
+        .reposition(Duration::from_millis(position_ms), rate)?;
+    download.state.wake();
+    let (source, fade, tap_enabled) = chain(ring, dsp_state, gain_db, tap_state);
+    Some(OpenedSource {
+        source,
+        fade,
+        tap_enabled,
+        download: download.clone(),
+        start_ms: position_ms,
+    })
+}
+
+/// Couple `next`, the track that follows `prev`'s gaplessly on one player at
+/// the output's `rate`, to it (`feed::FeedHandle::couple`): `prev`'s
+/// resampler plays out into `next`'s start, and `next`'s source, not yet
+/// played, starts on `prev`'s end — if that is ready in time; else as it is.
+/// Returns whether `next` is converted anew; its source stays the same.
+pub fn couple(prev: &DownloadProgress, next: &DownloadProgress, rate: rodio::SampleRate) -> bool {
+    match (&prev.feed, &next.feed) {
+        (Some(prev), Some(next)) => prev.couple(next, rate),
+        _ => false,
+    }
+}
+
+/// A whole download and its decoder thread, held past the player they played
+/// in: a paused track whose player went with an output closed for silence
+/// keeps them, and resumes from them later ([`Parked::resume`]) without asking
+/// the server again. What holds the thread is a ring of its own that nothing
+/// pulls — a thread whose source is gone ends. Waiting, it costs what a paused
+/// source costs before the close: the temp file, the decoder with its 1.5 s
+/// ring, and a thread that looks up every quarter of a second. Dropping it
+/// stops the download (unless the player holds it too) and ends the thread.
+pub struct Parked {
+    _ring: feed::RingSource,
+    download: Arc<DownloadProgress>,
+}
+
+/// Park the source of `download`, positioned at `position_ms`, its ring at
+/// `rate`. Only a download that is all on disk is worth keeping: a resume
+/// from it plays without the server. None for one that is not (still
+/// loading, broke off, a live transcode) or whose decoder cannot be
+/// positioned; that track is opened anew when it plays.
+pub fn park(
+    download: &Arc<DownloadProgress>,
+    position_ms: u64,
+    rate: rodio::SampleRate,
+) -> Option<Parked> {
+    if !download.is_complete() || download.broke_off() {
+        return None;
+    }
+    let ring = download
+        .feed
+        .as_ref()?
+        .reposition(Duration::from_millis(position_ms), rate)?;
+    Some(Parked {
+        _ring: ring,
+        download: download.clone(),
+    })
+}
+
+impl Parked {
+    /// What the parked source has on disk: the seek bar's buffered range.
+    pub fn download(&self) -> &Arc<DownloadProgress> {
+        &self.download
+    }
+
+    /// The parked source at `position_ms`, for an output at `rate`, from its
+    /// decoder thread and download (see [`reposition`]). None when the
+    /// decoder can no longer be positioned; the track is opened anew then.
+    pub fn resume(
+        self,
+        position_ms: u64,
+        rate: rodio::SampleRate,
+        dsp_state: Arc<AudioDsp>,
+        gain_db: Option<f32>,
+        tap_state: Arc<VisualizerTap>,
+    ) -> Option<OpenedSource> {
+        // On the new ring before the parked one goes: with no source left,
+        // the thread would end.
+        let resumed = reposition(
+            &self.download,
+            position_ms,
+            rate,
+            dsp_state,
+            gain_db,
+            tap_state,
+        );
+        drop(self);
+        resumed
+    }
 }
 
 /// Symphonia's decoder (flac/mp3/vorbis/wav) over `reader`, a stream of
@@ -979,17 +1256,39 @@ fn symphonia_decoder<R>(
     mut reader: R,
     byte_len: Option<u64>,
     mpeg: bool,
-) -> AppResult<rodio::Decoder<R>>
+) -> AppResult<SymphoniaSource<R>>
 where
     R: std::io::Read + std::io::Seek + Send + Sync + 'static,
 {
-    // MP3 has no index, and Symphonia's accurate seek reads every frame from
-    // the start (backwards) or the current one up to the target: on the audio
-    // callback for a native seek, and waiting for the download up to there
-    // for a reopen. Its coarse seek jumps to the byte the target's share of
-    // the file points at — and takes the time from that share too, so only a
-    // constant-bitrate file gets it (see `mp3`).
-    let coarse = mpeg && byte_len.is_some_and(|len| mp3::constant_bitrate(&mut reader, len));
+    // MP3 has no index. Symphonia's coarse seek jumps to the byte the
+    // target's share of the file points at — and takes the time from that
+    // share too, so only a constant-bitrate file gets it. Its accurate seek
+    // reads every frame from the start (backwards) or the current one up to
+    // the target: any other MP3 is read by our demuxer instead, which notes
+    // where frames start as it reads them, and jumps back (see `mp3`).
+    let bitrate = match byte_len {
+        Some(len) if mpeg => mp3::bitrate(&mut reader, len),
+        _ => mp3::Bitrate::Unknown,
+    };
+    if let (mp3::Bitrate::Variable { start, counted }, Some(len)) = (bitrate, byte_len) {
+        match mp3::IndexedMp3::new(reader, len, start, counted) {
+            Ok(decoder) => {
+                tracing::debug!("variable-bitrate MP3: seeking through a frame index");
+                return Ok(SymphoniaSource::Indexed(Box::new(decoder)));
+            }
+            // Symphonia's reader did not take what `mp3::bitrate` saw:
+            // rodio's decoder probes the stream from its start, as before.
+            Err((e, Some(back))) => {
+                tracing::debug!("not read through a frame index ({e}): decoded as before");
+                reader = back;
+                reader
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|e| AppError::Audio(format!("decode failed: {e}")))?;
+            }
+            Err((e, None)) => return Err(AppError::Audio(format!("decode failed: {e}"))),
+        }
+    }
+    let coarse = bitrate == mp3::Bitrate::Constant;
     let mut builder = rodio::Decoder::builder()
         .with_data(reader)
         .with_gapless(true);
@@ -1001,6 +1300,7 @@ where
     }
     builder
         .build()
+        .map(SymphoniaSource::Rodio)
         .map_err(|e| AppError::Audio(format!("decode failed: {e}")))
 }
 
@@ -1143,7 +1443,8 @@ mod tests {
         let state = Arc::new(DownloadState::default());
         let download = DownloadProgress {
             state: state.clone(),
-            _stop: stop.clone().drop_guard(),
+            stop: stop.clone(),
+            feed: None,
         };
         assert!(!download.broke_off());
         state.broke_off();
@@ -1267,6 +1568,196 @@ mod tests {
         // No folder of our own: the temp directory.
         let file = stream_file(None).expect("a stream copy");
         assert_eq!(file.path().parent(), Some(std::env::temp_dir().as_path()));
+    }
+
+    /// A device switch to an output at another rate: the source goes on on
+    /// its decoder, resampled for the new rate, where it stood.
+    #[test]
+    fn a_source_repositioned_for_another_output_comes_at_its_rate() {
+        use rodio::{ChannelCount, SampleRate};
+        let rate = |hz| SampleRate::new(hz).unwrap();
+        let samples: Vec<f32> = (0..44_100 * 2).map(|i| (i % 200) as f32 / 400.0).collect();
+        let track =
+            rodio::buffer::SamplesBuffer::new(ChannelCount::new(2).unwrap(), rate(44_100), samples);
+        let stop = CancellationToken::new();
+        let interrupt = Arc::<feed::Interrupt>::default();
+        let (first, handle) = feed::start(
+            track,
+            Duration::ZERO,
+            true,
+            stop.clone(),
+            interrupt,
+            rate(48_000),
+        )
+        .unwrap();
+        assert_eq!(first.sample_rate(), rate(48_000));
+        let download = Arc::new(DownloadProgress {
+            state: Arc::default(),
+            stop,
+            feed: Some(handle),
+        });
+        let dsp = Arc::new(AudioDsp::new(super::dsp::DspParams::default()));
+        let tap = Arc::new(VisualizerTap::new());
+        let mut moved =
+            reposition(&download, 250, rate(96_000), dsp, None, tap).expect("repositioned");
+        assert_eq!(moved.start_ms, 250);
+        assert_eq!(moved.source.sample_rate(), rate(96_000));
+        assert_eq!(moved.source.channels().get(), 2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match moved.source.next() {
+                Some(0.0) => assert!(std::time::Instant::now() < deadline, "no audio"),
+                Some(_) => break,
+                None => panic!("it ended without audio"),
+            }
+        }
+        drop(first);
+    }
+
+    /// Waits up to 10 s for `done`.
+    fn within_ten_seconds(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The output closed for silence under a paused track: its player, and
+    /// the source in it, go. Parked, the decoder thread and the download stay
+    /// for the resume, which needs no server; let go of, they end.
+    #[test]
+    fn a_parked_source_outlives_its_player_and_resumes_from_its_download() {
+        use rodio::{ChannelCount, SampleRate};
+        let rate = |hz| SampleRate::new(hz).unwrap();
+        let samples: Vec<f32> = (0..44_100 * 2).map(|i| (i % 200) as f32 / 400.0).collect();
+        let open = || {
+            let track = rodio::buffer::SamplesBuffer::new(
+                ChannelCount::new(2).unwrap(),
+                rate(44_100),
+                samples.clone(),
+            );
+            let stop = CancellationToken::new();
+            let (source, handle) = feed::start(
+                track,
+                Duration::ZERO,
+                true,
+                stop.clone(),
+                Arc::default(),
+                rate(48_000),
+            )
+            .unwrap();
+            let download = Arc::new(DownloadProgress {
+                state: Arc::default(),
+                stop: stop.clone(),
+                feed: Some(handle.clone()),
+            });
+            (source, handle, download, stop)
+        };
+        let dsp = Arc::new(AudioDsp::new(super::dsp::DspParams::default()));
+        let tap = Arc::new(VisualizerTap::new());
+
+        // Not all on disk yet: not worth keeping.
+        let (_first, _, download, _) = open();
+        download.state.record(0..600, Some(1000));
+        assert!(park(&download, 250, rate(48_000)).is_none());
+
+        let (first, handle, download, stop) = open();
+        download.state.record(0..1000, Some(1000));
+        let parked = park(&download, 250, rate(48_000)).expect("parked");
+        // The player goes with the output, its source and its handles too.
+        drop(first);
+        drop(download);
+        // Longer than the decoder takes to notice a dropped source.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(handle.running(), "the decoder thread ended");
+        assert!(!stop.is_cancelled(), "the download stopped");
+        assert!(parked.download().is_complete());
+
+        // Play, on an output at another rate.
+        let mut resumed = parked
+            .resume(400, rate(96_000), dsp, None, tap)
+            .expect("resumed from the parked source");
+        assert_eq!(resumed.start_ms, 400);
+        assert_eq!(resumed.source.sample_rate(), rate(96_000));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match resumed.source.next() {
+                Some(0.0) => assert!(std::time::Instant::now() < deadline, "no audio"),
+                Some(_) => break,
+                None => panic!("it ended without audio"),
+            }
+        }
+        assert!(handle.running());
+        // The resumed source holds the thread and the download now.
+        drop(resumed);
+        within_ten_seconds("the decoder thread outlived its source", || {
+            !handle.running()
+        });
+        assert!(stop.is_cancelled());
+
+        // A parked source nobody resumes lets go of both.
+        let (first, handle, download, stop) = open();
+        download.state.record(0..1000, Some(1000));
+        let parked = park(&download, 0, rate(48_000)).expect("parked");
+        drop((first, download));
+        drop(parked);
+        assert!(stop.is_cancelled());
+        within_ten_seconds("the decoder thread outlived its parked source", || {
+            !handle.running()
+        });
+    }
+
+    /// What the player calls at the gapless append (`couple_prefetched`):
+    /// the next track's own source stays, converted anew when it is
+    /// resampled, as it is at the output's rate; and nothing without a
+    /// decoder thread.
+    #[test]
+    fn the_next_track_is_coupled_through_its_download() {
+        use rodio::{ChannelCount, SampleRate};
+        let rate = |hz| SampleRate::new(hz).unwrap();
+        let open = |hz: u32, seconds: usize| {
+            let samples: Vec<f32> = (0..hz as usize * seconds * 2)
+                .map(|i| (i % 200) as f32 / 400.0)
+                .collect();
+            let track =
+                rodio::buffer::SamplesBuffer::new(ChannelCount::new(2).unwrap(), rate(hz), samples);
+            let stop = CancellationToken::new();
+            let (source, handle) = feed::start(
+                track,
+                Duration::ZERO,
+                true,
+                stop.clone(),
+                Arc::default(),
+                rate(48_000),
+            )
+            .unwrap();
+            let download = Arc::new(DownloadProgress {
+                state: Arc::default(),
+                stop,
+                feed: Some(handle),
+            });
+            (source, download)
+        };
+        let (_a, a) = open(44_100, 2);
+        // Its start kept: a quarter of a second decoded.
+        std::thread::sleep(Duration::from_millis(300));
+        let (_b, b) = open(44_100, 1);
+        let (_c, c) = open(48_000, 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !couple(&a, &b, rate(48_000)) {
+            assert!(std::time::Instant::now() < deadline, "never coupled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Once per source; and one at the output's rate stays as it is.
+        assert!(!couple(&a, &b, rate(48_000)));
+        assert!(!couple(&b, &c, rate(48_000)));
+        let none = DownloadProgress {
+            state: Arc::default(),
+            stop: CancellationToken::new(),
+            feed: None,
+        };
+        assert!(!couple(&none, &b, rate(48_000)));
     }
 
     #[test]

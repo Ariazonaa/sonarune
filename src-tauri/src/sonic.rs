@@ -352,12 +352,15 @@ impl SonicIndex {
 /// whole library again and again.
 const REBUILD_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The index over the analyses of the server signed in now, rebuilt after an
-/// analysis was written — at most every [`REBUILD_AFTER`] while they keep
+/// The index over the analyses of `server` — the session's — rebuilt after
+/// an analysis was written, at most every [`REBUILD_AFTER`] while they keep
 /// coming. Parsing a large library's analyses takes a moment; this is the one
-/// place that pays for it. Empty while signed out.
-pub fn index(store: &crate::store::Store) -> std::sync::Arc<SonicIndex> {
-    index_containing(store, &[])
+/// place that pays for it.
+pub fn index(
+    store: &crate::store::Store,
+    server: &crate::identity::Server,
+) -> std::sync::Arc<SonicIndex> {
+    index_containing(store, server, &[])
 }
 
 /// [`index`] for a caller that needs `needed` in it: when one of them is
@@ -366,27 +369,25 @@ pub fn index(store: &crate::store::Store) -> std::sync::Arc<SonicIndex> {
 /// moment ago must not be reported as not analysed.
 pub fn index_containing(
     store: &crate::store::Store,
+    server: &crate::identity::Server,
     needed: &[&str],
 ) -> std::sync::Arc<SonicIndex> {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Instant;
     struct Built {
-        server: String,
+        server: crate::identity::Server,
         generation: u64,
         at: Instant,
         index: Arc<SonicIndex>,
     }
     static CACHE: OnceLock<Mutex<Option<Built>>> = OnceLock::new();
-    let Some(server) = store.get(crate::store::keys::SERVER_URL) else {
-        return Arc::new(SonicIndex::default());
-    };
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let generation = store.analysis_generation();
     // Held while building on purpose: a second caller waits for this build
     // instead of starting the same one.
     let mut cached = cache.lock().unwrap();
     if let Some(built) = cached.as_ref() {
-        if built.server == server
+        if built.server == *server
             && still_good(
                 &built.index,
                 built.generation != generation,
@@ -398,7 +399,7 @@ pub fn index_containing(
         }
     }
     let rows = store
-        .analyses_for(&server)
+        .analyses_for(server)
         .unwrap_or_else(|e| {
             tracing::warn!("cannot read the stored analyses: {e}");
             Vec::new()
@@ -411,7 +412,7 @@ pub fn index_containing(
         .collect();
     let index = Arc::new(SonicIndex::build(rows));
     *cached = Some(Built {
-        server,
+        server: server.clone(),
         generation,
         at: Instant::now(),
         index: index.clone(),
@@ -459,7 +460,7 @@ pub fn without_sound(store: &crate::store::Store, item_id: &str) -> bool {
 }
 
 /// Take the analyses of `gone` — tracks the server no longer returns to the
-/// account `user` — out of the index (`Store::release_analyses`), as far as
+/// account `owner` — out of the index (`Store::release_analyses`), as far as
 /// that holds for every account here. The server answers for the account
 /// signed in, but an analysis serves every account of its server, and a
 /// track hidden from this one may be another's. So where another account has
@@ -467,20 +468,19 @@ pub fn without_sound(store: &crate::store::Store, item_id: &str) -> bool {
 /// are released: it saw them, and now they are gone. Returns how many.
 pub fn release_gone(
     store: &crate::store::Store,
-    server: &str,
-    user: &str,
+    owner: &crate::identity::Owner,
     gone: Vec<String>,
 ) -> crate::error::AppResult<usize> {
     if gone.is_empty() {
         return Ok(0);
     }
-    let gone: Vec<String> = if crate::history::shared_with_others(store, user, server)? {
-        let played = crate::history::played_by(store, user, &gone)?;
+    let gone: Vec<String> = if crate::history::shared_with_others(store, owner)? {
+        let played = crate::history::played_by(store, owner, &gone)?;
         gone.into_iter().filter(|id| played.contains(id)).collect()
     } else {
         gone
     };
-    store.release_analyses(server, &gone)
+    store.release_analyses(&owner.server, &gone)
 }
 
 /// The tempo part of a distance. An unknown or doubtful tempo costs what a
@@ -787,15 +787,28 @@ mod tests {
     /// Neighbours over a real database, for judging by hand:
     /// `SONARUNE_EVAL_DIR=<data dir> cargo test --release --lib sonic::tests::evaluate -- --ignored --nocapture`.
     /// Prints one JSON line per analysed track: its five nearest, a radio of
-    /// ten, and for a few pairs a path. Reads only; plays nothing.
+    /// ten, and for a few pairs a path. Plays nothing, and works on a copy:
+    /// opening a store tidies it (`Store::tidy` deletes analyses released
+    /// long ago and settles server ids), which must not happen to the real
+    /// library behind a judging run. The copy is taken through a read-only
+    /// connection, so a running app's database is read consistently.
     #[test]
     #[ignore]
     fn evaluate() {
         let Ok(dir) = std::env::var("SONARUNE_EVAL_DIR") else {
             return;
         };
-        let store = crate::store::Store::open(std::path::Path::new(&dir)).unwrap();
-        let index = index(&store);
+        let source = std::path::Path::new(&dir).join(crate::store::DB_FILE);
+        let copy = std::env::temp_dir().join(format!("sonarune-evaluate-{}", std::process::id()));
+        std::fs::create_dir_all(&copy).unwrap();
+        let copied = copy.join(crate::store::DB_FILE);
+        rusqlite::Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [copied.to_string_lossy()])
+            .unwrap();
+        let store = crate::store::Store::open(&copy).unwrap();
+        let server = crate::identity::Server::current(&store).expect("a server signed in");
+        let index = index(&store, &server);
         let none = HashSet::new();
         for point in &index.points {
             let me = index.find(&point.item_id).unwrap();
@@ -832,6 +845,8 @@ mod tests {
                 );
             }
         }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&copy);
     }
 
     #[test]

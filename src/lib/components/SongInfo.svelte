@@ -1,6 +1,7 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { api } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { keyName } from "#lib/musicalKey.js";
   import { modalFocus } from "#lib/modal.js";
   import { m } from "#lib/paraglide/messages.js";
@@ -46,7 +47,7 @@
         if (id === itemId) info = i;
       })
       .catch((e) => {
-        if (id === itemId) error = String(e);
+        if (id === itemId) error = errorCause(e);
       });
   });
 

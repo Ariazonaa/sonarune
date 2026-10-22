@@ -3,6 +3,7 @@
   import { VList } from "virtua/svelte";
   import { goto } from "$app/navigation";
   import { api, formatDuration } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { appendPage, pageWindow } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
@@ -66,7 +67,7 @@
       total = merged.total;
       return merged.grew;
     } catch (e) {
-      if (seq === reloadSeq) error = String(e);
+      if (seq === reloadSeq) error = errorCause(e);
       return false;
     } finally {
       if (seq === reloadSeq) loading = false;
@@ -186,7 +187,7 @@
       if (seq !== reloadSeq) return; // the list was replaced meanwhile
       songs = songs.map((song) => fresh.get(song.id) ?? song);
     } catch (e) {
-      if (seq === reloadSeq) error = String(e);
+      if (seq === reloadSeq) error = errorCause(e);
     }
   }
 </script>

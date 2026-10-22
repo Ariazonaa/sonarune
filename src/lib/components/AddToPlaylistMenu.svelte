@@ -1,5 +1,6 @@
 <script lang="ts">
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorMessage } from "#lib/appErrors.js";
   import { playlistAddedToast } from "#lib/playlistAdd.js";
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
@@ -34,7 +35,7 @@
       .getPlaylists()
       .then((p) => (playlists = p))
       .catch((e) => {
-        player.error = String(e);
+        player.error = errorMessage(e);
         onclose();
       });
   });
@@ -46,7 +47,7 @@
       const { message, kind } = playlistAddedToast(pl.name, trackIds, added);
       toast.show(message, { kind });
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -59,7 +60,7 @@
       playlistStore.refresh();
       toast.show(m.add_to_playlist_done({ name }));
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 </script>

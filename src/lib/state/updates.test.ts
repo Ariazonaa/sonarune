@@ -38,4 +38,19 @@ describe("update announcement", () => {
     await settle();
     expect(updates.info?.version).toBe("0.6.2");
   });
+
+  it("forgets the other channel's answer after a switch", async () => {
+    // A check on beta.
+    vi.mocked(invoke).mockImplementationOnce((async () => newer("0.7.0-beta.1")) as typeof invoke);
+    await updates.check();
+    expect(updates.info?.version).toBe("0.7.0-beta.1");
+
+    // Switched back to stable: until the next check there is no answer.
+    known = null;
+    updates.forget();
+    expect(updates.info).toBeNull();
+    windowComesBack();
+    await settle();
+    expect(updates.info).toBeNull();
+  });
 });

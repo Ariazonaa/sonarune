@@ -146,6 +146,12 @@ async function release(version) {
     );
   }
 
+  // winget-pkgs carries one Sonarune, and that is the stable one: a beta is
+  // for the installs that chose the beta channel in the app.
+  if (found.prerelease || version.includes("-")) {
+    throw new Error(`${tag} is a pre-release; winget gets stable releases only.`);
+  }
+
   // Tauri names the installer after productName, case and all (Sonarune_…).
   const installerName = `${json("src-tauri/tauri.conf.json").productName}_${version}_x64-setup.exe`;
   const asset = (name) => found.assets.find((a) => a.name === name);

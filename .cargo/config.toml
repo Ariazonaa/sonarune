@@ -1,0 +1,12 @@
+# Checked in: applies to every build, local and CI.
+#
+# Link the C runtime statically on Windows. Tauri already does this for the
+# Rust side (`build.windows.staticVCRuntime`), but `cc` builds C and C++
+# dependencies with /MD unless this target feature is set, and the C++ in
+# `signalsmith-stretch` (playback speed) then imports MSVCP140.dll. A Windows
+# without the Visual C++ Redistributable has no such DLL, and the app quit at
+# start without a word. With the feature `cc` uses /MT and the C++ standard
+# library is linked in; only the Universal CRT stays a DLL, which ships with
+# Windows 10 and later.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

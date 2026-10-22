@@ -1,4 +1,4 @@
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorReport};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,9 @@ pub struct AuthenticationResult {
 #[serde(rename_all = "PascalCase")]
 pub struct PublicSystemInfo {
     pub version: String,
+    /// The server's own id, the same under every address it is reached at.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,7 +129,7 @@ pub struct BulkMetadataResult {
     /// Never tried: the run stopped once the server could not be reached.
     pub skipped: usize,
     /// The first failure, for the message; the rest are only counted.
-    pub error: Option<String>,
+    pub error: Option<ErrorReport>,
 }
 
 /// Merge a bulk edit onto a fetched item, in place. Touches only the fields

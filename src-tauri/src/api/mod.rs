@@ -1047,6 +1047,10 @@ pub struct JellyfinClient {
     observed: crate::tls::ObservedFingerprint,
     token: Option<String>,
     user_id: Option<String>,
+    /// The Jellyfin id of the server, once the session learned it
+    /// (`commands::install_session`); what stored data is filed under
+    /// (`identity.rs`). Fixed for the client's life: a session is one server.
+    server_id: Option<String>,
     /// Last full smart-view scan, reused by that view's later pages. Per client,
     /// so it never outlives the session (server and user) it was scanned for.
     smart_scan_cache: Mutex<Option<ScanCache<SmartFilter>>>,
@@ -1132,6 +1136,20 @@ async fn read_capped(response: reqwest::Response, limit: u64, what: &str) -> App
     Ok(out)
 }
 
+/// A server id as stored data is filed under it: Jellyfin's is a GUID (32
+/// hex digits), compared without regard to case or dashes. Anything else —
+/// empty, overlong, with spaces or other signs in it — is no id to go by.
+fn server_id_from(raw: &str) -> Option<String> {
+    let id: String = raw
+        .trim()
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    (!id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric()))
+        .then_some(id)
+}
+
 impl JellyfinClient {
     pub fn new(base_url: &str, device_id: &str, trusted: Vec<String>) -> AppResult<Self> {
         let base = base_url.trim_end_matches('/').to_string();
@@ -1156,6 +1174,7 @@ impl JellyfinClient {
             observed,
             token: None,
             user_id: None,
+            server_id: None,
             smart_scan_cache: Mutex::new(None),
             album_scan_cache: Mutex::new(None),
             random_grid_shuffle: Mutex::new(None),
@@ -1209,6 +1228,16 @@ impl JellyfinClient {
 
     pub fn user_id(&self) -> AppResult<&str> {
         self.user_id.as_deref().ok_or(AppError::NotConnected)
+    }
+
+    /// The Jellyfin id of the server, when the session knows it.
+    pub fn server_id(&self) -> Option<&str> {
+        self.server_id.as_deref()
+    }
+
+    /// Before the client is shared: which server it talks to.
+    pub fn set_server_id(&mut self, id: Option<String>) {
+        self.server_id = id;
     }
 
     pub fn token(&self) -> Option<&str> {
@@ -1370,6 +1399,17 @@ impl JellyfinClient {
     pub async fn server_version(&self) -> AppResult<String> {
         let info: PublicSystemInfo = self.get_json("/System/Info/Public", &[]).await?;
         Ok(info.version)
+    }
+
+    /// The server's own id (`/System/Info/Public`), the same under every
+    /// address it is reached at. Never logged or exported: it names the
+    /// server.
+    pub async fn public_server_id(&self) -> AppResult<String> {
+        let info: PublicSystemInfo = self.get_json("/System/Info/Public", &[]).await?;
+        info.id
+            .as_deref()
+            .and_then(server_id_from)
+            .ok_or_else(|| AppError::Other("the server does not say its id".into()))
     }
 
     async fn post_no_content(&self, path: &str, body: serde_json::Value) -> AppResult<()> {

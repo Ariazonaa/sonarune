@@ -27,6 +27,12 @@ name: Release
 #     endpoint is `releases/latest/download/latest.json`, so it is always the
 #     newest published release that answers.
 #
+# A tag with a pre-release version (`v0.7.0-beta.1`) is drafted as a
+# pre-release, which GitHub never makes the latest release: the stable
+# endpoint goes on answering with the stable one. Installs on the beta
+# channel find it once it is published, through the pointer
+# `beta-channel.yml` moves then (see there, also for rolling a beta back).
+#
 # **Rolling back** therefore means un-publishing (or deleting) the bad release:
 # `latest` then falls back to the release before it, whose own `latest.json`
 # is still correct, and new downloads and new checks get the older version
@@ -395,7 +401,21 @@ jobs:
             if (-not (Test-Path "dist/$file")) { "::error::dist/$file is missing; not drafting a release without it"; exit 1 }
           }
 
-          @(
+          # A pre-release version is a beta: drafted as a pre-release, so it
+          # never becomes the latest release the stable endpoint answers from.
+          $beta = $env:VERSION.Contains("-")
+          $flags = if ($beta) { @("--prerelease", "--latest=false") } else { @() }
+          $intro = if ($beta) {
+            @(
+              "**This is a beta.** It reaches only installs that chose the beta"
+              "channel in Settings -> Updates; everyone else stays on the stable"
+              "release. Back on the stable channel, the beta stays installed until"
+              "a stable release is newer than it."
+              ""
+            )
+          } else { @() }
+
+          @($intro) + @(
             "**Sonarune keeps itself up to date.** The installed app asks this"
             "page once per start whether a newer version exists -- that can be"
             "switched off in Settings -> Updates, where there is also a button"
@@ -424,7 +444,7 @@ jobs:
 
           # No checkout in this job, so `gh` is told the repository.
           $assets = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
-          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --draft --title "Sonarune $($env:VERSION)" --notes-file notes.md $assets
+          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --draft @flags --title "Sonarune $($env:VERSION)" --notes-file notes.md $assets
 
       # The draft holds the signature now, and only the maintainer sees a
       # draft. Left on the run, it would stay downloadable for a day, which is

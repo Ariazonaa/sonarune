@@ -8,12 +8,14 @@ mod commands_library;
 mod commands_metadata;
 mod commands_sonic;
 mod commands_visualizer;
+mod credential_purge;
 mod db_recovery;
 mod desktop;
 mod diagnostics;
 mod download;
 mod error;
 mod history;
+mod identity;
 mod legacy;
 mod library_watch;
 mod player;
@@ -116,6 +118,13 @@ pub fn run() {
         .init();
 
     let context = tauri::generate_context!();
+    // The uninstaller's "delete app data" (installer/hooks.nsh): remove the
+    // saved credentials and leave, before the data migration, before the
+    // single-instance plugin could hand the call over to a running copy, and
+    // before any window exists.
+    if credential_purge::requested(std::env::args_os()) {
+        std::process::exit(credential_purge::run(&context.config().identifier));
+    }
     // Release builds only: a dev or demo build must not walk off with the
     // installed app's data.
     if !cfg!(debug_assertions) {
@@ -327,6 +336,8 @@ pub fn run() {
             commands::get_downloads,
             commands::cancel_download,
             commands::retry_download,
+            commands::retry_failed_downloads,
+            commands::cancel_all_downloads,
             commands::clear_finished_downloads,
             commands::open_downloads_folder,
             commands::play_album,

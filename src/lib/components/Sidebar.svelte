@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import { api } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import BrandMark from "#lib/components/BrandMark.svelte";
   import SyncStatus from "#lib/components/SyncStatus.svelte";
@@ -129,7 +130,7 @@
       const { message, kind } = playlistAddedToast(playlist.name, trackIds, added);
       toast.show(message, { kind });
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 </script>
@@ -177,6 +178,11 @@
             ? 'text-ink'
             : 'text-ink-muted hover:text-ink'}
             {dropTarget === playlist.id ? 'bg-accent text-(--color-on-accent)' : ''}"
+          ondragenter={(event) => {
+            // Taken like `dragover`, or a drop while the list scrolls under
+            // the pointer is lost (see PlaylistTrackList.svelte).
+            if (isOurDrag(event)) event.preventDefault();
+          }}
           ondragover={(event) => {
             // Only ours: a file or a link dragged in must not look droppable.
             if (!isOurDrag(event)) return;

@@ -7,6 +7,7 @@
     type SmartFilter,
     type SmartPlayed,
   } from "#lib/api/discovery.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
@@ -95,7 +96,7 @@
         void migrateGenreIds();
       })
       .catch((cause) => {
-        if (!genres) genresError = String(cause);
+        if (!genres) genresError = errorCause(cause);
       });
   }
 
@@ -174,7 +175,7 @@
       total = result.total;
       swrSet(cacheKey(signature), result);
     } catch (cause) {
-      if (seq === queryGeneration && tracks.length === 0) error = String(cause);
+      if (seq === queryGeneration && tracks.length === 0) error = errorCause(cause);
     } finally {
       if (seq === queryGeneration) loading = false;
     }
@@ -193,7 +194,7 @@
       total = result.total;
       error = null;
     } catch (cause) {
-      if (seq === queryGeneration) error = String(cause);
+      if (seq === queryGeneration) error = errorCause(cause);
     } finally {
       if (seq === queryGeneration) loading = false;
     }
@@ -281,7 +282,7 @@
       toast.show(m.smart_materialized({ name: trimmed }));
       await goto(`/playlist/${playlistId}`);
     } catch (cause) {
-      error = String(cause);
+      error = errorCause(cause);
     } finally {
       materializing = false;
     }

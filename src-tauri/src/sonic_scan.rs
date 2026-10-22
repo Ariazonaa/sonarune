@@ -12,15 +12,17 @@
 //! restart picks up from there.
 //!
 //! The listing also keeps the store's idea of which analyses belong to the
-//! server in step with its library: one made under another address of the
-//! same server is claimed for it, one of a track the library no longer lists
-//! is released (`Store::claim_analyses`, `Store::release_analyses`). Without
-//! a listing — the scan switched off — the account's play history still
-//! tells its server's other addresses, and every sign-in moves what was
-//! analysed under them over (`Store::adopt_analyses`).
+//! server in step with its library: one tagged for another server, or for
+//! none, is claimed for it, one of a track the library no longer lists is
+//! released (`Store::claim_analyses`, `Store::release_analyses`). A server is
+//! its Jellyfin id, not the address it is reached at (`identity.rs`): without
+//! a listing — the scan switched off — what was analysed under another
+//! address of the same server is its own all the same, and every sign-in
+//! settles it (`identity::settle`).
 
 use crate::api::{JellyfinClient, LibrarySignature};
 use crate::error::AppError;
+use crate::identity::{Owner, Server};
 use crate::player::analysis::TrackAnalysis;
 use crate::player::SharedSession;
 use crate::store::{keys, Store};
@@ -53,6 +55,10 @@ const MAX_FAILURES: usize = 2;
 /// transcoder, a full disk), not the tracks, and the pass stops instead of
 /// striking its way through the rest of the library.
 const FAILED_CHUNKS_IN_A_ROW: usize = 3;
+/// How often the scan itself renews a revoked session. A renewal pokes the
+/// next pass at once (`install_session`), so a server that refused every
+/// fresh session as well would otherwise keep the scan logging in.
+const RENEWAL_SPACING: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,15 +106,15 @@ impl ScanHandle {
     }
 }
 
-/// Server URL and user id: whose library a listing describes. Accounts on
-/// one server can see different libraries.
-type Identity = (String, String);
+/// Server and user id: whose library a listing describes. Accounts on one
+/// server can see different libraries.
+type Identity = Owner;
 
 fn identity(client: &JellyfinClient) -> Identity {
-    (
-        client.base_url().to_string(),
-        client.user_id().unwrap_or_default().to_string(),
-    )
+    Owner {
+        server: Server::of(client),
+        user: client.user_id().unwrap_or_default().to_string(),
+    }
 }
 
 /// What the last complete listing of an account's library found, kept in the
@@ -121,9 +127,38 @@ struct Progress {
     /// The address it was listed under. The account is what counts: the
     /// same one under another address has the same library.
     server: String,
+    /// The Jellyfin id of the server; absent in counts kept before it was,
+    /// which go by the user id alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_id: Option<String>,
     user: String,
     analysed: u64,
     total: u64,
+}
+
+impl Progress {
+    /// Whether this is the count of `identity`'s library: the same user id
+    /// on the same server. A count from before server ids were kept goes by
+    /// the user id; for a server whose id is not known, a count with an id
+    /// is its own only under its address.
+    fn is_of(&self, identity: &Identity) -> bool {
+        self.user == identity.user
+            && match (&identity.server.id, &self.server_id) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                (_, None) => true,
+                (None, Some(_)) => self.server == identity.server.address,
+            }
+    }
+
+    /// Whether a count of `identity`'s library saved now takes this one's
+    /// place. One kept before server ids were, listed under another address,
+    /// stays: it may be the count of another server the account is on.
+    fn is_replaced_by(&self, identity: &Identity) -> bool {
+        self.is_of(identity)
+            && (self.server_id.is_some()
+                || identity.server.id.is_none()
+                || self.server == identity.server.address)
+    }
 }
 
 /// Accounts whose counts are kept, the one listed last first.
@@ -142,27 +177,29 @@ fn saved_list(store: &Store) -> Vec<Progress> {
 /// (analysed, total) of the last complete listing of the library of
 /// `identity`'s account.
 fn saved_progress(store: &Store, identity: &Identity) -> Option<(u64, u64)> {
-    let user = identity.1.as_str();
-    if user.is_empty() {
+    if identity.user.is_empty() {
         return None;
     }
-    saved_list(store)
-        .into_iter()
-        .find(|progress| progress.user == user)
+    let list = saved_list(store);
+    // The server's own count before one from before ids were kept.
+    list.iter()
+        .find(|p| p.is_of(identity) && p.server_id.is_some())
+        .or_else(|| list.iter().find(|p| p.is_of(identity)))
         .map(|progress| (progress.analysed, progress.total))
 }
 
 fn save_progress(store: &Store, identity: &Identity, analysed: u64, total: u64) {
-    if identity.1.is_empty() {
+    if identity.user.is_empty() {
         return;
     }
     let mut list = saved_list(store);
-    list.retain(|progress| progress.user != identity.1);
+    list.retain(|progress| !progress.is_replaced_by(identity));
     list.insert(
         0,
         Progress {
-            server: identity.0.clone(),
-            user: identity.1.clone(),
+            server: identity.server.address.clone(),
+            server_id: identity.server.id.clone(),
+            user: identity.user.clone(),
             analysed,
             total,
         },
@@ -173,42 +210,30 @@ fn save_progress(store: &Store, identity: &Identity, analysed: u64, total: u64) 
     }
 }
 
-/// Move what was analysed under the other addresses `me`'s account has
-/// played under over to the address it is signed in at now. A Jellyfin user
-/// id is minted by one server, so its plays tie them together.
-fn adopt_analyses(store: &Store, me: &Identity) -> crate::error::AppResult<usize> {
-    let (server, user) = me;
-    if user.is_empty() {
-        return Ok(0);
-    }
-    let addresses = crate::history::other_addresses(store, user, server)?;
-    store.adopt_analyses(server, &addresses)
-}
-
 /// What a pass has to do about one listed track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Todo {
     /// Fetch and analyse it.
     Analyse,
-    /// Analysed, but tagged with another server or none: claim it for this
-    /// one, no download needed.
+    /// Analysed, but tagged with another server or none, or with this one
+    /// under another address: claim it for this one, no download needed.
     Claim,
     /// Analysed, for this server.
     Done,
 }
 
-fn todo_for(store: &Store, server: &str, item_id: &str, duration_ms: u64) -> Todo {
-    let Some((json, tag)) = store.analysis_row(item_id) else {
+fn todo_for(store: &Store, server: &Server, item_id: &str, duration_ms: u64) -> Todo {
+    let Some(row) = store.analysis_row(item_id) else {
         return Todo::Analyse;
     };
-    match serde_json::from_str::<TrackAnalysis>(&json) {
+    match serde_json::from_str::<TrackAnalysis>(&row.json) {
         Ok(analysis)
             if analysis.version == crate::player::analysis::VERSION
                 && crate::sonic::sound_attempted(&analysis)
                 // Not a file replaced on the server since.
                 && analysis.fits(duration_ms) =>
         {
-            if tag.as_deref() == Some(server) {
+            if row.is_tagged_for(server) {
                 Todo::Done
             } else {
                 Todo::Claim
@@ -232,6 +257,12 @@ fn about_the_track(error: &AppError) -> bool {
         AppError::NotConnected | AppError::Db(_) => false,
         _ => true,
     }
+}
+
+/// Whether the scan may renew the session now, having last done so at
+/// `last` ([`RENEWAL_SPACING`]).
+fn renewal_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= RENEWAL_SPACING)
 }
 
 /// The last walk that listed the whole library and left nothing to retry.
@@ -320,7 +351,7 @@ pub fn spawn(app: AppHandle, session: SharedSession, store: Arc<Store>) -> ScanH
     let enabled = store.get(keys::SONIC_SCAN).as_deref() == Some("true");
     // Before the first listing of the session: what the last one found for
     // the account signed in.
-    let signed_in = store.get(keys::SERVER_URL).zip(store.get(keys::USER_ID));
+    let signed_in = Owner::current(&store);
     let saved = signed_in
         .as_ref()
         .and_then(|identity| saved_progress(&store, identity));
@@ -342,7 +373,7 @@ pub fn spawn(app: AppHandle, session: SharedSession, store: Arc<Store>) -> ScanH
         failures: HashMap::new(),
         last_walk: None,
         shown_for: signed_in,
-        adopted_for: None,
+        renewed_at: None,
     };
     tauri::async_runtime::spawn(scan.run());
     handle
@@ -359,8 +390,8 @@ struct Scan {
     last_walk: Option<Walk>,
     /// Whose library the counts in the status describe.
     shown_for: Option<Identity>,
-    /// Who the analyses of other addresses were last moved over for.
-    adopted_for: Option<Identity>,
+    /// When the scan last renewed a revoked session ([`Scan::renew`]).
+    renewed_at: Option<Instant>,
 }
 
 impl Scan {
@@ -372,7 +403,6 @@ impl Scan {
             let client = self.session.read().await.clone();
             if let Some(client) = client {
                 let me = identity(&client);
-                self.adopt(&me);
                 if self.handle.enabled.load(Ordering::Relaxed) {
                     self.pass(client, poked).await;
                 } else {
@@ -396,21 +426,6 @@ impl Scan {
         let _ = self.app.emit("sonic:scan", snapshot);
     }
 
-    /// Once per sign-in, scan on or off: the analyses made under another
-    /// address of this account's server move over to the one signed in at
-    /// (`adopt_analyses`), so the index does not lose the played tracks.
-    fn adopt(&mut self, me: &Identity) {
-        if self.adopted_for.as_ref() == Some(me) {
-            return;
-        }
-        self.adopted_for = Some(me.clone());
-        match adopt_analyses(&self.store, me) {
-            Ok(0) => {}
-            Ok(moved) => tracing::debug!("{moved} analyses moved over from another address"),
-            Err(e) => tracing::warn!("cannot move analyses over from another address: {e}"),
-        }
-    }
-
     /// The counts of the last complete listing of `identity`'s library, or
     /// none, when the status shows another library's.
     fn show_saved(&mut self, identity: &Identity) {
@@ -423,6 +438,22 @@ impl Scan {
             s.total = saved.map(|(_, total)| total);
         });
         self.shown_for = Some(identity.clone());
+    }
+
+    /// A 401 in this pass: renew the session the way every caller renews it
+    /// (`commands::renew_session`), at most every [`RENEWAL_SPACING`]. The
+    /// pass ends either way — `client` is not the session any more, or still
+    /// rejected — and a renewed session pokes the next one, which is the
+    /// retry.
+    async fn renew(&mut self, client: &Arc<JellyfinClient>, unauthorized: AppError) {
+        let now = Instant::now();
+        if !renewal_due(self.renewed_at, now) {
+            return;
+        }
+        self.renewed_at = Some(now);
+        if let Err(e) = crate::commands::renew_session(&self.app, client, now, unauthorized).await {
+            tracing::debug!("the sonic scan could not renew the session: {e}");
+        }
     }
 
     /// Switched on, and `client` still the session: a pass goes on.
@@ -484,7 +515,7 @@ impl Scan {
         me: &Identity,
         before: Option<&LibrarySignature>,
     ) -> bool {
-        let server = me.0.as_str();
+        let server = &me.server;
         // The rows of this server before the listing: what it does not list
         // any more is released afterwards. Analyses written meanwhile are
         // not in here, so a track played during the walk keeps its own.
@@ -501,6 +532,9 @@ impl Scan {
                 Ok(page) => page,
                 Err(e) => {
                     self.publish(|s| s.last_error = Some(e.to_string()));
+                    if matches!(e, AppError::Server { status: 401, .. }) {
+                        self.renew(client, e).await;
+                    }
                     break Listed::Part;
                 }
             };
@@ -600,7 +634,7 @@ impl Scan {
                 });
             }
             let (mut struck, mut server_trouble) = (0, false);
-            let mut failed = None;
+            let (mut failed, mut unauthorized) = (None, None);
             while let Some(joined) = jobs.join_next().await {
                 let Ok((id, result)) = joined else {
                     continue;
@@ -618,6 +652,9 @@ impl Scan {
                             server_trouble = true;
                         }
                         failed = Some(e.to_string());
+                        if matches!(e, AppError::Server { status: 401, .. }) {
+                            unauthorized = Some(e);
+                        }
                     }
                 }
             }
@@ -635,6 +672,9 @@ impl Scan {
             }
             // Not the tracks' fault: the next look tries them again.
             if server_trouble {
+                if let Some(unauthorized) = unauthorized {
+                    self.renew(client, unauthorized).await;
+                }
                 break;
             }
             failed_in_a_row = if struck == chunk.len() {
@@ -679,7 +719,7 @@ async fn analyse_one(
         .map_err(|e| AppError::Other(format!("cannot store the analysis: {e}")))?;
     // Filed under the server the audio came from, even when the session has
     // moved on while it downloaded.
-    store.put_analysis_from(Some(client.base_url()), id, &json)?;
+    store.put_analysis_from(Some(&Server::of(client)), id, &json)?;
     Ok(crate::sonic::has_sound(&analysis))
 }
 
@@ -721,9 +761,24 @@ mod tests {
 
     const SERVER: &str = "https://music.home";
 
+    /// A server known by its address alone, as before ids were kept.
+    fn at(address: &str) -> Server {
+        Server {
+            address: address.into(),
+            id: None,
+        }
+    }
+
+    fn owner(server: Server, user: &str) -> Identity {
+        Owner {
+            server,
+            user: user.into(),
+        }
+    }
+
     fn stored_with(
         store: &Store,
-        server: Option<&str>,
+        server: Option<&Server>,
         id: &str,
         decoded_ms: f64,
         server_ms: Option<u64>,
@@ -748,6 +803,7 @@ mod tests {
             .unwrap();
     }
 
+    /// An analysis stored under the address `server` (no id), or nobody's.
     fn stored(
         store: &Store,
         server: Option<&str>,
@@ -760,7 +816,14 @@ mod tests {
             version: sonic,
             vector: vec![0.5; crate::player::timbre::DIMENSIONS],
         };
-        stored_with(store, server, id, decoded_ms, server_ms, features);
+        stored_with(
+            store,
+            server.map(at).as_ref(),
+            id,
+            decoded_ms,
+            server_ms,
+            features,
+        );
     }
 
     /// A row of `user`'s play history: `item` played under `server`.
@@ -778,13 +841,13 @@ mod tests {
     }
 
     fn tag(store: &Store, id: &str) -> Option<String> {
-        store.analysis_row(id).and_then(|(_, tag)| tag)
+        store.analysis_row(id).and_then(|row| row.server_url)
     }
 
     #[test]
     fn a_listed_track_is_analysed_claimed_or_left_alone() {
         let store = temp_store();
-        assert_eq!(todo_for(&store, SERVER, "new", 200_000), Todo::Analyse);
+        assert_eq!(todo_for(&store, &at(SERVER), "new", 200_000), Todo::Analyse);
         stored(
             &store,
             Some(SERVER),
@@ -793,7 +856,7 @@ mod tests {
             Some(200_000),
             SONIC_VERSION,
         );
-        assert_eq!(todo_for(&store, SERVER, "done", 200_000), Todo::Done);
+        assert_eq!(todo_for(&store, &at(SERVER), "done", 200_000), Todo::Done);
         // Analysed under another address of the server, or before analyses
         // recorded one: no download, only a claim.
         stored(
@@ -804,7 +867,7 @@ mod tests {
             Some(200_000),
             SONIC_VERSION,
         );
-        assert_eq!(todo_for(&store, SERVER, "moved", 200_000), Todo::Claim);
+        assert_eq!(todo_for(&store, &at(SERVER), "moved", 200_000), Todo::Claim);
         stored(
             &store,
             None,
@@ -813,7 +876,10 @@ mod tests {
             Some(200_000),
             SONIC_VERSION,
         );
-        assert_eq!(todo_for(&store, SERVER, "legacy", 200_000), Todo::Claim);
+        assert_eq!(
+            todo_for(&store, &at(SERVER), "legacy", 200_000),
+            Todo::Claim
+        );
         // The sound analysis changed since.
         stored(
             &store,
@@ -823,9 +889,52 @@ mod tests {
             Some(200_000),
             SONIC_VERSION - 1,
         );
-        assert_eq!(todo_for(&store, SERVER, "old", 200_000), Todo::Analyse);
+        assert_eq!(todo_for(&store, &at(SERVER), "old", 200_000), Todo::Analyse);
         // A file replaced on the server: another length.
-        assert_eq!(todo_for(&store, SERVER, "done", 260_000), Todo::Analyse);
+        assert_eq!(
+            todo_for(&store, &at(SERVER), "done", 260_000),
+            Todo::Analyse
+        );
+    }
+
+    #[test]
+    fn a_track_of_this_server_under_another_address_is_claimed_not_fetched() {
+        let store = temp_store();
+        let lan = "http://10.0.0.5:8096";
+        let with = |address: &str, id: &str| Server {
+            address: address.into(),
+            id: Some(id.into()),
+        };
+        let current = || SonicFeatures {
+            version: SONIC_VERSION,
+            vector: vec![0.5; crate::player::timbre::DIMENSIONS],
+        };
+        let me = with(SERVER, "s1");
+        stored_with(
+            &store,
+            Some(&with(lan, "s1")),
+            "moved",
+            200_000.0,
+            Some(200_000),
+            current(),
+        );
+        stored_with(
+            &store,
+            Some(&me),
+            "done",
+            200_000.0,
+            Some(200_000),
+            current(),
+        );
+        assert_eq!(todo_for(&store, &me, "moved", 200_000), Todo::Claim);
+        assert_eq!(todo_for(&store, &me, "done", 200_000), Todo::Done);
+        // Listed by another server at the same address: its own now.
+        assert_eq!(
+            todo_for(&store, &with(SERVER, "copy"), "done", 200_000),
+            Todo::Claim
+        );
+        // Its id not known: the address decides, as before ids were kept.
+        assert_eq!(todo_for(&store, &at(SERVER), "done", 200_000), Todo::Done);
     }
 
     #[test]
@@ -841,7 +950,7 @@ mod tests {
             Some(238_000),
             SONIC_VERSION,
         );
-        assert_eq!(todo_for(&store, SERVER, "vbr", 238_000), Todo::Done);
+        assert_eq!(todo_for(&store, &at(SERVER), "vbr", 238_000), Todo::Done);
         // Stored before the server length was: the decode is all there is to
         // go by, so it is analysed once more — and then stays.
         stored(
@@ -852,7 +961,10 @@ mod tests {
             None,
             SONIC_VERSION,
         );
-        assert_eq!(todo_for(&store, SERVER, "older", 238_000), Todo::Analyse);
+        assert_eq!(
+            todo_for(&store, &at(SERVER), "older", 238_000),
+            Todo::Analyse
+        );
     }
 
     #[test]
@@ -880,6 +992,15 @@ mod tests {
     }
 
     #[test]
+    fn the_scan_renews_a_session_at_most_every_so_often() {
+        let now = Instant::now();
+        assert!(renewal_due(None, now));
+        assert!(!renewal_due(Some(now), now));
+        assert!(!renewal_due(Some(now), now + RENEWAL_SPACING / 2));
+        assert!(renewal_due(Some(now), now + RENEWAL_SPACING));
+    }
+
+    #[test]
     fn only_trouble_with_one_track_counts_against_it() {
         let server = |status| AppError::Server {
             status,
@@ -899,7 +1020,7 @@ mod tests {
 
     #[test]
     fn an_idle_look_walks_only_when_something_may_have_changed() {
-        let me: Identity = (SERVER.into(), "u1".into());
+        let me = owner(at(SERVER), "u1");
         let signature = |count| LibrarySignature {
             newest: "2026-10-01T00:00:00Z".into(),
             count,
@@ -933,7 +1054,7 @@ mod tests {
             walk_needed(false, None, &me, Some(&signature(20_000)), now),
             "no clean walk"
         );
-        let other: Identity = (SERVER.into(), "u2".into());
+        let other = owner(at(SERVER), "u2");
         assert!(walk_needed(
             false,
             Some(&walk),
@@ -954,13 +1075,13 @@ mod tests {
     #[test]
     fn the_last_count_is_kept_per_account() {
         let store = temp_store();
-        let me: Identity = (SERVER.into(), "u1".into());
+        let me = owner(at(SERVER), "u1");
         assert_eq!(saved_progress(&store, &me), None);
         save_progress(&store, &me, 19_990, 20_000);
         assert_eq!(saved_progress(&store, &me), Some((19_990, 20_000)));
         // Another account is signed in and listed; the first one keeps its
         // count for when it comes back.
-        let kid: Identity = (SERVER.into(), "kid".into());
+        let kid = owner(at(SERVER), "kid");
         assert_eq!(saved_progress(&store, &kid), None);
         save_progress(&store, &kid, 300, 400);
         assert_eq!(saved_progress(&store, &kid), Some((300, 400)));
@@ -968,13 +1089,13 @@ mod tests {
         // The same account under another address of its server: the same
         // library.
         assert_eq!(
-            saved_progress(&store, &("https://music.example.org".into(), "u1".into())),
+            saved_progress(&store, &owner(at("https://music.example.org"), "u1")),
             Some((19_990, 20_000))
         );
         save_progress(&store, &me, 20_000, 20_000);
         assert_eq!(saved_progress(&store, &me), Some((20_000, 20_000)));
         for i in 0..KEPT_PROGRESS {
-            save_progress(&store, &(SERVER.into(), format!("other{i}")), 1, 1);
+            save_progress(&store, &owner(at(SERVER), &format!("other{i}")), 1, 1);
         }
         assert_eq!(saved_progress(&store, &me), None, "the oldest went");
         // One entry on its own, as it was kept before.
@@ -985,10 +1106,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(saved_progress(&store, &me), Some((5, 9)));
+        assert_eq!(saved_progress(&store, &owner(at(SERVER), "")), None);
+    }
+
+    #[test]
+    fn the_count_of_one_server_is_not_shown_for_another() {
+        let store = temp_store();
+        let server = |address: &str, id: &str| Server {
+            address: address.into(),
+            id: Some(id.into()),
+        };
+        let first = owner(server(SERVER, "first"), "u1");
+        // A copy of the server: the same user ids, an id of its own.
+        let copy = owner(server("https://copy.home", "copy"), "u1");
+        save_progress(&store, &first, 19_990, 20_000);
+        assert_eq!(saved_progress(&store, &copy), None);
+        save_progress(&store, &copy, 300, 400);
+        assert_eq!(saved_progress(&store, &first), Some((19_990, 20_000)));
+        assert_eq!(saved_progress(&store, &copy), Some((300, 400)));
+        // The first one under another address: the same library.
+        let proxied = owner(server("https://music.example.org", "first"), "u1");
+        assert_eq!(saved_progress(&store, &proxied), Some((19_990, 20_000)));
+        // Its id not known: its own count only at its address.
         assert_eq!(
-            saved_progress(&store, &(SERVER.into(), String::new())),
+            saved_progress(&store, &owner(at(SERVER), "u1")),
+            Some((19_990, 20_000))
+        );
+        assert_eq!(
+            saved_progress(&store, &owner(at("https://elsewhere.home"), "u1")),
             None
         );
+
+        // A count kept by 0.6.1, without the server id: the account's until
+        // a listing of its server replaces it.
+        store
+            .set(
+                keys::SONIC_SCAN_PROGRESS,
+                r#"[{"server":"https://music.home","user":"u2","analysed":5,"total":9}]"#,
+            )
+            .unwrap();
+        let u2 = owner(server(SERVER, "first"), "u2");
+        assert_eq!(saved_progress(&store, &u2), Some((5, 9)));
+        save_progress(&store, &u2, 7, 9);
+        assert_eq!(saved_list(&store).len(), 1);
+        assert_eq!(saved_progress(&store, &u2), Some((7, 9)));
+        // One listed elsewhere may be another server's: it stays for that
+        // one until it saves its own.
+        let elsewhere = r#"{"server":"https://copy.home","user":"u2","analysed":1,"total":4}"#;
+        let mut list: Vec<serde_json::Value> =
+            serde_json::from_str(&store.get(keys::SONIC_SCAN_PROGRESS).unwrap()).unwrap();
+        list.push(serde_json::from_str(elsewhere).unwrap());
+        store
+            .set(
+                keys::SONIC_SCAN_PROGRESS,
+                &serde_json::to_string(&list).unwrap(),
+            )
+            .unwrap();
+        save_progress(&store, &u2, 8, 9);
+        assert_eq!(saved_progress(&store, &u2), Some((8, 9)));
+        let copy_u2 = owner(server("https://copy.home", "copy"), "u2");
+        assert_eq!(saved_progress(&store, &copy_u2), Some((1, 4)));
+        save_progress(&store, &copy_u2, 2, 4);
+        assert_eq!(saved_list(&store).len(), 2);
+
+        // 0.6.1 reads the list as it did, ignoring the id.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Progress061 {
+            server: String,
+            user: String,
+            analysed: u64,
+            total: u64,
+        }
+        let stored = store.get(keys::SONIC_SCAN_PROGRESS).unwrap();
+        let read: Vec<Progress061> = serde_json::from_str(&stored).unwrap();
+        assert_eq!((read[0].user.as_str(), read[0].analysed), ("u2", 2));
+        assert!(stored.contains(r#""serverId":"first""#), "{stored}");
     }
 
     #[test]
@@ -1050,10 +1243,9 @@ mod tests {
         stored(&store, Some(""), "gone", 200_000.0, None, SONIC_VERSION);
         let generation = store.analysis_generation();
 
-        assert_eq!(
-            adopt_analyses(&store, &(new.into(), "u1".into())).unwrap(),
-            2
-        );
+        let settle = |me: Identity| crate::identity::settle(&store, &me).unwrap().0;
+        // No server id known: the history ties the addresses.
+        assert_eq!(settle(owner(at(new), "u1")), 2);
         assert!(store.analysis_generation() > generation);
         assert_eq!(tag(&store, "a").as_deref(), Some(new));
         assert_eq!(tag(&store, "skipped").as_deref(), Some(new));
@@ -1061,14 +1253,8 @@ mod tests {
         assert_eq!(tag(&store, "gone").as_deref(), Some(""));
         // Another account has no plays tying it to the old address.
         stored(&store, Some(old), "b", 200_000.0, None, SONIC_VERSION);
-        assert_eq!(
-            adopt_analyses(&store, &(new.into(), "u2".into())).unwrap(),
-            0
-        );
-        assert_eq!(
-            adopt_analyses(&store, &(new.into(), String::new())).unwrap(),
-            0
-        );
+        assert_eq!(settle(owner(at(new), "u2")), 0);
+        assert_eq!(settle(owner(at(new), "")), 0);
         assert_eq!(tag(&store, "b").as_deref(), Some(old));
     }
 
@@ -1080,7 +1266,7 @@ mod tests {
         }
         let release = |gone: &[&str]| {
             let gone = gone.iter().map(|id| id.to_string()).collect();
-            crate::sonic::release_gone(&store, SERVER, "kid", gone).unwrap()
+            crate::sonic::release_gone(&store, &owner(at(SERVER), "kid"), gone).unwrap()
         };
         // Nobody else plays on this server: what it no longer returns is gone.
         assert_eq!(release(&["dead"]), 1);
@@ -1104,7 +1290,7 @@ mod tests {
         assert!(!crate::sonic::without_sound(&store, "loud"));
         stored_with(
             &store,
-            Some(SERVER),
+            Some(&at(SERVER)),
             "jingle",
             2_000.0,
             None,
@@ -1114,7 +1300,7 @@ mod tests {
         // Not through the current sound analysis yet: it may still get one.
         stored_with(
             &store,
-            Some(SERVER),
+            Some(&at(SERVER)),
             "older",
             2_000.0,
             None,

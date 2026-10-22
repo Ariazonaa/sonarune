@@ -1,6 +1,7 @@
 import { goto } from "$app/navigation";
 import { api } from "#lib/api.js";
 import { apiLibrary } from "#lib/api/library.js";
+import { errorMessage } from "#lib/appErrors.js";
 import { m } from "#lib/paraglide/messages.js";
 import { sonicPathEntries } from "#lib/sonicPathMenu.js";
 import { confirm } from "#lib/state/confirm.svelte.js";
@@ -39,7 +40,7 @@ export async function downloadTracks(tracks: TrackDto[]) {
     await downloads.enqueue(tracks.map((track) => ({ itemId: track.id, name: track.name })));
     toast.show(tracks.length === 1 ? m.download_queued_one() : m.download_queued_many({ count: tracks.length }));
   } catch (e) {
-    player.error = String(e);
+    player.error = errorMessage(e);
   }
 }
 
@@ -66,7 +67,7 @@ export async function deleteTracks(tracks: TrackDto[], onRemoved: (ids: string[]
     onRemoved(ids);
     toast.show(m.delete_done());
   } catch (e) {
-    player.error = String(e);
+    player.error = errorMessage(e);
   }
 }
 

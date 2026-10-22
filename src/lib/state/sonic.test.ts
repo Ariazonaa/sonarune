@@ -52,14 +52,16 @@ describe("a sonic radio or path that cannot be made", () => {
   });
 
   it("points to the library analysis when a track has not been analysed", async () => {
-    invokeMock.mockRejectedValueOnce("sonic:not-analysed");
+    // As the command rejects since the codes (`ErrorReport`).
+    invokeMock.mockRejectedValueOnce({ code: "sonic:not-analysed", detail: "sonic:not-analysed" });
     await sonic.radio("new");
     expect(told()).toEqual({ toast: ["sonic_not_analysed"], banner: null });
   });
 
   it("shows any other failure as an error", async () => {
-    invokeMock.mockRejectedValueOnce("none of these tracks are on the server");
+    invokeMock.mockRejectedValueOnce({ code: "other", detail: "none of these tracks are on the server" });
     await sonic.radio("gone");
-    expect(told()).toEqual({ toast: [], banner: "none of these tracks are on the server" });
+    // In the words of `appErrors.ts` (messages are their keys here).
+    expect(told()).toEqual({ toast: [], banner: "error_generic" });
   });
 });

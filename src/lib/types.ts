@@ -1,5 +1,7 @@
 // Mirrors of the Rust DTOs (src-tauri/src/api/types.rs, player.rs, commands.rs).
 
+import type { AppErrorReport } from "#lib/appErrors.js";
+
 export interface SessionInfo {
   serverUrl: string;
   username: string;
@@ -52,7 +54,7 @@ export interface BulkMetadataResult {
   /** Never tried: the run stopped once the server could not be reached. */
   skipped: number;
   /** The first failure; the others are only counted. */
-  error: string | null;
+  error: AppErrorReport | null;
 }
 
 export interface ArtistDto {
@@ -275,7 +277,8 @@ export interface AudioDeviceSnapshot {
   /** Requested output (its stored id) currently routed through the system
    *  default. */
   fallbackDevice: string | null;
-  /** The device the output actually plays through right now. */
+  /** The device the output actually plays through right now — also while
+   *  it is closed after a long pause: it opens there again. */
   activeDevice: OutputDevice | null;
 }
 
@@ -290,6 +293,31 @@ export interface AudioProfilesInfo {
 export interface AudioOutputFallbackEvent {
   /** Name of the configured device. */
   requestedDevice: string;
+}
+
+/** `player:error` (Rust `player/errors.rs`): a playback failure, worded by
+ *  `lib/playerErrors.ts`. */
+export interface PlayerErrorEvent {
+  code: "cannotPlay" | "outputUnavailable" | "outputFailed" | "noFallbackOutput";
+  /** Title of the track that did not play. */
+  track: string | null;
+  /** Name of the output device; null for the system default. */
+  device: string | null;
+  cause: PlayerErrorCause | null;
+}
+
+export interface PlayerErrorCause {
+  kind: "notConnected" | "network" | "server" | "noOutputDevice" | "outputDeviceMissing" | "other";
+  /** The code a command error would carry (`lib/appErrors.ts`); what the
+   *  banner words the cause by. */
+  code?: string;
+  /** HTTP status, for `server`. */
+  status?: number;
+  /** The value the code's sentence names, if any. */
+  arg?: string;
+  /** The error as the log has it (English); shown where the UI has no
+   *  words of its own for the cause. */
+  detail: string;
 }
 
 export interface ExtrasSettings {
@@ -370,11 +398,16 @@ export type QueuePosition = Pick<
 
 export type CloseBehavior = "quit" | "tray";
 
+/** Which releases an update check considers (src-tauri/src/updater.rs):
+ *  beta takes the newer of the stable release and the latest beta. */
+export type UpdateChannel = "stable" | "beta";
+
 export interface DesktopSettings {
   closeBehavior: CloseBehavior;
   startMinimized: boolean;
   coverCacheLimitMb: number;
   autoCheckUpdates: boolean;
+  updateChannel: UpdateChannel;
 }
 
 /** What `check_for_update` answers (src-tauri/src/updater.rs). `version` is
@@ -420,6 +453,17 @@ export interface DownloadTask extends DownloadRequest {
   totalBytes: number | null;
   path: string | null;
   error: string | null;
+  /** The list's revision at this task's last change: of two copies of a
+   *  task, the one with the higher revision is the newer. */
+  revision: number;
+}
+
+/** The whole download list (`download:state`, `get_downloads`). Changes to
+ *  single tasks arrive as `download:changed`, carrying just those tasks. */
+export interface DownloadSnapshot {
+  /** Raised by every change: a list older than one applied is stale. */
+  revision: number;
+  tasks: DownloadTask[];
 }
 
 export type SearchKind = "artists" | "albums" | "tracks";
@@ -486,7 +530,7 @@ export interface PlaylistTransfer {
    *  null when unknown. */
   added: number | null;
   /** A move whose copy went through but whose removal from the source failed. */
-  removeError: string | null;
+  removeError: AppErrorReport | null;
 }
 
 /** What cleaning up a playlist's duplicates did (`remove_playlist_duplicates`). */

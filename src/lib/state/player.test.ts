@@ -217,6 +217,46 @@ describe("play/pause", () => {
   });
 });
 
+describe("the error banner", () => {
+  const emitError = (payload: unknown) => handlers.get("player:error")?.({ payload });
+  const grain = track("grain", { name: "Grain" });
+  const cannotPlayGrain = { code: "cannotPlay", track: "Grain", device: null, cause: { kind: "network" } };
+
+  it("goes when the track it is about plays again", () => {
+    emitState(state({ status: "paused", current: grain }));
+    emitError(cannotPlayGrain);
+    expect(player.error).not.toBeNull();
+    emitState(state({ status: "loading", current: grain }));
+    expect(player.error).not.toBeNull();
+    emitState(state({ status: "playing", current: grain }));
+    expect(player.error).toBeNull();
+  });
+
+  it("stays when the queue moves on to another track", () => {
+    emitState(state({ status: "loading", current: grain }));
+    emitError(cannotPlayGrain);
+    emitState(state({ status: "playing", current: track("next", { name: "Next" }) }));
+    expect(player.error).not.toBeNull();
+    player.error = null;
+  });
+
+  it("stays for an error that is not about a track", () => {
+    emitState(state({ status: "paused", current: grain }));
+    emitError({ code: "outputFailed", track: null, device: "Speakers", cause: null });
+    emitState(state({ status: "playing", current: grain }));
+    expect(player.error).not.toBeNull();
+    player.error = null;
+  });
+
+  it("goes when a stream that broke off plays on", () => {
+    emitState(state({ status: "playing", current: grain }));
+    handlers.get("player:stream-broke-off")?.({ payload: { name: "Grain" } });
+    emitState(state({ status: "loading", current: grain }));
+    emitState(state({ status: "playing", current: grain }));
+    expect(player.error).toBeNull();
+  });
+});
+
 describe("favorites", () => {
   it("shows a heart set elsewhere on the playing track", async () => {
     emitState(state({ current: track("f1", { isFavorite: false }) }));

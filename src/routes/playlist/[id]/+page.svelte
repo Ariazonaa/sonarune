@@ -1,9 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { page } from "$app/state";
-  import { goto } from "$app/navigation";
-  import { formatDuration } from "#lib/api.js";
+  import { goto, snapshot } from "$app/navigation";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause, errorMessage, isNotFound, type AppErrorReport } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
@@ -11,18 +11,25 @@
   import ContextMenu, { type ContextMenuItem } from "#lib/components/ContextMenu.svelte";
   import SongInfo from "#lib/components/SongInfo.svelte";
   import MetadataEditor from "#lib/components/MetadataEditor.svelte";
-  import { contextMenuKey, menuPoint } from "#lib/menu.js";
-  import { activatesRow } from "#lib/rowKeys.js";
+  import PlaylistTrackList from "#lib/components/PlaylistTrackList.svelte";
+  import { menuPoint } from "#lib/menu.js";
   import { TRACK_ICON, trackMenuItems } from "#lib/trackMenu.js";
   import PlaylistDuplicatesDialog from "#lib/components/PlaylistDuplicatesDialog.svelte";
   import PlaylistTransferDialog from "#lib/components/PlaylistTransferDialog.svelte";
-  import { entryRowKeys, firstOccurrences, sharedEntryIds } from "#lib/playlistEntries.js";
+  import { moveItem } from "#lib/dragReorder.js";
+  import type { ListPosition } from "#lib/longList.js";
+  import {
+    entryRowKeys,
+    filterRows,
+    firstOccurrences,
+    searchTexts,
+    sharedEntryIds,
+  } from "#lib/playlistEntries.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
   import { library } from "#lib/state/library.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { playlists } from "#lib/state/playlists.svelte.js";
-  import { listFlip } from "#lib/motion.js";
   import { portal } from "#lib/portal.js";
   import { swrGet, swrSet, swrDelete } from "#lib/swr.js";
   import type { PlaylistDetail, PlaylistTrackDto } from "#lib/types.js";
@@ -72,7 +79,7 @@
     } catch (e) {
       // Another playlist is open by now: its page shows its own state.
       if (id !== page.params.id) return;
-      error = String(e);
+      error = errorCause(e);
       load(id);
     }
   }
@@ -89,7 +96,7 @@
       toast.show(m.playlist_deleted());
       if (id === page.params.id) goto("/playlists");
     } catch (e) {
-      if (id === page.params.id) error = String(e);
+      if (id === page.params.id) error = errorCause(e);
     }
   }
 
@@ -113,8 +120,8 @@
       })
       .catch((e) => {
         if (id !== page.params.id) return;
-        const msg = String(e);
-        if (msg.includes("returned 404")) {
+        const msg = errorCause(e);
+        if (isNotFound(e)) {
           swrDelete(`playlist:${id}`);
           detail = null;
           error = msg;
@@ -129,6 +136,7 @@
     detail = swrGet<PlaylistDetail>(`playlist:${id}`) ?? null;
     error = null;
     filterQuery = "";
+    restoreTo = null;
     duplicatePreview = false;
     duplicateOpen = false;
     transferOpen = false;
@@ -181,20 +189,11 @@
   // A move goes by entry id, so while one is shared the server could move
   // another row than the one dragged, or drop it next to the wrong copy.
   const reorderable = $derived(!filterActive && sharedIds.size === 0);
-  const visibleTracks = $derived.by(() => {
-    const query = filterQuery.trim().toLocaleLowerCase();
-    const indexed = (detail?.tracks ?? []).map((entry, originalIndex) => ({
-      entry,
-      originalIndex,
-      key: rowKeys[originalIndex],
-    }));
-    if (!query) return indexed;
-    return indexed.filter(({ entry }) =>
-      [entry.track.name, entry.track.artist, entry.track.album].some((value) =>
-        value.toLocaleLowerCase().includes(query),
-      ),
-    );
-  });
+  // Lowercased once per change of the playlist, not on every keystroke.
+  const haystacks = $derived(searchTexts(detail?.tracks ?? []));
+  const visibleTracks = $derived(
+    filterRows(detail?.tracks ?? [], rowKeys, haystacks, filterQuery),
+  );
   const duplicateEntryCount = $derived.by(() => {
     const seen = new Set<string>();
     let count = 0;
@@ -240,7 +239,7 @@
     applyEntryRemoval([entryId]);
     apiLibrary.playlistRemove(id, [entryId]).catch((e) => {
       if (id === page.params.id) {
-        error = String(e);
+        error = errorCause(e);
         load(id);
       }
     });
@@ -313,7 +312,7 @@
       if (id === page.params.id) {
         detail = previous;
         swrSet(`playlist:${id}`, previous);
-        duplicateError = m.error_generic({ message: String(e) });
+        duplicateError = errorMessage(e);
         load(id);
       }
     } finally {
@@ -340,7 +339,7 @@
       toast.show(m.playlist_duplicate_done({ name }));
       await goto("/playlist/" + newId);
     } catch (e) {
-      duplicatePlaylistError = String(e);
+      duplicatePlaylistError = errorCause(e);
     } finally {
       duplicatePlaylistBusy = false;
     }
@@ -352,7 +351,7 @@
     targetName: string;
     moved: boolean;
     added: number | null;
-    removeError: string | null;
+    removeError: AppErrorReport | null;
   }) {
     transferOpen = false;
     swrDelete(`playlist:${result.targetId}`);
@@ -363,7 +362,7 @@
       // an answer can be lost after the server acted. Show what it holds now.
       gen++;
       load(playlistId);
-      toast.show(m.playlist_transfer_move_partial({ name, message: result.removeError }), {
+      toast.show(m.playlist_transfer_move_partial({ name, message: errorCause(result.removeError) }), {
         kind: "error",
       });
       return;
@@ -404,42 +403,46 @@
     }
   }
 
-  // Native HTML5 drag & drop reorder (same pattern as the queue panel).
-  // `dropAt` is the slot the dragged row would land in (insert-before
-  // semantics; length = append at the end).
-  let dragFrom = $state<number | null>(null);
-  let dropAt = $state<number | null>(null);
-
-  function onDrop() {
-    if (detail && dragFrom !== null && dropAt !== null) {
-      // The server move is remove-then-insert: dropping below the origin
-      // shifts the target up by one.
-      const to = dropAt > dragFrom ? dropAt - 1 : dropAt;
-      if (to !== dragFrom) {
-        const id = playlistId;
-        const entry = detail.tracks[dragFrom];
-        const reordered = [...detail.tracks];
-        reordered.splice(to, 0, ...reordered.splice(dragFrom, 1));
-        gen++;
-        detail.tracks = reordered;
-        apiLibrary.playlistMove(id, entry.entryId, to).catch((e) => {
-          if (id === page.params.id) {
-            error = String(e);
-            load(id);
-          }
-        });
+  /** A row dragged elsewhere (PlaylistTrackList; same pattern as the queue
+   *  panel). The server move is remove-then-insert, like `moveItem`. */
+  function moveEntry(from: number, to: number) {
+    if (!detail) return;
+    const id = playlistId;
+    const entry = detail.tracks[from];
+    if (!entry) return;
+    gen++;
+    // The cache too: the way back restores a row by its position.
+    applyTracks(moveItem(detail.tracks, from, to));
+    apiLibrary.playlistMove(id, entry.entryId, to).catch((e) => {
+      if (id === page.params.id) {
+        error = errorCause(e);
+        load(id);
       }
-    }
-    dragFrom = null;
-    dropAt = null;
+    });
   }
 
-  function onDragOver(event: DragEvent, index: number) {
-    event.preventDefault();
-    const row = event.currentTarget as HTMLElement;
-    const rect = row.getBoundingClientRect();
-    dropAt = event.clientY < rect.top + rect.height / 2 ? index : index + 1;
-  }
+  // Back and Forward come back to where the list was, with the filter it had
+  // — in a long list too, which has to be told: it mounts only the rows in
+  // view, and has measured none of them when it opens again.
+  let trackList = $state<PlaylistTrackList | null>(null);
+  let restoreTo = $state<{ id: string; position: ListPosition } | null>(null);
+  snapshot<{ id: string; filter: string; position: ListPosition | null }>({
+    id: "playlist-page",
+    capture: () => ({ id: playlistId, filter: filterQuery, position: trackList?.position() ?? null }),
+    restore: (value) => {
+      if (value.id !== playlistId) return;
+      filterQuery = value.filter;
+      if (value.position) restoreTo = { id: value.id, position: value.position };
+    },
+  });
+
+  // The playlist may still be loading when the way back arrives here.
+  $effect(() => {
+    const target = restoreTo;
+    if (!target || !trackList || !detail) return;
+    restoreTo = null;
+    if (target.id === playlistId) trackList.restore(target.position);
+  });
 </script>
 
 <svelte:window onkeydown={onPageKeydown} />
@@ -601,108 +604,18 @@
           compact
         />
       {:else}
-        <table class="w-full border-collapse text-sm">
-          <tbody ondragleave={() => (dropAt = null)}>
-            {#each visibleTracks as visible (visible.key)}
-              {@const entry = visible.entry}
-              {@const originalIndex = visible.originalIndex}
-              <tr
-                animate:listFlip={{ rows: visibleTracks.length }}
-                class="group relative cursor-pointer outline-none transition-colors hover:bg-ink/10 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent
-                  {entry.track.id === currentTrackId ? 'text-accent' : ''}
-                  {dragFrom === originalIndex ? 'opacity-40' : ''}"
-                tabindex="0"
-                role="button"
-                aria-label={entry.track.name}
-                draggable={reorderable}
-                ondragstart={(event) => {
-                  if (!reorderable) return;
-                  dragFrom = originalIndex;
-                  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
-                }}
-                ondragover={(event) => {
-                  if (reorderable) onDragOver(event, originalIndex);
-                }}
-                ondrop={() => {
-                  if (reorderable) onDrop();
-                }}
-                ondragend={() => {
-                  dragFrom = null;
-                  dropAt = null;
-                }}
-                oncontextmenu={(event) => onRowContextMenu(event, entry, originalIndex)}
-                {@attach contextMenuKey}
-                onclick={() => player.run(apiLibrary.playPlaylist(playlistId, originalIndex))}
-                onkeydown={(event) => {
-                  if (activatesRow(event)) {
-                    event.preventDefault();
-                    player.run(apiLibrary.playPlaylist(playlistId, originalIndex));
-                  }
-                }}
-              >
-                <td class="w-10 rounded-l-md px-2 py-2 text-right text-ink-muted tabular-nums">
-                  {#if dropAt === originalIndex && dragFrom !== null}
-                    <div class="pointer-events-none absolute inset-x-1 top-0 h-0.5 rounded bg-accent"></div>
-                  {/if}
-                  {#if dropAt === originalIndex + 1 && dragFrom !== null}
-                    <div class="pointer-events-none absolute inset-x-1 bottom-0 h-0.5 rounded bg-accent"></div>
-                  {/if}
-                  {originalIndex + 1}
-                </td>
-                <td class="w-11 py-1.5 pl-1">
-                  <div class="w-9">
-                    <Cover
-                      itemId={entry.track.imageItemId}
-                      tag={entry.track.imageTag}
-                      size={96}
-                      alt=""
-                      blurhash={entry.track.imageBlurHash}
-                    />
-                  </div>
-                </td>
-                <td class="px-3 py-2">
-                  <p class="font-medium {entry.track.id === currentTrackId ? '' : 'text-ink'}">
-                    {entry.track.name}
-                  </p>
-                  <p class="text-xs text-ink-muted">
-                    {entry.track.artist}{entry.track.album ? ` · ${entry.track.album}` : ""}
-                  </p>
-                </td>
-                <td class="w-16 px-1 py-2">
-                  <span class="invisible flex justify-end gap-0.5 group-hover:visible">
-                    <button
-                      class="rounded p-1 text-ink-muted hover:text-ink"
-                      onclick={(event) => openAddTo(event, [entry.track.id])}
-                      aria-haspopup="menu"
-                      aria-label={m.add_to_playlist()}
-                      title={m.add_to_playlist()}
-                    >
-                      <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor" aria-hidden="true">
-                        <path d="M14 10H3v2h11v-2zm0-4H3v2h11V6zM3 16h7v-2H3v2zm15-4v3h-3v2h3v3h2v-3h3v-2h-3v-3h-2z" />
-                      </svg>
-                    </button>
-                    <button
-                      class="rounded p-1 text-ink-muted hover:text-ink"
-                      onclick={(event) => {
-                        event.stopPropagation();
-                        void removeEntry(entry.entryId);
-                      }}
-                      aria-label={m.playlist_remove_track()}
-                      title={m.playlist_remove_track()}
-                    >
-                      <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor" aria-hidden="true">
-                        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
-                      </svg>
-                    </button>
-                  </span>
-                </td>
-                <td class="w-16 rounded-r-md px-2 py-2 text-right text-ink-muted tabular-nums">
-                  {formatDuration(entry.track.durationMs)}
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
+        <PlaylistTrackList
+          bind:this={trackList}
+          rows={visibleTracks}
+          total={trackCount}
+          {currentTrackId}
+          {reorderable}
+          onplay={(index) => player.run(apiLibrary.playPlaylist(playlistId, index))}
+          onmenu={onRowContextMenu}
+          onaddto={openAddTo}
+          onremove={(entryId) => void removeEntry(entryId)}
+          onmove={moveEntry}
+        />
       {/if}
     </div>
   {:else if !error}

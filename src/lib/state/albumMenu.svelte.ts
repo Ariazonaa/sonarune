@@ -1,5 +1,6 @@
 import { api } from "#lib/api.js";
 import { apiLibrary } from "#lib/api/library.js";
+import { errorMessage } from "#lib/appErrors.js";
 import { player } from "#lib/state/player.svelte.js";
 import { albumMenuItems } from "#lib/albumMenu.js";
 import type { ContextMenuItem } from "#lib/components/ContextMenu.svelte";
@@ -38,7 +39,7 @@ export function createAlbumMenu(options: AlbumMenuOptions = {}) {
             const d = await api.getAlbum(album.id);
             addTo = { x, y, trackIds: d.tracks.map((t) => t.id) };
           } catch (err) {
-            player.error = String(err);
+            player.error = errorMessage(err);
           }
         },
         () => {

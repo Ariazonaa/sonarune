@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { AppErrorReport } from "#lib/appErrors.js";
 import type { AlbumDto, ArtistDto, GenreDto, Page, TrackDto } from "#lib/types.js";
 
 export interface DiscoverRow<T> {
   items: T[];
-  error: string | null;
+  error: AppErrorReport | null;
 }
 
 export interface SimilarArtistsRow extends DiscoverRow<ArtistDto> {

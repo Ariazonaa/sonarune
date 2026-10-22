@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Attachment } from "svelte/attachments";
   import { api } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { portal } from "#lib/portal.js";
   import { net } from "#lib/state/net.svelte.js";
@@ -46,7 +47,7 @@
       // Back on a trusted certificate: the banner goes, the view refetches.
       await net.retry();
     } catch (e) {
-      error = String(e);
+      error = errorCause(e);
       // The server may present yet another certificate by now.
       void net.check();
     } finally {

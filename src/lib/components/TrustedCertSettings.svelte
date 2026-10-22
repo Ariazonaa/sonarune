@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
@@ -15,7 +16,7 @@
     try {
       certs = await api.listTrustedCertificates();
     } catch (e) {
-      error = String(e);
+      error = errorCause(e);
     }
   }
 
@@ -61,7 +62,7 @@
         return;
       }
     } catch (e) {
-      error = String(e);
+      error = errorCause(e);
     } finally {
       busy = false;
     }

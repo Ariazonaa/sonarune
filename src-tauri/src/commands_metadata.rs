@@ -68,11 +68,11 @@ pub async fn update_items_metadata(
                 result.failed += 1;
                 if server_unreachable(&e) {
                     // The reason the run stopped is the one worth showing.
-                    result.error = Some(e.to_string());
+                    result.error = Some(e.report());
                     result.skipped = total - index - 1;
                     break;
                 }
-                result.error.get_or_insert_with(|| e.to_string());
+                result.error.get_or_insert_with(|| e.report());
             }
         }
     }

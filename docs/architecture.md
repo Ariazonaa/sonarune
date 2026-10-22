@@ -161,24 +161,31 @@ flowchart LR
 
 ## 4. The audio source chain
 
-Every playing track is a stack of iterator wrappers. Each `next()` sample flows
-from the decoder outward:
+Every playing track has its own decoder thread, which decodes about 1.5 s
+ahead into a lock-free ring. What the audio callback pulls is a stack of
+iterator wrappers on top of that ring; each `next()` sample flows from the ring
+outward:
 
 ```mermaid
 flowchart LR
-    DEC["EitherSource<br/>Symphonia (flac/mp3/vorbis/wav)<br/>or libopus (Ogg-Opus)"]
-    DSP["DspSource<br/>normalization → 10-band EQ → clamp"]
+    DEC["decoder thread<br/>Symphonia (flac/mp3/vorbis/wav)<br/>or libopus (Ogg-Opus)"]
+    RING["RingSource<br/>lock-free ring, ~1.5 s"]
+    DSP["DspSource<br/>normalization → 10-band EQ"]
     FADE["FadeSource<br/>gain ramp: crossfade +<br/>click-free pause/resume"]
     TAP["TapSource<br/>stereo fold → visualizer IPC"]
     SINK["rodio::Player"]
     CPAL["cpal output device"]
 
-    DEC --> DSP --> FADE --> TAP --> SINK --> CPAL
+    DEC --> RING --> DSP --> FADE --> TAP --> SINK --> CPAL
 
     classDef box fill:#3b2415,stroke:#7c4a1e,color:#fde3c8;
-    class DEC,DSP,FADE,TAP,SINK,CPAL box;
+    class DEC,RING,DSP,FADE,TAP,SINK,CPAL box;
 ```
 
+- **The ring** keeps the network and the decoder off the audio callback: while
+  a download stalls, that track plays silence and every other one plays on. A
+  seek is a request to the decoder thread, whether the file is downloaded yet
+  or not.
 - **DSP** is live-editable: it polls a revision counter every ~1024 samples, so
   EQ/normalization changes apply without reopening the stream.
 - **Fade** is sample-accurate and steered by a shared handle — it powers both
@@ -263,7 +270,9 @@ server can correlate — and later kill — transcode jobs.
 
 Every server command is wrapped in `with_retry`. A dead token triggers a silent
 re-login using the password stored in the OS credential manager, then the call
-is retried exactly once.
+is retried exactly once. Work that runs without a command — opening the next
+track, the library watch, the sonic scan, downloads — renews the same way, so
+playback from the tray survives a revoked session.
 
 ```mermaid
 sequenceDiagram

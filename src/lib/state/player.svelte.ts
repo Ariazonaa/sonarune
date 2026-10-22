@@ -1,14 +1,17 @@
 import { listen } from "@tauri-apps/api/event";
 import { api } from "#lib/api.js";
 import { apiLibrary } from "#lib/api/library.js";
+import { errorMessage } from "#lib/appErrors.js";
 import { net } from "#lib/state/net.svelte.js";
 import { session } from "#lib/state/session.svelte.js";
 import { toast } from "#lib/state/toast.svelte.js";
 import { m } from "#lib/paraglide/messages.js";
+import { playerErrorMessage } from "#lib/playerErrors.js";
 import { UnmuteVolume } from "#lib/unmuteVolume.js";
 import { stepVolume } from "#lib/volume.js";
 import type {
   AudioOutputFallbackEvent,
+  PlayerErrorEvent,
   PlayerState,
   QueuePosition,
   QueueSnapshot,
@@ -106,6 +109,10 @@ class PlayerStore {
   #initialized = false;
   /** When the last player:state event landed — basis for extrapolation. */
   #lastStateAt = performance.now();
+  /** The track `error` says did not play (or broke off); once it plays
+   *  again the message is out of date and goes. Null for errors about
+   *  something else — those stay until dismissed. */
+  #errorItemId: string | null = null;
   /** Last track whose waveform was asked for, so a tick does not ask again. */
   #waveformAsked: string | null = null;
   /** The level unmute returns to, learned from the reported volumes. */
@@ -132,12 +139,29 @@ class PlayerStore {
       .catch(() => {});
   }
 
+  /** The current track's item id when `name` is its title: the track an
+   *  error is about. The events name the track, they carry no id. */
+  #currentItemNamed(name: string | null): string | null {
+    const current = this.state.current;
+    return name !== null && current?.name === name ? current.itemId : null;
+  }
+
   async init() {
     if (this.#initialized) return;
     this.#initialized = true;
 
     await listen<PlayerState>("player:state", (event) => {
+      const wasPlaying = this.state.status === "playing";
       this.state = event.payload;
+      if (
+        !wasPlaying &&
+        event.payload.status === "playing" &&
+        this.#errorItemId !== null &&
+        event.payload.current?.itemId === this.#errorItemId
+      ) {
+        this.error = null;
+        this.#errorItemId = null;
+      }
       this.#lastStateAt = performance.now();
       this.#unmute.observe(event.payload.volume, this.#lastStateAt);
       this.#askWaveform(event.payload);
@@ -163,13 +187,15 @@ class PlayerStore {
       this.queue.playedCount = position.playedCount;
       this.queue.duplicateCount = position.duplicateCount;
     });
-    await listen<string>("player:error", (event) => {
-      this.error = event.payload;
+    await listen<PlayerErrorEvent>("player:error", (event) => {
+      this.error = playerErrorMessage(event.payload);
+      this.#errorItemId = this.#currentItemNamed(event.payload.code === "cannotPlay" ? event.payload.track : null);
       // A stream failure may be the server dropping — verify.
       void net.check();
     });
     await listen<{ name: string }>("player:stream-broke-off", (event) => {
       this.error = m.player_stream_broke_off({ name: event.payload.name });
+      this.#errorItemId = this.#currentItemNamed(event.payload.name);
       void net.check();
     });
     await listen<{ device: string }>("audio:profile-applied", (event) => {
@@ -261,7 +287,7 @@ class PlayerStore {
       // A successful action while the banner is up recovers it (real ping).
       .then(() => net.recheckIfOffline())
       .catch((e) => {
-        this.error = String(e);
+        this.error = errorMessage(e);
         // A failed action may mean the server dropped — verify quietly.
         void net.check();
       });
@@ -305,7 +331,7 @@ class PlayerStore {
     const cur = this.state.current;
     if (!cur) return;
     this.setFavorite(cur.itemId, !this.currentIsFavorite).catch((e) => {
-      this.error = String(e);
+      this.error = errorMessage(e);
     });
   };
 

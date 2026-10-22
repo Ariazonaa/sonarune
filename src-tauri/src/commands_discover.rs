@@ -3,7 +3,7 @@
 use crate::api::types::{AlbumDto, ArtistDto, GenreDto, Page, SmartFilter, TrackDto};
 use crate::api::validate_smart_filter;
 use crate::commands::{to_queue_tracks, with_retry};
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorReport};
 use crate::player::PlayTicket;
 use crate::AppState;
 use serde::Serialize;
@@ -14,7 +14,7 @@ use tauri::State;
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverRow<T> {
     pub items: Vec<T>,
-    pub error: Option<String>,
+    pub error: Option<ErrorReport>,
 }
 
 impl<T> DiscoverRow<T> {
@@ -23,7 +23,7 @@ impl<T> DiscoverRow<T> {
             Ok(items) => Self { items, error: None },
             Err(error) => Self {
                 items: Vec::new(),
-                error: Some(error.to_string()),
+                error: Some(error.report()),
             },
         }
     }
@@ -60,7 +60,7 @@ fn decades_from_years(years: impl IntoIterator<Item = i32>) -> Vec<DecadeDto> {
 pub struct SimilarArtistsRow {
     pub seed: Option<ArtistDto>,
     pub items: Vec<ArtistDto>,
-    pub error: Option<String>,
+    pub error: Option<ErrorReport>,
 }
 
 impl SimilarArtistsRow {
@@ -74,7 +74,7 @@ impl SimilarArtistsRow {
             Err(error) => Self {
                 seed: None,
                 items: Vec::new(),
-                error: Some(error.to_string()),
+                error: Some(error.report()),
             },
         }
     }

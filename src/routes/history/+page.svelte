@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { api, formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause, errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
   import Cover from "#lib/components/Cover.svelte";
@@ -43,7 +44,7 @@
       exhausted = page.length < PAGE_SIZE;
       if (reset) years = await apiLibrary.historyYears();
     } catch (e) {
-      if (seq === generation) error = String(e);
+      if (seq === generation) error = errorCause(e);
     } finally {
       if (seq === generation) {
         loading = false;
@@ -111,7 +112,7 @@
       entries = entries.filter((entry) => !gone.has(entry.id));
       years = await apiLibrary.historyYears();
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -128,7 +129,7 @@
       toast.show(m.history_cleared());
       void load(true);
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 

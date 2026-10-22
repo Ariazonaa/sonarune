@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { apiDiscovery, type CollectionDetail } from "#lib/api/discovery.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import LibraryAlbumCard from "#lib/components/LibraryAlbumCard.svelte";
@@ -28,7 +29,7 @@
         swrSet(key, result);
       })
       .catch((cause) => {
-        if (seq === generation && id === page.params.id && !detail) error = String(cause);
+        if (seq === generation && id === page.params.id && !detail) error = errorCause(cause);
       });
   }
 

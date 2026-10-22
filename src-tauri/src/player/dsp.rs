@@ -102,14 +102,18 @@ impl AudioDsp {
     }
 }
 
-/// Audio EQ Cookbook peaking EQ, normalized by a0.
+/// Audio EQ Cookbook peaking EQ, normalized by a0. In double precision,
+/// coefficients and state: the low bands' poles sit close to the unit circle
+/// (a hundred-thousandth off at 31 Hz and 192 kHz, a rate the tracks reach
+/// the EQ at on some devices), where single precision misses the response by
+/// a few percent and adds its rounding at -40 dB.
 #[derive(Debug, Clone, Copy)]
 struct BiquadCoeffs {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
 }
 
 impl BiquadCoeffs {
@@ -120,11 +124,11 @@ impl BiquadCoeffs {
         let cos_w0 = w0.cos();
         let a0 = 1.0 + alpha / a;
         Self {
-            b0: ((1.0 + alpha * a) / a0) as f32,
-            b1: (-2.0 * cos_w0 / a0) as f32,
-            b2: ((1.0 - alpha * a) / a0) as f32,
-            a1: (-2.0 * cos_w0 / a0) as f32,
-            a2: ((1.0 - alpha / a) / a0) as f32,
+            b0: (1.0 + alpha * a) / a0,
+            b1: -2.0 * cos_w0 / a0,
+            b2: (1.0 - alpha * a) / a0,
+            a1: -2.0 * cos_w0 / a0,
+            a2: (1.0 - alpha / a) / a0,
         }
     }
 
@@ -134,7 +138,8 @@ impl BiquadCoeffs {
         // After silence the state decays into subnormal floats, which x86
         // computes in a slow path — per band, per sample, on the audio
         // callback. -400 dB is inaudible; snap it to zero.
-        const FLOOR: f32 = 1e-20;
+        const FLOOR: f64 = 1e-20;
+        let x = f64::from(x);
         let y = self.b0 * x + state.z1;
         state.z1 = self.b1 * x - self.a1 * y + state.z2;
         state.z2 = self.b2 * x - self.a2 * y;
@@ -144,14 +149,14 @@ impl BiquadCoeffs {
         if state.z2.abs() < FLOOR {
             state.z2 = 0.0;
         }
-        y
+        y as f32
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct BiquadState {
-    z1: f32,
-    z2: f32,
+    z1: f64,
+    z2: f64,
 }
 
 /// A value that moves to its target in equal steps, one per frame.
@@ -493,6 +498,8 @@ mod tests {
             .collect()
     }
 
+    const PI64: f64 = std::f64::consts::PI;
+
     fn rms(samples: &[f32]) -> f32 {
         (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
     }
@@ -787,6 +794,96 @@ mod tests {
         let out: Vec<f32> = wrap(buffer(1, sample_rate, input), dsp(params), None).collect();
         assert!(out.iter().all(|s| s.is_finite()));
         assert!(rms(&out[4000..]) > 0.0);
+    }
+
+    /// The tracks reach the EQ at the output's rate (resampled on their
+    /// decoder threads), 192 kHz on some devices: its lowest band is to sound
+    /// there as at 48 kHz, where a filter pole sits a hundred-thousandth from
+    /// the unit circle.
+    #[test]
+    fn the_lowest_band_sounds_the_same_at_any_rate() {
+        let gain_at = |sample_rate: u32, hz: f64| {
+            let mut eq_gains_db = [0.0; BAND_COUNT];
+            eq_gains_db[0] = 12.0;
+            let params = DspParams {
+                eq_enabled: true,
+                normalization_enabled: false,
+                eq_gains_db,
+                ..DspParams::default()
+            };
+            let len = sample_rate as usize * 3;
+            let input: Vec<f32> = (0..len)
+                .map(|i| {
+                    (0.05 * (2.0 * PI64 * hz * i as f64 / f64::from(sample_rate)).sin()) as f32
+                })
+                .collect();
+            let out: Vec<f32> =
+                wrap(buffer(1, sample_rate, input.clone()), dsp(params), None).collect();
+            let settled = sample_rate as usize..len;
+            20.0 * (rms(&out[settled.clone()]) / rms(&input[settled])).log10()
+        };
+        for hz in [31.0, 62.0, 125.0] {
+            let reference = gain_at(48_000, hz);
+            for sample_rate in [44_100, 96_000, 192_000] {
+                let gain = gain_at(sample_rate, hz);
+                assert!(
+                    (gain - reference).abs() < 0.05,
+                    "{hz} Hz at {sample_rate} Hz: {gain} dB, at 48 kHz {reference} dB"
+                );
+            }
+        }
+        assert!((gain_at(48_000, 31.0) - 12.0).abs() < 0.1);
+    }
+
+    /// Against the cookbook filter in double precision, run apart from the
+    /// stage: what the stage puts out at 192 kHz is that, to the rounding of
+    /// its output. (Single-precision state and coefficients missed it at
+    /// -40 dB there, -70 dB at 48 kHz.)
+    #[test]
+    fn the_eq_rounds_no_audible_error_into_a_low_band_at_a_high_rate() {
+        let sample_rate = 192_000u32;
+        let mut eq_gains_db = [0.0; BAND_COUNT];
+        eq_gains_db[0] = 12.0;
+        let params = DspParams {
+            eq_enabled: true,
+            normalization_enabled: false,
+            eq_gains_db,
+            ..DspParams::default()
+        };
+        let len = sample_rate as usize * 2;
+        let input: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f64 / f64::from(sample_rate);
+                (0.3 * (2.0 * PI64 * 997.0 * t).sin() + 0.3 * (2.0 * PI64 * 40.0 * t).sin()) as f32
+            })
+            .collect();
+        let out: Vec<f32> =
+            wrap(buffer(1, sample_rate, input.clone()), dsp(params), None).collect();
+        let a = 10f64.powf(12.0 / 40.0);
+        let w0 = 2.0 * PI64 * 31.0 / f64::from(sample_rate);
+        let alpha = w0.sin() / (2.0 * f64::from(EQ_BAND_Q));
+        let a0 = 1.0 + alpha / a;
+        let (b0, b1, b2) = (1.0 + alpha * a, -2.0 * w0.cos(), 1.0 - alpha * a);
+        let (a1, a2) = (-2.0 * w0.cos(), 1.0 - alpha / a);
+        // Direct form I, from the last two inputs and outputs.
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0, 0.0, 0.0);
+        let reference: Vec<f64> = input
+            .iter()
+            .map(|x| {
+                let x = f64::from(*x);
+                let y = (b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2) / a0;
+                (x2, x1, y2, y1) = (x1, x, y1, y);
+                y
+            })
+            .collect();
+        // After the first second: the settings' glide and the filter's
+        // settling are long over.
+        let settled = sample_rate as usize..len;
+        let power = |f: &dyn Fn(usize) -> f64| settled.clone().map(|i| f(i).powi(2)).sum::<f64>();
+        let signal = power(&|i| reference[i]);
+        let error = power(&|i| f64::from(out[i]) - reference[i]);
+        let below = 10.0 * (signal / error).log10();
+        assert!(below > 120.0, "an error {below} dB below the signal");
     }
 
     #[test]

@@ -2,6 +2,7 @@
   import { goto } from "$app/navigation";
   import { api } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "./Cover.svelte";
   import { playInAlbum } from "#lib/playInAlbum.js";
@@ -83,7 +84,7 @@
       playlists.refresh();
       toast.show(m.playlist_created());
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 

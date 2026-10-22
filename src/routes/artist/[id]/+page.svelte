@@ -2,6 +2,7 @@
   import { untrack } from "svelte";
   import { page } from "$app/state";
   import { api, formatDuration } from "#lib/api.js";
+  import { errorCause, isNotFound } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import CoverBackdrop from "#lib/components/CoverBackdrop.svelte";
@@ -44,8 +45,8 @@
       })
       .catch((e) => {
         if (id !== page.params.id) return;
-        const msg = String(e);
-        if (msg.includes("returned 404")) {
+        const msg = errorCause(e);
+        if (isNotFound(e)) {
           swrDelete(key);
           detail = null;
           error = msg;

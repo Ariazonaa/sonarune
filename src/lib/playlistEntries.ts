@@ -38,3 +38,41 @@ export function firstOccurrences(entries: readonly PlaylistTrackDto[]): Playlist
     return true;
   });
 }
+
+/** A row of the playlist page and its transfer dialog: the entry, where it
+ *  stands in the playlist, and its row key (`entryRowKeys`). */
+export interface PlaylistRow {
+  entry: PlaylistTrackDto;
+  originalIndex: number;
+  key: string;
+}
+
+/**
+ * The rows that match a filter, in playlist order — all of them for an empty
+ * one. Title, artist and album count, case-insensitively; `haystacks` holds
+ * each entry's text lowercased already, so a keystroke in a list of
+ * thousands only compares.
+ */
+export function filterRows(
+  entries: readonly PlaylistTrackDto[],
+  keys: readonly string[],
+  haystacks: readonly string[],
+  query: string,
+): PlaylistRow[] {
+  const needle = query.trim().toLocaleLowerCase();
+  const rows: PlaylistRow[] = [];
+  entries.forEach((entry, originalIndex) => {
+    if (!needle || haystacks[originalIndex].includes(needle)) {
+      rows.push({ entry, originalIndex, key: keys[originalIndex] });
+    }
+  });
+  return rows;
+}
+
+/** What `filterRows` searches in: title, artist and album, lowercased. A
+ *  line break separates them, so a needle cannot match across two. */
+export function searchTexts(entries: readonly PlaylistTrackDto[]): string[] {
+  return entries.map(({ track }) =>
+    [track.name, track.artist, track.album].join("\n").toLocaleLowerCase(),
+  );
+}

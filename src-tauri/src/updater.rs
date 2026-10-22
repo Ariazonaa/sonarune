@@ -25,7 +25,27 @@
 //!   the portable exe the user keeps launching, and the update would look
 //!   like it silently did nothing.
 //!
-//! Update channels (stable/beta) are not a thing yet; there is one endpoint.
+//! ## Channels
+//!
+//! **Stable**, the default, asks `releases/latest/download/latest.json`.
+//! GitHub never counts a release marked as a pre-release as the latest one,
+//! so a beta does not reach anyone through it — and should one be published
+//! without that mark by mistake, the stable check still turns it down: on this
+//! endpoint a version with a pre-release part (`0.7.0-beta.1`) is never newer.
+//!
+//! **Beta** is opt-in (Settings → Updates). It asks the stable endpoint and the
+//! beta endpoint, `plugins.sonarune.betaEndpoint` in `tauri.conf.json`, and
+//! takes the newer answer. The beta endpoint is `beta.json` on the fixed
+//! release `beta-channel`, a pointer that `.github/workflows/beta-channel.yml`
+//! moves to every pre-release once it is published. Taking the newer of both
+//! means a beta tester gets the stable release that follows a beta (0.7.0 is
+//! newer than 0.7.0-beta.2), and a beta pointer that is missing or stale
+//! holds nobody back from stable. One request more per check, and no GitHub
+//! API: that one allows 60 requests an hour per address, shared by everyone
+//! behind the same router.
+//!
+//! Leaving the beta installs nothing older — downgrades stay off — so the
+//! installed beta stays until a stable release is newer than it.
 //!
 //! One thing to know when testing this right after cutting a release: the
 //! endpoint is `releases/latest/download/latest.json`, and GitHub serves that
@@ -44,6 +64,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, Updater, UpdaterExt};
 use tauri_plugin_window_state::AppHandleExt;
 
+use crate::desktop::UpdateChannel;
 use crate::error::{AppError, AppResult};
 use crate::player::PlaybackStatus;
 use crate::AppState;
@@ -110,6 +131,9 @@ impl From<UpdateError> for AppError {
 enum Phase {
     /// Asking the endpoint what the current release is.
     Check,
+    /// The same at the beta endpoint. Only the log line differs: a beta
+    /// endpoint that fails costs nothing while the stable one answers.
+    BetaCheck,
     /// Fetching the installer and checking its signature.
     Download,
     /// Writing the installer out and starting it.
@@ -120,6 +144,7 @@ impl Phase {
     fn name(self) -> &'static str {
         match self {
             Phase::Check => "update check",
+            Phase::BetaCheck => "beta channel check",
             Phase::Download => "update download",
             Phase::Install => "update install",
         }
@@ -149,7 +174,7 @@ fn code_for(phase: Phase, error: &tauri_plugin_updater::Error) -> UpdateError {
         | E::SignedVersionMismatch { .. }
         | E::MissingSignedVersion => UpdateError::Signature,
         _ => match phase {
-            Phase::Check => match error {
+            Phase::Check | Phase::BetaCheck => match error {
                 // `latest.json` arrived but is not JSON.
                 E::Reqwest(e) if e.is_decode() => UpdateError::NoRelease,
                 E::Reqwest(_) | E::Network(_) => UpdateError::Offline,
@@ -236,14 +261,72 @@ struct ProgressEvent {
     total: Option<u64>,
 }
 
-/// An updater whose exit hook hands the app over to the installer (see
-/// [`hand_over`]).
-fn updater(app: &AppHandle) -> Result<Updater, UpdateError> {
+/// Where a check asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The endpoint of `plugins.updater`: the latest stable release.
+    Stable,
+    /// `plugins.sonarune.betaEndpoint`: the latest published pre-release.
+    Beta,
+}
+
+impl Source {
+    fn phase(self) -> Phase {
+        match self {
+            Source::Stable => Phase::Check,
+            Source::Beta => Phase::BetaCheck,
+        }
+    }
+}
+
+/// The channel chosen in Settings.
+fn channel(app: &AppHandle) -> UpdateChannel {
+    app.try_state::<AppState>()
+        .map(|state| crate::desktop::load(&state.store).update_channel)
+        .unwrap_or_default()
+}
+
+/// `plugins.sonarune.betaEndpoint`. Configured rather than built in, so a test
+/// build can point it at a local server, as it can the stable endpoint.
+fn beta_endpoint(config: &tauri::Config) -> Option<tauri::Url> {
+    let endpoint = config
+        .plugins
+        .0
+        .get("sonarune")?
+        .get("betaEndpoint")?
+        .as_str()?;
+    tauri::Url::parse(endpoint).ok()
+}
+
+/// Whether the stable endpoint's answer counts as an update: the plugin's own
+/// rule, newer than the running version, and no pre-release (see the module
+/// docs).
+fn stable_offer(current: &semver::Version, remote: &semver::Version) -> bool {
+    remote > current && remote.pre.is_empty()
+}
+
+/// An updater for `source` whose exit hook hands the app over to the
+/// installer (see [`hand_over`]).
+fn updater(app: &AppHandle, source: Source) -> Result<Updater, UpdateError> {
     let handle = app.clone();
-    app.updater_builder()
-        .on_before_exit(move || hand_over(&handle))
-        .build()
-        .map_err(|e| classify(Phase::Check, e))
+    let builder = app
+        .updater_builder()
+        .on_before_exit(move || hand_over(&handle));
+    let builder = match source {
+        Source::Stable => {
+            builder.version_comparator(|current, remote| stable_offer(&current, &remote.version))
+        }
+        Source::Beta => {
+            let Some(endpoint) = beta_endpoint(app.config()) else {
+                tracing::warn!("the beta channel has no endpoint configured");
+                return Err(UpdateError::Unavailable);
+            };
+            builder
+                .endpoints(vec![endpoint])
+                .map_err(|e| classify(Phase::BetaCheck, e))?
+        }
+    };
+    builder.build().map_err(|e| classify(source.phase(), e))
 }
 
 /// Whether this process is being handed over to the installer: set by
@@ -369,11 +452,47 @@ fn recover_from_failed_launch(app: &AppHandle) {
     }
 }
 
-async fn check(app: &AppHandle) -> Result<Option<Update>, UpdateError> {
-    updater(app)?
+async fn check_at(app: &AppHandle, source: Source) -> Result<Option<Update>, UpdateError> {
+    updater(app, source)?
         .check()
         .await
-        .map_err(|e| classify(Phase::Check, e))
+        .map_err(|e| classify(source.phase(), e))
+}
+
+/// What `channel` offers: the stable endpoint's answer, or on beta the newer
+/// answer of both endpoints (see the module docs).
+async fn check(app: &AppHandle, channel: UpdateChannel) -> Result<Option<Update>, UpdateError> {
+    match channel {
+        UpdateChannel::Stable => check_at(app, Source::Stable).await,
+        UpdateChannel::Beta => {
+            let (stable, beta) =
+                tokio::join!(check_at(app, Source::Stable), check_at(app, Source::Beta));
+            newer_of(stable, beta, |update| {
+                semver::Version::parse(&update.version).ok()
+            })
+        }
+    }
+}
+
+/// The newer of two answers. One endpoint failing does not fail the check
+/// while the other one answered — `classify` logged the failure — and when
+/// both fail, the stable endpoint's failure is the one reported.
+fn newer_of<T>(
+    stable: Result<Option<T>, UpdateError>,
+    beta: Result<Option<T>, UpdateError>,
+    version: impl Fn(&T) -> Option<semver::Version>,
+) -> Result<Option<T>, UpdateError> {
+    match (stable, beta) {
+        (Ok(Some(stable)), Ok(Some(beta))) => Ok(Some(if version(&beta) > version(&stable) {
+            beta
+        } else {
+            stable
+        })),
+        (Ok(stable), Ok(beta)) => Ok(stable.or(beta)),
+        (Ok(stable), Err(_)) => Ok(stable),
+        (Err(_), Ok(beta)) => Ok(beta),
+        (Err(stable), Err(_)) => Err(stable),
+    }
 }
 
 /// Whether this copy was installed rather than unpacked from the portable zip.
@@ -439,24 +558,39 @@ fn refuse_while_playing(app: &AppHandle) -> Result<(), UpdateError> {
 /// 20 s after start — with the window hidden or minimized it goes out to a
 /// suspended WebView — so the UI reads this back when it comes up or back
 /// (`get_known_update`).
-static LAST_ANSWER: std::sync::Mutex<Option<UpdateInfo>> = std::sync::Mutex::new(None);
+///
+/// Kept with the channel it was given for: after a switch in Settings, the
+/// other channel's answer is no answer at all.
+static LAST_ANSWER: std::sync::Mutex<Option<(UpdateChannel, UpdateInfo)>> =
+    std::sync::Mutex::new(None);
 
-fn remember(info: &UpdateInfo) {
-    *LAST_ANSWER.lock().unwrap() = Some(info.clone());
+fn remember(channel: UpdateChannel, info: &UpdateInfo) {
+    *LAST_ANSWER.lock().unwrap() = Some((channel, info.clone()));
+}
+
+fn known(channel: UpdateChannel) -> Option<UpdateInfo> {
+    LAST_ANSWER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(given, _)| *given == channel)
+        .map(|(_, info)| info.clone())
 }
 
 /// The last answer, without asking the endpoint again. `None` until a check
-/// found something to announce or ran from Settings.
+/// found something to announce or ran from Settings, and again after the
+/// channel was switched.
 #[tauri::command]
-pub fn get_known_update() -> Option<UpdateInfo> {
-    LAST_ANSWER.lock().unwrap().clone()
+pub fn get_known_update(app: AppHandle) -> Option<UpdateInfo> {
+    known(channel(&app))
 }
 
 /// Ask the endpoint what the current version is. Errors are the network's, not
 /// the app's: the caller shows them, nothing else changes.
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> AppResult<UpdateInfo> {
-    let update = check(&app).await?;
+    let channel = channel(&app);
+    let update = check(&app, channel).await?;
     // Logged like the background check, so the diagnostic export can answer
     // "what did the server actually say" — the panel only ever shows the
     // answer, never which version it was compared against.
@@ -464,12 +598,13 @@ pub async fn check_for_update(app: AppHandle) -> AppResult<UpdateInfo> {
         Some(update) => tracing::info!(
             version = %update.version,
             current = %update.current_version,
+            ?channel,
             "update available"
         ),
-        None => tracing::info!("checked for updates: nothing newer"),
+        None => tracing::info!(?channel, "checked for updates: nothing newer"),
     }
     let answer = info(&app, update.as_ref());
-    remember(&answer);
+    remember(channel, &answer);
     Ok(answer)
 }
 
@@ -486,7 +621,9 @@ pub async fn install_update(app: AppHandle) -> AppResult<()> {
     }
     refuse_while_playing(&app)?;
 
-    let update = check(&app).await?.ok_or(UpdateError::NothingNewer)?;
+    let update = check(&app, channel(&app))
+        .await?
+        .ok_or(UpdateError::NothingNewer)?;
 
     let mut downloaded: u64 = 0;
     let progress_to = app.clone();
@@ -523,11 +660,17 @@ pub fn check_in_background(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(STARTUP_DELAY).await;
-        match check(&app).await {
+        let channel = channel(&app);
+        match check(&app, channel).await {
+            // Switched in Settings while this asked: the answer is the other
+            // channel's, and the UI has already let go of that one.
+            Ok(Some(_)) if self::channel(&app) != channel => {
+                tracing::debug!("the update channel changed during the background check")
+            }
             Ok(Some(update)) => {
-                tracing::info!(version = %update.version, "update available");
+                tracing::info!(version = %update.version, ?channel, "update available");
                 let answer = info(&app, Some(&update));
-                remember(&answer);
+                remember(channel, &answer);
                 let _ = app.emit("updater:available", answer);
             }
             Ok(None) => tracing::debug!("no update available"),
@@ -544,7 +687,11 @@ mod tests {
     //! at all, and a missing field shows up only in a shipped build — where a
     //! wrong answer means either no updates or, worse, unchecked ones.
 
-    use super::{code_for, describe, http_status, run_bounded, HandOverFlag, Phase, UpdateError};
+    use super::{
+        beta_endpoint, code_for, describe, http_status, newer_of, run_bounded, stable_offer,
+        HandOverFlag, Phase, UpdateError,
+    };
+    use crate::desktop::UpdateChannel;
     use std::time::{Duration, Instant};
     use tauri_plugin_updater::Error as E;
 
@@ -615,10 +762,78 @@ mod tests {
             date: None,
             installable: true,
         };
-        super::remember(&answer);
-        let known = super::get_known_update().expect("remembered");
+        super::remember(UpdateChannel::Stable, &answer);
+        let known = super::known(UpdateChannel::Stable).expect("remembered");
         assert_eq!(known.version.as_deref(), Some("0.6.2"));
         assert_eq!(known.current_version, "0.6.1");
+        // Switched to beta since: that answer was given for stable.
+        assert!(super::known(UpdateChannel::Beta).is_none());
+    }
+
+    fn v(text: &str) -> semver::Version {
+        semver::Version::parse(text).unwrap()
+    }
+
+    #[test]
+    fn the_stable_endpoint_never_offers_a_pre_release() {
+        assert!(stable_offer(&v("0.6.1"), &v("0.6.2")));
+        assert!(!stable_offer(&v("0.6.1"), &v("0.7.0-beta.1")));
+        assert!(!stable_offer(&v("0.6.2"), &v("0.6.1")));
+        // Off the beta, the stable release of that version is the way back.
+        assert!(stable_offer(&v("0.7.0-beta.2"), &v("0.7.0")));
+        assert!(!stable_offer(&v("0.7.0-beta.2"), &v("0.6.2")));
+    }
+
+    #[test]
+    fn the_beta_channel_takes_the_newer_answer() {
+        let version = |text: &&str| semver::Version::parse(text).ok();
+        let pick = |stable, beta| newer_of(stable, beta, version).ok().flatten();
+        assert_eq!(
+            pick(Ok(Some("0.6.2")), Ok(Some("0.7.0-beta.1"))),
+            Some("0.7.0-beta.1")
+        );
+        // The stable release after the beta wins over a pointer still on it.
+        assert_eq!(
+            pick(Ok(Some("0.7.0")), Ok(Some("0.7.0-beta.2"))),
+            Some("0.7.0")
+        );
+        assert_eq!(
+            pick(Ok(None), Ok(Some("0.7.0-beta.1"))),
+            Some("0.7.0-beta.1")
+        );
+        assert_eq!(pick(Ok(Some("0.6.2")), Ok(None)), Some("0.6.2"));
+        assert_eq!(pick(Ok(None), Ok(None)), None);
+        // No beta pointer yet, or a failing one: the stable answer stands.
+        assert_eq!(
+            pick(Ok(Some("0.6.2")), Err(UpdateError::NoRelease)),
+            Some("0.6.2")
+        );
+        assert_eq!(
+            pick(Err(UpdateError::Offline), Ok(Some("0.7.0-beta.1"))),
+            Some("0.7.0-beta.1")
+        );
+        let both = newer_of::<&str>(
+            Err(UpdateError::Offline),
+            Err(UpdateError::NoRelease),
+            version,
+        );
+        assert!(matches!(both, Err(UpdateError::Offline)));
+    }
+
+    #[test]
+    fn the_beta_endpoint_sits_beside_the_stable_one() {
+        let config: tauri::Config =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let beta = beta_endpoint(&config).expect("plugins.sonarune.betaEndpoint");
+        let stable = tauri::Url::parse(updater_config()["endpoints"][0].as_str().unwrap()).unwrap();
+        assert_eq!(beta.scheme(), "https");
+        assert_eq!(beta.host_str(), stable.host_str());
+        // The same repository's releases, at the fixed tag the workflow moves.
+        let repo = stable.path().split("/releases/").next().unwrap();
+        assert_eq!(
+            beta.path(),
+            format!("{repo}/releases/download/beta-channel/beta.json")
+        );
     }
 
     /// `latest.json` is not signed, only the installer is. Without this a

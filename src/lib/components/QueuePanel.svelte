@@ -4,6 +4,7 @@
   import { goto } from "$app/navigation";
   import { api, formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorMessage } from "#lib/appErrors.js";
   import { autoDjReasonLabel } from "#lib/autoDjReason.js";
   import { m } from "#lib/paraglide/messages.js";
   import { player } from "#lib/state/player.svelte.js";
@@ -168,7 +169,7 @@
       playlists.refresh();
       toast.show(m.playlist_created());
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -328,7 +329,7 @@
             downloads
               .enqueue([{ itemId: track.itemId, name: track.name }])
               .then(() => toast.show(m.download_queued_one(), { kind: "info" }))
-              .catch((e) => (player.error = String(e))),
+              .catch((e) => (player.error = errorMessage(e))),
         },
       ],
     };
@@ -359,6 +360,9 @@
   }
 
   function onDragOver(event: DragEvent, index: number) {
+    // Only a row of this queue: a link or file dragged in must not look
+    // droppable here.
+    if (dragFrom === null) return;
     event.preventDefault();
     // Measure the row itself, not the whole entry: the "up next" heading sits
     // in the same entry and would shift the midpoint.
@@ -464,6 +468,11 @@
       ondragstart={(e) => {
         dragFrom = i;
         if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+      }}
+      ondragenter={(e) => {
+        // Taken like `dragover`, or a drop while the list scrolls under the
+        // pointer is lost (see PlaylistTrackList.svelte).
+        if (dragFrom !== null) e.preventDefault();
       }}
       ondragover={(e) => onDragOver(e, i)}
       ondrop={onDrop}

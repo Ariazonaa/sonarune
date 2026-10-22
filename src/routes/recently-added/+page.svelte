@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { api } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { appendPage } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
@@ -45,7 +46,7 @@
       total = merged.total;
       return merged.grew;
     } catch (e) {
-      if (seq === requestSeq) error = String(e);
+      if (seq === requestSeq) error = errorCause(e);
       return false;
     } finally {
       if (seq === requestSeq) loading = false;

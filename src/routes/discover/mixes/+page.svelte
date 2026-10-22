@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { apiDiscovery } from "#lib/api/discovery.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import DiscoveryTrackCard from "#lib/components/DiscoveryTrackCard.svelte";
   import CardSkeleton from "#lib/components/CardSkeleton.svelte";
@@ -34,7 +35,7 @@
       }
       total = result.total;
     } catch (cause) {
-      if (seq === generation) error = String(cause);
+      if (seq === generation) error = errorCause(cause);
     } finally {
       if (seq === generation) loading = false;
     }

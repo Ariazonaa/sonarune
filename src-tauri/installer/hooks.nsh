@@ -80,3 +80,43 @@
     DeleteRegKey /ifempty HKCU "Software\jellysic"
   ${EndIf}
 !macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  ; "Delete app data" takes the two data folders, further down in the
+  ; template. The access token, the password and the ListenBrainz token are
+  ; kept in the Windows Credential Manager instead, so the app removes its own
+  ; entries there, and nothing else (src-tauri/src/credential_purge.rs). That
+  ; has to happen here, while the program is still in place.
+  ;
+  ; Never in an update. The box is read when the confirm page is left, which
+  ; /P and /S skip, and the in-app update (/P /UPDATE) installs over the old
+  ; copy without running its uninstaller at all; $UpdateMode is tested anyway,
+  ; as the template does before it deletes the data folders.
+  ${If} $DeleteAppDataCheckboxState = 1
+  ${AndIf} $UpdateMode <> 1
+    ; Close a running copy first, as the template does right after this hook,
+    ; so it cannot write a credential back. Cancel in its prompt ends the
+    ; uninstall before anything is removed.
+    !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+    ; Only the exe of this very build knows the switch. An older one (an
+    ; upgrade that could not replace it, a copy put there by hand) would start
+    ; as the app and keep the uninstaller waiting until it is closed. Tauri
+    ; gives the exe the same four-part version as the installer.
+    StrCpy $R0 1
+    ClearErrors
+    ${GetFileVersion} "$INSTDIR\${MAINBINARYNAME}.exe" $R1
+    ${IfNot} ${Errors}
+    ${AndIf} $R1 == "${VERSIONWITHBUILD}"
+      ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --purge-credentials' $R0
+      ${IfThen} ${Errors} ${|} StrCpy $R0 1 ${|}
+    ${EndIf}
+    ; Best effort: the uninstall goes on, with a line in the details list.
+    ${If} $R0 <> 0
+      ${If} $LANGUAGE = ${LANG_GERMAN}
+        DetailPrint "Die gespeicherten Zugangsdaten konnten nicht alle entfernt werden."
+      ${Else}
+        DetailPrint "Not all saved credentials could be removed."
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+!macroend

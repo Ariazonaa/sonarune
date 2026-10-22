@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod dsp;
+mod errors;
 pub mod fade;
 mod limiter;
 pub mod opus;
@@ -8,6 +9,7 @@ pub mod source;
 pub mod tap;
 pub mod tempo;
 pub mod timbre;
+mod uniform;
 pub mod waveform;
 
 use crate::api::JellyfinClient;
@@ -16,6 +18,7 @@ use crate::error::{AppError, AppResult};
 use crate::store::{keys, Store};
 use dsp::AudioDsp;
 pub use dsp::DspParams;
+use errors::PlayerErrorEvent;
 use fade::FadeHandle;
 use serde::{Deserialize, Serialize};
 use source::{DownloadProgress, OpenPurpose, OpenedSource, StreamAuth, TrackSource};
@@ -43,6 +46,15 @@ const DEFAULT_OUTPUT_POLL: Duration = Duration::from_secs(2);
 /// default a moment before they can play.
 const DEFAULT_OUTPUT_RETRY: Duration = Duration::from_secs(5);
 const DEFAULT_OUTPUT_ATTEMPTS: u32 = 4;
+/// The output closes once nothing has been audible for this long (see
+/// `IdleClock`). A running render stream holds Windows' "An audio stream is
+/// currently in use" power request, which keeps the machine from going to
+/// sleep — playing silence, paused in the tray overnight, as much as music.
+/// Five minutes: past a phone call or a word at the door, after which Play
+/// should be instant, and short enough that a machine left alone sleeps not
+/// much later than its power plan says. Play after that opens the device
+/// again and reloads the paused track at its place, which takes a moment.
+const IDLE_OUTPUT_CLOSE: Duration = Duration::from_secs(5 * 60);
 /// Upper bound on commands buffered while the audio output is unavailable.
 const DEFERRED_COMMAND_LIMIT: usize = 256;
 /// Report playback progress to the server this often — on the clock, not in
@@ -312,6 +324,16 @@ pub struct QueueTrack {
 /// both sides always remain gapless. Smart mode preserves an album's declared
 /// track/disc order and crossfades every other transition (mixes/radio queues
 /// naturally consist of such unrelated transitions).
+/// Whose a listen is: the account of the session the track played in. A
+/// session the server ended (a refused token, a forced move to https)
+/// leaves the track playing and the account signed in as far as the store
+/// goes; after a sign-out the store names nobody.
+fn listener(session: Option<&JellyfinClient>, store: &Store) -> Option<crate::identity::Owner> {
+    session
+        .and_then(crate::identity::Owner::of)
+        .or_else(|| crate::identity::Owner::current(store))
+}
+
 fn should_crossfade(
     mode: CrossfadeMode,
     fade_ms: u64,
@@ -1047,6 +1069,444 @@ fn new_play_session() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Open with `auth`. A 401 — the session's token was revoked, a device
+/// removed in the Jellyfin dashboard — gets one renewal (`renew`) and one
+/// more open with the renewed session; whatever that brings is the answer.
+fn open_renewing<T>(
+    auth: StreamAuth,
+    mut open: impl FnMut(&StreamAuth) -> AppResult<T>,
+    renew: impl FnOnce(AppError) -> AppResult<StreamAuth>,
+) -> AppResult<T> {
+    match open(&auth) {
+        Err(unauthorized @ AppError::Server { status: 401, .. }) => {
+            tracing::info!("stream refused with 401, renewing the session");
+            let renewed = renew(unauthorized)?;
+            open(&renewed)
+        }
+        other => other,
+    }
+}
+
+/// A fetch of the player's own on the async runtime (the Auto-DJ mix) on
+/// `client`: a 401 gets one renewal (`renew`) and one more try, and `client`
+/// is the renewed session from then on.
+async fn fetch_renewing<T, Fetched, Renewed>(
+    client: &mut Arc<JellyfinClient>,
+    fetch: impl Fn(Arc<JellyfinClient>) -> Fetched,
+    renew: impl FnOnce(Arc<JellyfinClient>, AppError) -> Renewed,
+) -> AppResult<T>
+where
+    Fetched: std::future::Future<Output = AppResult<T>>,
+    Renewed: std::future::Future<Output = AppResult<Arc<JellyfinClient>>>,
+{
+    match fetch(client.clone()).await {
+        Err(unauthorized @ AppError::Server { status: 401, .. }) => {
+            tracing::info!("player fetch refused with 401, renewing the session");
+            *client = renew(client.clone(), unauthorized).await?;
+            fetch(client.clone()).await
+        }
+        other => other,
+    }
+}
+
+/// [`source::open_track_source`] through [`open_renewing`]: `attempt.stop`
+/// stops every try, and each try gets a token of its own under it — a try
+/// that fails stops the one it was given on its way out, and the retry must
+/// not start out stopped.
+fn open_track_renewing(
+    auth: StreamAuth,
+    track: &QueueTrack,
+    attempt: source::Attempt<'_>,
+    dsp: Arc<AudioDsp>,
+    tap: Arc<tap::VisualizerTap>,
+    waveform: Option<waveform::WaveformRequest>,
+    renew: impl FnOnce(AppError) -> AppResult<StreamAuth>,
+) -> AppResult<OpenedSource> {
+    let source::Attempt {
+        play_session,
+        gain_db,
+        start_ms,
+        rate,
+        stop,
+    } = attempt;
+    open_renewing(
+        auth,
+        |auth| {
+            source::open_track_source(
+                auth,
+                track,
+                source::Attempt {
+                    play_session,
+                    gain_db,
+                    start_ms,
+                    rate,
+                    stop: stop.child_token(),
+                },
+                dsp.clone(),
+                tap.clone(),
+                waveform.clone(),
+            )
+        },
+        renew,
+    )
+}
+
+/// The session renewed after a stream open of `stale` got `unauthorized`,
+/// as the auth to open again with. Runs on the open thread, never on the
+/// player's: the renewal itself is a task on the async runtime
+/// (`commands::renew_session`), so an open the player gives up on (`stop`)
+/// stops waiting for it at once, and the renewal still runs to its end.
+fn renew_stream_auth(
+    app: &tauri::AppHandle,
+    stale: &Arc<JellyfinClient>,
+    unauthorized: AppError,
+    stop: &tokio_util::sync::CancellationToken,
+) -> AppResult<StreamAuth> {
+    if stop.is_cancelled() {
+        return Err(unauthorized);
+    }
+    let fallback = unauthorized.replay();
+    let at = Instant::now();
+    tauri::async_runtime::block_on(async {
+        tokio::select! {
+            renewed = crate::commands::renew_session(app, stale, at, unauthorized) => {
+                renewed.map(|client| StreamAuth::from_client(&client))
+            }
+            () = stop.cancelled() => Err(fallback),
+        }
+    })
+}
+
+#[cfg(test)]
+mod open_renewing_tests {
+    use super::{
+        fetch_renewing, open_renewing, open_track_renewing, source, tap, AppError, AudioDsp,
+        DspParams, JellyfinClient, QueueTrack, StreamAuth,
+    };
+    use std::cell::RefCell;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    fn auth_for(token: &str, base_url: &str) -> StreamAuth {
+        StreamAuth {
+            auth_header: format!("MediaBrowser Token=\"{token}\""),
+            trusted: Vec::new(),
+            base_url: base_url.into(),
+            server: crate::identity::Server {
+                address: base_url.into(),
+                id: None,
+            },
+        }
+    }
+
+    fn auth(token: &str) -> StreamAuth {
+        auth_for(token, "http://music.home")
+    }
+
+    fn status(status: u16) -> AppError {
+        AppError::Server {
+            status,
+            message: "stream open failed".into(),
+        }
+    }
+
+    /// Opens with the answers in `script`, in order; returns the result, the
+    /// auth headers the opens went out with, and how often it renewed.
+    fn run(
+        script: Vec<Result<(), AppError>>,
+        renewal: Result<StreamAuth, AppError>,
+    ) -> (Result<(), AppError>, Vec<String>, usize) {
+        let script = RefCell::new(script.into_iter());
+        let opened_with = RefCell::new(Vec::new());
+        let renewals = RefCell::new(0);
+        let result = open_renewing(
+            auth("revoked"),
+            |auth| {
+                opened_with.borrow_mut().push(auth.auth_header.clone());
+                script.borrow_mut().next().expect("no more opens expected")
+            },
+            |unauthorized| {
+                assert!(matches!(unauthorized, AppError::Server { status: 401, .. }));
+                *renewals.borrow_mut() += 1;
+                renewal
+            },
+        );
+        (result, opened_with.into_inner(), renewals.into_inner())
+    }
+
+    #[test]
+    fn a_401_renews_once_and_opens_once_more_with_the_renewed_session() {
+        let (result, opened_with, renewals) =
+            run(vec![Err(status(401)), Ok(())], Ok(auth("fresh")));
+        assert!(result.is_ok());
+        assert_eq!(renewals, 1);
+        assert_eq!(opened_with.len(), 2);
+        assert!(opened_with[1].contains("fresh"), "{opened_with:?}");
+    }
+
+    #[test]
+    fn a_second_401_is_the_answer() {
+        let (result, opened_with, renewals) =
+            run(vec![Err(status(401)), Err(status(401))], Ok(auth("fresh")));
+        assert!(matches!(result, Err(AppError::Server { status: 401, .. })));
+        assert_eq!((opened_with.len(), renewals), (2, 1));
+    }
+
+    #[test]
+    fn a_renewal_that_fails_is_not_followed_by_another_open() {
+        let (result, opened_with, renewals) =
+            run(vec![Err(status(401))], Err(AppError::NotConnected));
+        assert!(matches!(result, Err(AppError::NotConnected)));
+        assert_eq!((opened_with.len(), renewals), (1, 1));
+    }
+
+    /// A second of CD-quality silence as a WAV file.
+    fn wav() -> Vec<u8> {
+        let data_len: u32 = 44_100 * 2 * 2;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&2u16.to_le_bytes()); // channels
+        out.extend_from_slice(&44_100u32.to_le_bytes());
+        out.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(44 + data_len as usize, 0);
+        out
+    }
+
+    /// A stand-in for the server's stream: 401 for the revoked session, the
+    /// file for any other. Returns its URL and the auth header of every
+    /// request.
+    fn stream_server() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stand-in server");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let body = wav();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => head.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let header = |name: &str| {
+                    head.lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .map(|value| value.trim().to_string())
+                };
+                let authorization = header("authorization:").unwrap_or_default();
+                log.lock().unwrap().push(authorization.clone());
+                if authorization.contains("revoked") {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let start = header("range:")
+                    .and_then(|range| {
+                        let (start, _) = range.strip_prefix("bytes=")?.split_once('-')?;
+                        start.parse::<usize>().ok()
+                    })
+                    .filter(|&start| start < body.len());
+                let (status, part) = match start {
+                    Some(start) => ("206 Partial Content", &body[start..]),
+                    None => ("200 OK", &body[..]),
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n",
+                        part.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.write_all(part);
+            }
+        });
+        (url, seen)
+    }
+
+    fn track(url: &str) -> QueueTrack {
+        QueueTrack {
+            item_id: "x".into(),
+            name: "x".into(),
+            artist: String::new(),
+            album: String::new(),
+            album_id: None,
+            album_artist: None,
+            track_number: None,
+            disc_number: None,
+            duration_ms: 1_000,
+            image_item_id: None,
+            image_tag: None,
+            image_blur_hash: None,
+            stream_url: format!("{url}/Audio/x/universal?userId=u"),
+            entry_id: String::new(),
+            normalization_gain: None,
+            album_normalization_gain: None,
+            artists: Vec::new(),
+            genres: Vec::new(),
+            source_playlist_id: None,
+            auto_dj_reason: None,
+            is_favorite: false,
+        }
+    }
+
+    /// Opens `url`'s track as `spawn_open` does, starting with the revoked
+    /// session; `renewal` is what renewing it brings.
+    fn open_revoked(
+        url: &str,
+        stop: &tokio_util::sync::CancellationToken,
+        renewal: Result<StreamAuth, AppError>,
+    ) -> Result<source::OpenedSource, AppError> {
+        open_track_renewing(
+            auth_for("revoked", url),
+            &track(url),
+            source::Attempt {
+                play_session: "attempt",
+                gain_db: None,
+                start_ms: None,
+                rate: rodio::SampleRate::new(48_000).unwrap(),
+                stop: stop.clone(),
+            },
+            Arc::new(AudioDsp::new(DspParams::default())),
+            Arc::new(tap::VisualizerTap::new()),
+            None,
+            |_| renewal,
+        )
+    }
+
+    #[test]
+    fn a_track_whose_session_was_revoked_plays_on_the_renewed_one() {
+        let (url, seen) = stream_server();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let opened = open_revoked(&url, &stop, Ok(auth_for("fresh", &url)));
+        assert!(opened.is_ok(), "{:?}", opened.err());
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].contains("revoked") && seen[1].contains("fresh"));
+        // The failed try stopped only what it was given; the open as a whole
+        // is still wanted.
+        assert!(!stop.is_cancelled());
+    }
+
+    #[test]
+    fn a_track_whose_session_cannot_be_renewed_fails_after_one_request() {
+        let (url, seen) = stream_server();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let opened = open_revoked(&url, &stop, Err(AppError::NotConnected));
+        assert!(matches!(opened, Err(AppError::NotConnected)));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    fn session(token: &str) -> Arc<JellyfinClient> {
+        Arc::new(
+            JellyfinClient::new("http://music.home", "test-device", Vec::new())
+                .unwrap()
+                .with_session(token.into(), "alice-id".into()),
+        )
+    }
+
+    /// Fetches with the answers in `script`; returns the result, the tokens
+    /// the fetches went out with, how often it renewed, and the client the
+    /// caller carries on with.
+    async fn fetch_with(
+        script: Vec<Result<(), AppError>>,
+        renewal: Result<Arc<JellyfinClient>, AppError>,
+    ) -> (
+        Result<(), AppError>,
+        Vec<String>,
+        usize,
+        Arc<JellyfinClient>,
+    ) {
+        let script = Mutex::new(script.into_iter());
+        let fetched_with = Mutex::new(Vec::new());
+        let renewals = Mutex::new(0);
+        let mut client = session("revoked");
+        let result = fetch_renewing(
+            &mut client,
+            |client| {
+                fetched_with
+                    .lock()
+                    .unwrap()
+                    .push(client.token().unwrap_or_default().to_string());
+                let answer = script
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .expect("no more fetches expected");
+                async move { answer }
+            },
+            |_, unauthorized| {
+                assert!(matches!(unauthorized, AppError::Server { status: 401, .. }));
+                *renewals.lock().unwrap() += 1;
+                async move { renewal }
+            },
+        )
+        .await;
+        let fetched_with = fetched_with.into_inner().unwrap();
+        let renewals = renewals.into_inner().unwrap();
+        (result, fetched_with, renewals, client)
+    }
+
+    #[tokio::test]
+    async fn a_player_fetch_renews_once_and_goes_on_with_the_renewed_session() {
+        let (result, fetched_with, renewals, client) =
+            fetch_with(vec![Err(status(401)), Ok(())], Ok(session("fresh"))).await;
+        assert!(result.is_ok());
+        assert_eq!(fetched_with, ["revoked", "fresh"]);
+        assert_eq!(renewals, 1);
+        assert_eq!(client.token(), Some("fresh"));
+
+        let (result, fetched_with, renewals, _) = fetch_with(
+            vec![Err(status(401)), Err(status(401))],
+            Ok(session("fresh")),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Server { status: 401, .. })));
+        assert_eq!((fetched_with.len(), renewals), (2, 1));
+
+        let (result, fetched_with, renewals, client) =
+            fetch_with(vec![Err(status(401))], Err(AppError::NotConnected)).await;
+        assert!(matches!(result, Err(AppError::NotConnected)));
+        assert_eq!((fetched_with.len(), renewals), (1, 1));
+        assert_eq!(client.token(), Some("revoked"));
+
+        let (result, fetched_with, renewals, _) =
+            fetch_with(vec![Err(status(503))], Ok(session("fresh"))).await;
+        assert!(matches!(result, Err(AppError::Server { status: 503, .. })));
+        assert_eq!((fetched_with.len(), renewals), (1, 0));
+    }
+
+    #[test]
+    fn other_failures_renew_nothing() {
+        for failure in [
+            status(403),
+            status(404),
+            status(500),
+            AppError::Audio("decode failed".into()),
+            AppError::NotConnected,
+        ] {
+            let shown = failure.to_string();
+            let (result, opened_with, renewals) = run(vec![Err(failure)], Ok(auth("fresh")));
+            assert_eq!(result.unwrap_err().to_string(), shown);
+            assert_eq!((opened_with.len(), renewals), (1, 0), "{shown}");
+        }
+    }
+}
+
 fn buffered_range_ms(fraction: Option<(f64, f64)>, duration_ms: u64) -> Option<(u64, u64)> {
     let (start, end) = fraction?;
     if duration_ms == 0 {
@@ -1301,17 +1761,23 @@ struct PersistedOrder {
 pub struct RestoredQueue {
     tracks: Vec<QueueTrack>,
     index: usize,
+    /// Where the track at `index` stood when playback last stopped for a
+    /// while (`Worker::persist_position`); 0 when nothing says.
+    position_ms: u64,
     order: Option<PersistedOrder>,
 }
 
 /// The queue index, saved apart from the track list (`keys::QUEUE_INDEX`): it
 /// moves on every track change, and writing it into the snapshot would
 /// re-serialize the whole queue each time. Applies only to the snapshot it
-/// names.
+/// names. It also carries where that track stood when playback last stopped
+/// for a while, so a restart — an update's too — goes on from there.
 #[derive(Serialize, Deserialize)]
 struct PersistedQueueIndex {
     snapshot_id: String,
     index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    position_ms: Option<u64>,
 }
 
 /// What `sync_queue` last wrote: the track list as of `revision` (saved under
@@ -1344,13 +1810,16 @@ fn queue_write(written: Option<&PersistedQueueMark>, revision: u64, index: usize
     }
 }
 
-/// Index to restore a snapshot at: the separately saved one when it belongs to
-/// this very track list, otherwise the snapshot's own.
-fn restored_index(snapshot: &PersistedQueue, saved_index: Option<&str>) -> usize {
+/// Index and position to restore a snapshot at: the separately saved ones
+/// when they belong to this very track list, otherwise the snapshot's own
+/// index from the start of the track.
+fn restored_index(snapshot: &PersistedQueue, saved_index: Option<&str>) -> (usize, u64) {
     saved_index
         .and_then(|json| serde_json::from_str::<PersistedQueueIndex>(json).ok())
         .filter(|saved| snapshot.snapshot_id.as_deref() == Some(saved.snapshot_id.as_str()))
-        .map_or(snapshot.index, |saved| saved.index)
+        .map_or((snapshot.index, 0), |saved| {
+            (saved.index, saved.position_ms.unwrap_or(0))
+        })
 }
 
 struct Prefetched {
@@ -1858,14 +2327,15 @@ impl TickClock {
 }
 
 /// A new player on the output at `volume`, filled by `fill` — and paused, if
-/// asked — before it joins the mixer. The mixer sets up its format conversion
-/// from what the player reports at that moment, and an empty player reports a
-/// placeholder (one channel at 48 kHz) that the first 512 samples of the real
-/// source would be converted as: a garbled blip at every start, and a beat
-/// transition landing late. Paused before it joins, it cannot sound for a
-/// moment before the pause takes either.
+/// asked — before it joins the mixer. Its way into the mixer
+/// (`uniform::wrap`) sets up the format conversion from what the player
+/// reports at that moment, and an empty player reports a placeholder (one
+/// channel at 48 kHz) that the first 512 samples of the real source would be
+/// converted as: a garbled blip at every start, and a beat transition landing
+/// late. Paused before it joins, it cannot sound for a moment before the
+/// pause takes either.
 fn start_player(
-    mixer: &rodio::mixer::Mixer,
+    mix: &Mix,
     volume: f32,
     paused: bool,
     fill: impl FnOnce(&rodio::Player),
@@ -1876,7 +2346,7 @@ fn start_player(
     if paused {
         player.pause();
     }
-    mixer.add(output);
+    mix.mixer.add(uniform::wrap(output, mix.channels, mix.rate));
     player
 }
 
@@ -2013,7 +2483,7 @@ pub fn spawn(
                     Ok(w) => break w,
                     Err(e) => {
                         tracing::error!("audio output init failed: {e}");
-                        let message = format!("audio output unavailable: {e}");
+                        let message = PlayerErrorEvent::output_unavailable(&e);
                         // Report once, not every 3 s — a missing device would
                         // otherwise flood the UI with the same banner.
                         if reported_output_error.is_none() {
@@ -2081,6 +2551,10 @@ pub fn spawn(
                 if clock.tick_due(Instant::now(), wake_at) {
                     worker.tick();
                 }
+                // After every command, not only on the tick: a moment of
+                // music between two ticks is no silence.
+                worker.watch_idle_output();
+                worker.drop_stale_parked();
                 // After the tick too: a track end it handled moves the
                 // generation on, and the opens that made stale stop now.
                 worker.stop_stale_opens();
@@ -2198,6 +2672,18 @@ struct Worker {
     /// A new default device that did not open (yet): tried again a few
     /// times, then not until the default changes once more.
     default_output_failed: Option<FailedDefault>,
+    /// How long the open output has played nothing; closes it after
+    /// `IDLE_OUTPUT_CLOSE` (`watch_idle_output`).
+    idle: IdleClock,
+    /// The source on its way fades in from silence, as a resume does: the
+    /// paused track reloaded after the output closed (`resume_closed`).
+    /// Should the reload fail, it goes back to paused (`reopen_failed`).
+    fade_in_arrival: bool,
+    /// The decoder and the whole download of the paused track whose player
+    /// went with the output closed for silence (`close_idle_output`): Play
+    /// resumes from them, without the server (`resume_closed`). Dropped as
+    /// soon as anything else becomes of that track (`drop_stale_parked`).
+    parked: Option<ParkedTrack>,
     queue: Vec<QueueTrack>,
     /// Bumped by every change to `queue` or to its play order (see
     /// `queue_mut`, `order_mut`), so `sync_queue` re-writes and re-sends the
@@ -2402,6 +2888,9 @@ impl Worker {
             opened_output: None,
             last_default_poll: Instant::now(),
             default_output_failed: None,
+            idle: IdleClock::default(),
+            fade_in_arrival: false,
+            parked: None,
             queue: Vec::new(),
             queue_revision: 0,
             persisted_queue: None,
@@ -2441,6 +2930,9 @@ impl Worker {
         // Called right after every new stream (start, rebuild, the reopen
         // on Play), and only then.
         self.stream_opened_at = Instant::now();
+        // A stream opened while nothing plays (a device picked in Settings
+        // during a long pause) gets its own while before it closes.
+        self.idle.reset();
         // A volume not saved yet was set on the device that played until now.
         self.save_volume();
         crate::audio_devices::set_active_device(opened.as_ref().map(|o| o.device.clone()));
@@ -2863,6 +3355,7 @@ impl Worker {
                 // ends right after it: a volume still waiting for its tick is
                 // saved first, as shutdown does.
                 self.save_volume();
+                self.persist_position();
                 let report = self.take_final_report(true);
                 self.stop_internal();
                 if let Some(report) = report {
@@ -2930,14 +3423,13 @@ impl Worker {
                             tap_enabled,
                             download,
                             ..
-                        } = *opened;
+                        } = self.refit(&track, *opened);
                         // Honor a pause pressed while this source was loading.
                         let paused = self.take_start_paused();
                         self.arm_fresh(&fade, 0, paused);
-                        let sink =
-                            start_player(self.output.mixer(), self.volume, paused, |player| {
-                                player.append(source)
-                            });
+                        let sink = start_player(self.output.mix(), self.volume, paused, |player| {
+                            player.append(source)
+                        });
                         self.status = if paused {
                             PlaybackStatus::Paused
                         } else {
@@ -2977,15 +3469,14 @@ impl Worker {
                             tap_enabled,
                             download,
                             start_ms,
-                        } = *opened;
+                        } = self.refit(&track, *opened);
                         // Paused before the reopen, as adjusted by Play/Pause
                         // pressed while it loaded (see restart_at).
                         let paused = self.take_start_paused();
                         self.arm_fresh(&fade, start_ms, paused);
-                        let sink =
-                            start_player(self.output.mixer(), self.volume, paused, |player| {
-                                player.append(source)
-                            });
+                        let sink = start_player(self.output.mix(), self.volume, paused, |player| {
+                            player.append(source)
+                        });
                         self.status = if paused {
                             PlaybackStatus::Paused
                         } else {
@@ -3015,11 +3506,9 @@ impl Worker {
                         self.emit();
                     }
                     Err(e) => {
-                        // A reopen's start was reported: close its session.
-                        if self.play_session_id.as_deref() == Some(play_session.as_str()) {
-                            self.report_stopped_playing();
-                        }
-                        self.fail_start(&track, e);
+                        let reported =
+                            self.play_session_id.as_deref() == Some(play_session.as_str());
+                        self.reopen_failed(&track, e, reported);
                     }
                 }
             }
@@ -3174,10 +3663,14 @@ impl Worker {
         {
             return false;
         }
+        let silence = self
+            .current_download
+            .as_ref()
+            .map_or(Duration::ZERO, |download| download.silence());
         let played = self
             .sink
             .as_ref()
-            .map(|sink| sink.get_pos())
+            .map(|sink| sink.get_pos().saturating_sub(silence))
             .unwrap_or_default();
         let position_ms = self.position_ms();
         let near_end = self.queue.get(self.index).is_none_or(|track| {
@@ -3218,6 +3711,22 @@ impl Worker {
         {
             self.disarm_sleep_timer();
             self.emit();
+        }
+        // A seek the decoder could not carry out leaves its source silent: the
+        // track is opened anew there, as for a live transcode.
+        if matches!(
+            self.status,
+            PlaybackStatus::Playing | PlaybackStatus::Paused
+        ) {
+            if let Some(target) = self
+                .current_download
+                .as_ref()
+                .and_then(|download| download.take_seek_failure())
+            {
+                tracing::info!("the decoder could not seek; reopening the track there");
+                self.restart_at(target.as_millis() as u64);
+                return;
+            }
         }
         if self.maybe_transition() || self.status != PlaybackStatus::Playing {
             return;
@@ -3338,13 +3847,17 @@ impl Worker {
 
     /// Set the level a source starts at, before its first sample plays (a
     /// FadeSource takes the latest ramp then). Opened paused, it stays silent
-    /// until the resume fades it in, like any other; during a sleep fade it
-    /// starts where the fade stands and carries on down. Otherwise it starts
-    /// at full gain, as every source does.
+    /// until the resume fades it in, like any other; reloaded to resume
+    /// (`fade_in_arrival`), it fades in as a resume does; during a sleep fade
+    /// it starts where the fade stands and carries on down. Otherwise it
+    /// starts at full gain, as every source does.
     fn arm_fresh(&mut self, fade: &FadeHandle, position_ms: u64, paused: bool) {
         self.sleep_fade_item = None;
+        let resumes = std::mem::take(&mut self.fade_in_arrival);
         if paused {
             fade.begin(0.0, 0.0, Duration::ZERO);
+        } else if resumes {
+            self.fade_in(Some(fade), position_ms);
         } else if let Some((gain, ramp)) = self.sleep_ramp(position_ms) {
             fade.begin(gain, 0.0, ramp);
             self.sleep_fade_item = self
@@ -3629,6 +4142,7 @@ impl Worker {
                             plan.fade_out_ms,
                             plan.fade_in_ms
                         );
+                        let p = self.refit_prefetched(&next, p);
                         self.begin_crossfade(p, plan.fade_out_ms, plan.fade_in_ms, lead);
                     }
                 }
@@ -3640,6 +4154,7 @@ impl Worker {
                 if let Some(p) = self.prefetched.take() {
                     if p.item_id == next.item_id {
                         let fade_ms = remaining.min(effective_fade_ms);
+                        let p = self.refit_prefetched(&next, p);
                         self.begin_crossfade(p, fade_ms, fade_ms, 0);
                     } else {
                         self.prefetched = Some(p);
@@ -3649,6 +4164,10 @@ impl Worker {
         } else if self.appended.is_none() && duration > 0 && remaining <= APPEND_REMAINING_MS {
             if let Some(p) = self.prefetched.take() {
                 if p.item_id == next.item_id {
+                    // Coupled to the playing track, at the output's rate.
+                    // Replacing the output drops the prefetch, so the rate
+                    // only guards.
+                    let p = self.couple_prefetched(&next, p);
                     if let Some(sink) = &self.sink {
                         sink.append(p.source);
                         self.pending_fade = Some(p.fade);
@@ -3783,7 +4302,7 @@ impl Worker {
                 .take_duration(Duration::from_millis(lead_ms))
         });
         p.fade.begin(0.0, 1.0, Duration::from_millis(fade_in_ms));
-        let sink = start_player(self.output.mixer(), self.volume, false, |player| {
+        let sink = start_player(self.output.mix(), self.volume, false, |player| {
             if let Some(silence) = lead {
                 player.append(silence);
             }
@@ -3818,6 +4337,7 @@ impl Worker {
     /// only when the appended track is still what the queue says comes next;
     /// otherwise the queue order wins.
     fn handle_transition(&mut self, appended_item_id: &str) {
+        self.report_decoder_crash();
         self.appended = None;
         // The appended source is what plays now, whatever follows: its fade
         // is the one to steer (a stop or a cut-over below ramps it out).
@@ -3886,6 +4406,7 @@ impl Worker {
     /// Current track finished with nothing appended (prefetch missed or was
     /// disabled): fall back to a regular start of the next track.
     fn handle_track_end(&mut self) {
+        self.report_decoder_crash();
         // Where it really stopped. A decoder ends on any read error, so a
         // stream that broke off ends the track early and looks like a natural
         // end otherwise — reported at its full length, the server would count
@@ -3895,9 +4416,16 @@ impl Worker {
             .current_download
             .as_ref()
             .and_then(|download| download.fraction());
+        // A decoder that crashed (or came to a rate that cannot be
+        // resampled) ended the track, whatever the download did: said so
+        // above, and the queue goes on.
+        let crashed = self
+            .current_download
+            .as_ref()
+            .is_some_and(|download| download.decoder_failed());
         if let Some(prev) = self.queue.get(self.index).cloned() {
             self.report_stopped(&prev, stopped_at);
-            if stream_broke_off(stopped_at, prev.duration_ms, download) {
+            if !crashed && stream_broke_off(stopped_at, prev.duration_ms, download) {
                 // Not on to the next track as if nothing happened: stop on
                 // this one, where it broke off, so Play continues it there.
                 tracing::warn!("the stream broke off at {stopped_at} ms");
@@ -3971,6 +4499,20 @@ impl Worker {
         }
     }
 
+    /// The decoder of the track that just ended crashed (on its own thread,
+    /// see `source/feed.rs`): it ended early. Said like a failed start; the
+    /// queue goes on.
+    fn report_decoder_crash(&self) {
+        let failure = self
+            .current_download
+            .as_ref()
+            .and_then(|download| download.decoder_failure());
+        if let (Some(failure), Some(track)) = (failure, self.queue.get(self.index)) {
+            let e = AppError::Audio(failure);
+            self.report_error(PlayerErrorEvent::cannot_play(&track.name, &e));
+        }
+    }
+
     /// The prefetch that was still on its way when the track before it ended
     /// landed before the fresh open of the same track (`handle_track_end`):
     /// it plays, and the other open is dropped when it lands, the generation
@@ -4009,6 +4551,46 @@ impl Worker {
         self.start_from_prefetched();
     }
 
+    /// [`Self::refit`] for a prefetched source, which starts at the top.
+    fn refit_prefetched(&self, track: &QueueTrack, p: Prefetched) -> Prefetched {
+        let Prefetched {
+            item_id,
+            play_session,
+            source,
+            fade,
+            tap_enabled,
+            download,
+        } = p;
+        let opened = self.refit(
+            track,
+            OpenedSource {
+                source,
+                fade,
+                tap_enabled,
+                download,
+                start_ms: 0,
+            },
+        );
+        Prefetched {
+            item_id,
+            play_session,
+            source: opened.source,
+            fade: opened.fade,
+            tap_enabled: opened.tap_enabled,
+            download: opened.download,
+        }
+    }
+
+    /// The prefetched next track, coupled to the playing one for the gapless
+    /// hand-over (`source::couple`), then [`Self::refit_prefetched`] — which
+    /// leaves a coupled one as it is: it is at the output's rate.
+    fn couple_prefetched(&self, track: &QueueTrack, p: Prefetched) -> Prefetched {
+        if let Some(current) = &self.current_download {
+            source::couple(current, &p.download, self.output.rate());
+        }
+        self.refit_prefetched(track, p)
+    }
+
     /// Start the current queue track from an already-opened prefetched source.
     fn start_from_prefetched(&mut self) -> bool {
         let Some(current_id) = self.queue.get(self.index).map(|t| t.item_id.clone()) else {
@@ -4024,6 +4606,8 @@ impl Worker {
         let Some(track) = self.queue.get(self.index).cloned() else {
             return false;
         };
+        // Opened for an output replaced since, it may be at another rate.
+        let p = self.refit_prefetched(&track, p);
         self.generation = self.generation.wrapping_add(1);
         // The old player may still sound: an appended track the queue has
         // moved away from (handle_transition).
@@ -4041,7 +4625,7 @@ impl Worker {
         // run out.
         let paused = self.take_start_paused();
         self.arm_fresh(&p.fade, 0, paused);
-        let sink = start_player(self.output.mixer(), self.volume, paused, |player| {
+        let sink = start_player(self.output.mix(), self.volume, paused, |player| {
             player.append(p.source)
         });
         self.sink = Some(sink);
@@ -4120,8 +4704,28 @@ impl Worker {
         }
         self.status = PlaybackStatus::Paused;
         self.report_progress(true);
+        self.persist_position();
         self.update_media_playback();
         self.emit();
+    }
+
+    /// Save where the current track stands along with the index, so a
+    /// restart resumes there. Written when playback stops for a while — a
+    /// pause, quitting, the installer taking over — not while it plays: the
+    /// index entry is small, but not worth a write every tick.
+    fn persist_position(&mut self) {
+        self.persist_queue();
+        let Some(written) = self.persisted_queue.as_ref() else {
+            return;
+        };
+        let entry = PersistedQueueIndex {
+            snapshot_id: written.snapshot_id.clone(),
+            index: self.index,
+            position_ms: Some(self.position_ms()),
+        };
+        if let Ok(json) = serde_json::to_string(&entry) {
+            let _ = self.store.set(keys::QUEUE_INDEX, &json);
+        }
     }
 
     fn resume_or_start(&mut self) {
@@ -4132,29 +4736,18 @@ impl Worker {
                 if self.sleep_timer_due() {
                     self.disarm_sleep_timer();
                 }
-                if let Some(sink) = &self.sink {
-                    sink.play();
-                }
+                // Its player went with the output, closed after a long pause.
+                let Some(sink) = &self.sink else {
+                    self.resume_closed();
+                    return;
+                };
+                sink.play();
                 // Up from silence, said so rather than ramped from the current
                 // gain: pause() left it at zero, but a source that was opened
                 // paused has never been pulled, so it has taken no ramp yet
-                // and would still start at full gain. pause() also replaced a
-                // sleep ramp with its own: come back to where the fade stands
-                // by now, not to full volume. The fade takes over from there
-                // once this ramp is done (update_sleep_fade, on a later tick).
-                let sleep = self.sleep_ramp(self.position_ms());
-                let level = sleep.map_or(1.0, |(gain, _)| gain);
-                if let Some(fade) = &self.current_fade {
-                    fade.begin(0.0, level, Duration::from_millis(PAUSE_FADE_MS));
-                }
-                // Brought back below full by the sleep fade, it carries the
-                // fade already: cancelling it brings the gain back up.
-                self.sleep_fade_item = sleep
-                    .and_then(|_| self.queue.get(self.index))
-                    .map(|track| track.item_id.clone());
-                self.resume_ramp_until = Some(
-                    Instant::now() + self.tempo.wall(Duration::from_millis(PAUSE_FADE_MS + 50)),
-                );
+                // and would still start at full gain.
+                let fade = self.current_fade.clone();
+                self.fade_in(fade.as_ref(), self.position_ms());
                 // The appended next source was muted by pause() too.
                 self.arm_appended();
                 self.status = PlaybackStatus::Playing;
@@ -4176,6 +4769,104 @@ impl Worker {
                 }
             }
             PlaybackStatus::Playing | PlaybackStatus::Loading => {}
+        }
+    }
+
+    /// Fade the source behind `fade` in from silence over the resume's ramp:
+    /// up to where a sleep fade stands by now, not to full volume — pause()
+    /// replaced the sleep ramp with its own, and a source reloaded to resume
+    /// has none yet. The sleep fade takes over from there once this ramp is
+    /// done (update_sleep_fade, on a later tick).
+    fn fade_in(&mut self, fade: Option<&FadeHandle>, position_ms: u64) {
+        let sleep = self.sleep_ramp(position_ms);
+        let level = sleep.map_or(1.0, |(gain, _)| gain);
+        if let Some(fade) = fade {
+            fade.begin(0.0, level, Duration::from_millis(PAUSE_FADE_MS));
+        }
+        // Brought back below full by the sleep fade, it carries the fade
+        // already: cancelling it brings the gain back up.
+        self.sleep_fade_item = sleep
+            .and_then(|_| self.queue.get(self.index))
+            .map(|track| track.item_id.clone());
+        self.resume_ramp_until =
+            Some(Instant::now() + self.tempo.wall(Duration::from_millis(PAUSE_FADE_MS + 50)));
+    }
+
+    /// Play a paused track whose player went with the output when that
+    /// closed for silence (`close_idle_output`): open the output again and
+    /// bring the track back where it was paused, in the same play session —
+    /// from its parked decoder and download when it kept them (`unpark`,
+    /// no server needed), else reloaded (`restart_at`). It fades in from
+    /// silence like any resume (`arm_fresh`). An output that does not open,
+    /// or a reload that fails (`reopen_failed`), leaves it paused there in
+    /// its session, for the next Play to try again.
+    fn resume_closed(&mut self) {
+        // The installer is about to end the process (see start_current_at).
+        if crate::updater::handing_over() {
+            self.emit();
+            return;
+        }
+        if self.queue.get(self.index).is_none() {
+            self.stop_internal();
+            return;
+        }
+        if !self.output.is_open() || !self.output_alive {
+            if let Err(e) = self.reopen_output() {
+                tracing::error!("cannot open audio output: {e}");
+                self.report_error(PlayerErrorEvent::output_failed(None, &e));
+                return;
+            }
+        }
+        let position_ms = self.position_ms();
+        // Loading to play: restart_at would bring a paused track back
+        // paused.
+        self.status = PlaybackStatus::Loading;
+        self.fade_in_arrival = true;
+        match self.unpark(position_ms) {
+            Some(resumed) => {
+                tracing::info!("resuming the paused track from its kept download");
+                self.reopen_at(position_ms, Some(resumed), position_ms);
+            }
+            None => {
+                tracing::info!("reloading the paused track to resume it");
+                self.restart_at(position_ms);
+            }
+        }
+    }
+
+    /// The parked source of the current track, at `position_ms` on the
+    /// output as it is now (see `source::Parked::resume`). Taken either way:
+    /// what does not resume from it is opened anew.
+    fn unpark(&mut self, position_ms: u64) -> Option<OpenedSource> {
+        let parked = self.parked.take()?;
+        let track = self.queue.get(self.index)?;
+        if !parked.holds(track) {
+            return None;
+        }
+        parked.source.resume(
+            position_ms,
+            self.output.rate(),
+            self.dsp.clone(),
+            self.normalization_gain_for(track),
+            self.tap.clone(),
+        )
+    }
+
+    /// Let go of a parked source once it no longer belongs to a paused track
+    /// without a player (another track, a stop, a reload): its download and
+    /// its decoder thread go with it. Checked after every command and tick,
+    /// rather than on every way out of that state.
+    fn drop_stale_parked(&mut self) {
+        let Some(parked) = &self.parked else {
+            return;
+        };
+        if !keeps_parked(
+            self.status,
+            self.sink.is_some(),
+            self.queue.get(self.index).is_some_and(|t| parked.holds(t)),
+        ) {
+            tracing::debug!("the parked track is let go of");
+            self.parked = None;
         }
     }
 
@@ -4304,7 +4995,15 @@ impl Worker {
     /// Sign-out / server change: everything about the previous session goes,
     /// including the undo snapshot and the recently-played memory.
     fn reset_queue(&mut self) {
+        // The listen, the resume point and a reload's fade go with the stop.
         self.stop_internal();
+        // And the Jellyfin play session, which every stop path other than
+        // this one has reported (and so taken) first. A sign-out did too
+        // (`StopAck`), but a session the backend ended skips the sign-out:
+        // the next account would report its own track stopped under the old
+        // account's session, to its own server.
+        self.play_session_id = None;
+        self.pending_play_session = None;
         self.queue_mut().clear();
         self.index = 0;
         self.order_mut().clear();
@@ -4383,8 +5082,11 @@ impl Worker {
             .tracks
             .get(undo.index)
             .map(|track| track.item_id.as_str());
+        // A paused track whose player went with the output closed for
+        // silence still holds its place.
         let restart = live_current != restored_current
             || (self.sink.is_none()
+                && self.status != PlaybackStatus::Paused
                 && matches!(
                     undo.status,
                     PlaybackStatus::Playing | PlaybackStatus::Paused | PlaybackStatus::Loading
@@ -4452,38 +5154,20 @@ impl Worker {
         self.current_tap = None;
         self.pending_download = None;
         self.current_download = None;
+        self.fade_in_arrival = false;
         self.position_offset_ms = position_ms;
         self.listen.restart(Instant::now(), position_ms);
         // A new attempt: the callers report the previous one stopped first.
         self.play_session_id = None;
-        // The output may have died while idle; bring it back before playing.
-        if !self.output_alive {
-            // Once a requested device has failed, stay on the default output
-            // until the user explicitly changes the setting. Reappearance
-            // alone must never steal playback back to the old device.
-            let requested_device = if crate::audio_devices::fallback_device().is_some() {
-                None
-            } else {
-                self.playback.output_device.clone()
-            };
-            let reopened = open_output(&requested_device, &self.tempo, self.tx.clone())
-                .or_else(|_| open_output(&None, &self.tempo, self.tx.clone()));
-            match reopened {
-                Ok((output, dead, device)) => {
-                    self.output = output;
-                    self.output_dead = dead;
-                    self.output_alive = true;
-                    self.last_output_rebuild = Instant::now();
-                    self.output_opened(device);
-                }
-                Err(e) => {
-                    let _ = self
-                        .app
-                        .emit("player:error", format!("Audio output failed: {e}"));
-                    self.status = PlaybackStatus::Idle;
-                    self.emit();
-                    return;
-                }
+        // The output may have closed for silence, or died while idle: bring
+        // it back before playing.
+        if !self.output.is_open() || !self.output_alive {
+            if let Err(e) = self.reopen_output() {
+                tracing::error!("cannot open audio output: {e}");
+                self.report_error(PlayerErrorEvent::output_failed(None, &e));
+                self.status = PlaybackStatus::Idle;
+                self.emit();
+                return;
             }
         }
         let Some(track) = self.queue.get(self.index).cloned() else {
@@ -4518,6 +5202,7 @@ impl Worker {
         self.current_tap = None;
         self.pending_download = None;
         self.current_download = None;
+        self.fade_in_arrival = false;
         self.position_offset_ms = 0;
         // Every stop path reports first, so nothing measured is lost here.
         self.listen = scrobble::ListenClock::default();
@@ -4562,10 +5247,7 @@ impl Worker {
         // No title in the log: the diagnostics export promises no track
         // metadata, and its quote redaction trips over apostrophes.
         tracing::error!("failed to start a track: {e}");
-        let _ = self.app.emit(
-            "player:error",
-            format!("Cannot play \"{}\": {e}", track.name),
-        );
+        self.report_error(PlayerErrorEvent::cannot_play(&track.name, &e));
         // Nothing plays: what the failed attempt left behind goes, like on
         // any stop. Where it was to start stays, as the target an idle
         // player starts at (seek_ms): Play tries there again, the seek bar
@@ -4584,14 +5266,14 @@ impl Worker {
         let Some(client) = self.session_client() else {
             // Nothing will answer, and a reopen has dropped its player
             // already (restart_at): left alone it would wait in Loading for
-            // good. A reopen's start was reported, so its session is closed
-            // first, as for a reopen that fails.
-            if matches!(purpose, OpenPurpose::SeekRestart { .. }) && self.play_session_id.is_some()
-            {
-                self.report_stopped_playing();
-            }
-            if !matches!(purpose, OpenPurpose::Prefetch) {
-                self.fail_start(&track, AppError::NotConnected);
+            // good. It fails the way a reopen that did not open does.
+            match purpose {
+                OpenPurpose::Prefetch => {}
+                OpenPurpose::SeekRestart { .. } => {
+                    let reported = self.play_session_id.is_some();
+                    self.reopen_failed(&track, AppError::NotConnected, reported);
+                }
+                OpenPurpose::Play => self.fail_start(&track, AppError::NotConnected),
             }
             return;
         };
@@ -4618,6 +5300,9 @@ impl Worker {
             _ => None,
         };
         let auth = StreamAuth::from_client(&client);
+        // The output it is for. Should that be replaced by one at another
+        // rate before the source lands, it is moved over then (`refit`).
+        let rate = self.output.rate();
         let gain_db = self.normalization_gain_for(&track);
         let dsp = self.dsp.clone();
         let tap = self.tap.clone();
@@ -4629,26 +5314,30 @@ impl Worker {
             matches!(purpose, OpenPurpose::Prefetch).then_some(prefetch_generation),
         );
         let tx = self.tx.clone();
+        let app = self.app.clone();
         let session = play_session.clone();
         let spawned = std::thread::Builder::new()
             .name("sonarune-open".into())
             .spawn(move || {
+                let stop = ticket.stop_token();
                 // A decoder panicking on a malformed file (symphonia on a WAV
                 // header with sample rate 0) must still answer, or the player
                 // waits in Loading for good.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    source::open_track_source(
-                        &auth,
+                    open_track_renewing(
+                        auth,
                         &track,
                         source::Attempt {
                             play_session: &session,
                             gain_db,
                             start_ms,
-                            stop: ticket.stop_token(),
+                            rate,
+                            stop: stop.clone(),
                         },
                         dsp,
                         tap,
                         Some(waveform),
+                        |unauthorized| renew_stream_auth(&app, &client, unauthorized, &stop),
                     )
                 }))
                 .unwrap_or_else(|_| Err(AppError::Audio("the decoder crashed".into())))
@@ -4669,16 +5358,43 @@ impl Worker {
             // failure instead.
             tracing::error!("failed to spawn open thread");
             self.prefetch_inflight = None;
-            if matches!(purpose, OpenPurpose::SeekRestart { .. }) && self.play_session_id.is_some()
-            {
-                self.report_stopped_playing();
-            }
-            if matches!(purpose, OpenPurpose::Play | OpenPurpose::SeekRestart { .. }) {
-                let track = self.queue.get(self.index).cloned();
-                if let Some(track) = track {
-                    self.fail_start(&track, AppError::Audio("cannot start opener thread".into()));
+            let e = AppError::Audio("cannot start opener thread".into());
+            match (purpose, self.queue.get(self.index).cloned()) {
+                (OpenPurpose::SeekRestart { .. }, Some(track)) => {
+                    let reported = self.play_session_id.is_some();
+                    self.reopen_failed(&track, e, reported);
                 }
+                (OpenPurpose::SeekRestart { .. }, None) if self.play_session_id.is_some() => {
+                    self.report_stopped_playing();
+                }
+                (OpenPurpose::Play, Some(track)) => self.fail_start(&track, e),
+                _ => {}
             }
+        }
+    }
+
+    /// A reopen at a position (`OpenPurpose::SeekRestart`) did not open;
+    /// `reported`: the play session it continues was reported started. See
+    /// [`failed_reopen`] for what that leaves.
+    fn reopen_failed(&mut self, track: &QueueTrack, e: AppError, reported: bool) {
+        let resuming = std::mem::take(&mut self.fade_in_arrival);
+        match failed_reopen(resuming, reported) {
+            FailedReopen::StayPaused => {
+                // No title in the log, as in fail_start.
+                tracing::error!("failed to resume a track: {e}");
+                self.report_error(PlayerErrorEvent::cannot_play(&track.name, &e));
+                // As restart_at left it: no player, the target as the
+                // position, the session and what was heard of it untouched.
+                self.pending_pause = false;
+                self.status = PlaybackStatus::Paused;
+                self.update_media_playback();
+                self.emit();
+            }
+            FailedReopen::CloseSession => {
+                self.report_stopped_playing();
+                self.fail_start(track, e);
+            }
+            FailedReopen::Fail => self.fail_start(track, e),
         }
     }
 
@@ -4703,8 +5419,12 @@ impl Worker {
     /// it is deferred to a tick instead of dropped.
     fn handle_output_failed(&mut self) {
         // The error of a stream that has been replaced since (a device
-        // switch, an earlier rebuild) is no reason to leave the one playing.
-        if !self.output_dead.load(std::sync::atomic::Ordering::Relaxed) {
+        // switch, an earlier rebuild) is no reason to leave the one playing,
+        // and a stream closed for silence failed nobody: Play opens a new one.
+        if !output_failure_counts(
+            self.output.is_open(),
+            self.output_dead.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
             self.output_failed_pending = false;
             return;
         }
@@ -4730,46 +5450,68 @@ impl Worker {
             }
         }
         tracing::warn!("audio output failed; falling back to the default device");
-        if self.try_rebuild_output(None) {
-            if let Some(requested_device) = self.playback.output_device.clone() {
-                // Keep the persisted preference: Settings can show the
-                // missing device, while the runtime stays on system default.
-                crate::audio_devices::mark_fallback(requested_device.clone());
-                let _ = self.app.emit(
-                    "audio:output-fallback",
-                    crate::audio_devices::AudioOutputFallbackEvent {
-                        requested_device: self
-                            .playback
-                            .output_device_name
-                            .clone()
-                            .unwrap_or(requested_device),
-                    },
-                );
+        // The device that died, named before the attempt can change it.
+        let failed = self.opened_output.as_ref().map(|o| o.device.name.clone());
+        match self.rebuild_output(None) {
+            Ok(()) => {
+                if let Some(requested_device) = self.playback.output_device.clone() {
+                    // Keep the persisted preference: Settings can show the
+                    // missing device, while the runtime stays on system
+                    // default.
+                    self.mark_fallback(requested_device);
+                }
             }
-        } else {
-            self.output_alive = false;
-            let _ = self.app.emit(
-                "player:error",
-                "Audio output failed and no fallback device is available.".to_string(),
-            );
-            // Close the Jellyfin play session like any other stop.
-            if self.status != PlaybackStatus::Idle {
-                self.report_stopped_playing();
+            Err(e) => {
+                tracing::error!("cannot open audio output: {e}");
+                self.output_alive = false;
+                self.report_error(PlayerErrorEvent::no_fallback_output(failed, &e));
+                // Close the Jellyfin play session like any other stop.
+                if self.status != PlaybackStatus::Idle {
+                    self.report_stopped_playing();
+                }
+                self.stop_internal();
             }
-            self.stop_internal();
         }
+    }
+
+    /// The configured device (`requested`, its stored id) does not play:
+    /// the system default stands in for it until Settings switches back.
+    fn mark_fallback(&self, requested: String) {
+        crate::audio_devices::mark_fallback(requested.clone());
+        let _ = self.app.emit(
+            "audio:output-fallback",
+            crate::audio_devices::AudioOutputFallbackEvent {
+                requested_device: self
+                    .playback
+                    .output_device_name
+                    .clone()
+                    .unwrap_or(requested),
+            },
+        );
+    }
+
+    /// Tell the error banner (`player:error`); the UI words it.
+    fn report_error(&self, event: PlayerErrorEvent) {
+        let _ = self.app.emit("player:error", event);
     }
 
     /// Swap the audio output and pick playback back up. Returns false (and
     /// keeps the previous output untouched) when the new device cannot open.
     fn try_rebuild_output(&mut self, device: Option<String>) -> bool {
-        match self.rebuild_output(device) {
+        match self.rebuild_output(device.clone()) {
             Ok(()) => true,
             Err(e) => {
                 tracing::error!("cannot open audio output: {e}");
-                let _ = self
-                    .app
-                    .emit("player:error", format!("Audio output failed: {e}"));
+                // Only the configured device is asked for by id here (a pick
+                // in Settings, "Switch back"); None is the system default.
+                let name = device.map(|id| {
+                    self.playback
+                        .output_device_name
+                        .clone()
+                        .filter(|_| self.playback.output_device.as_ref() == Some(&id))
+                        .unwrap_or(id)
+                });
+                self.report_error(PlayerErrorEvent::output_failed(name, &e));
                 false
             }
         }
@@ -4795,10 +5537,19 @@ impl Worker {
             open_output_named(&device, name.as_deref(), &self.tempo, self.tx.clone())?;
         crate::audio_devices::clear_fallback();
         let position_ms = self.position_ms();
-        // Dropping the old stream waits for its callback to return, which one
-        // stuck reading a stalled download never does: stop the downloads
-        // first. Every branch below lets go of these sources anyway.
-        self.current_download = None;
+        // The playing track's decoder thread and download go over to the new
+        // output, its source there starting at the position. Before the old
+        // output goes: that takes the old source along, and a decoder thread
+        // whose source is gone ends. The appended next track and a crossfade
+        // tail go with the old output. A paused track whose player went with
+        // an output closed for silence has no source to take along. Its ring
+        // comes at the new output's rate.
+        let carried = match self.status {
+            PlaybackStatus::Playing | PlaybackStatus::Paused if self.sink.is_some() => {
+                self.reposition(position_ms, output.rate())
+            }
+            _ => None,
+        };
         self.pending_download = None;
         self.fading_out = None;
         self.output = output;
@@ -4820,11 +5571,19 @@ impl Worker {
                 self.fading_out = None;
             }
             // An open in flight is tied to no output: its player joins
-            // whichever one is there when it lands (source_ready).
-            // Restarting it would lose a seek target, a pause pressed
-            // while it loads and the play session a reopen continues.
+            // whichever one is there when it lands (source_ready), moved to
+            // that output's rate (`refit`). Restarting it would lose a seek
+            // target, a pause pressed while it loads and the play session a
+            // reopen continues.
             PlaybackStatus::Loading => {}
-            PlaybackStatus::Playing | PlaybackStatus::Paused => self.restart_at(position_ms),
+            // A paused track whose player went with the output when that
+            // closed for silence has nothing on the old one: it comes back
+            // when it plays (resume_closed), on whatever output is there
+            // then — from its parked source, which no output holds.
+            PlaybackStatus::Paused if self.sink.is_none() => {}
+            PlaybackStatus::Playing | PlaybackStatus::Paused => {
+                self.reopen_at(position_ms, carried, position_ms);
+            }
         }
         Ok(())
     }
@@ -4840,11 +5599,13 @@ impl Worker {
         }
         self.last_default_poll = Instant::now();
         let fallback = crate::audio_devices::fallback_device();
-        if (self.playback.output_device.is_some() && fallback.is_none())
-            || !self.output_alive
-            || self.output_failed_pending
-            || self.last_output_rebuild.elapsed() < DEFAULT_OUTPUT_POLL
-        {
+        if !watches_default(
+            self.playback.output_device.is_none() || fallback.is_some(),
+            self.output.is_open(),
+            self.output_alive,
+            self.output_failed_pending,
+            self.last_output_rebuild.elapsed(),
+        ) {
             return;
         }
         let Some(default) = default_output_id() else {
@@ -4886,6 +5647,138 @@ impl Worker {
                 self.default_output_failed = Some(failed);
             }
         }
+    }
+
+    /// After every command and tick: close the output once nothing has been
+    /// audible, or about to be, for `IDLE_OUTPUT_CLOSE`.
+    fn watch_idle_output(&mut self) {
+        let silent = output_silent(
+            self.status,
+            self.fading_out.is_some() || !self.draining.is_empty(),
+            self.output_failed_pending,
+        );
+        if self.idle.due(self.output.is_open(), silent, Instant::now()) {
+            self.close_idle_output();
+        }
+    }
+
+    /// Close the output nobody has heard for a while, so that its stream
+    /// stops holding Windows awake. A paused track lets go of its player as
+    /// well — that player plays into this stream — and keeps its place, its
+    /// play session and what was heard of it: Play opens the output again
+    /// and brings the track back there (`resume_closed`). One that is all on
+    /// disk also keeps its decoder and download (`source::park`), so that it
+    /// resumes without the server, as a paused player would; anything else
+    /// is reloaded then. The device stays the active one, for Settings and
+    /// the sound profiles: it is what plays when the music goes on
+    /// (`reopen_output`).
+    fn close_idle_output(&mut self) {
+        let position_ms = self.position_ms();
+        // Before the player goes: the decoder thread moves to the parked
+        // ring while its source is still there. Parked already (closed
+        // once more after a device was picked), it stays as it is.
+        if self.parked.is_none() {
+            self.parked = self.park_current(position_ms);
+        }
+        // Nothing may join the closed stream: what is on its way is a
+        // prefetch at most, which a reload throws away anyway (restart_at).
+        self.generation = self.generation.wrapping_add(1);
+        self.release_sink();
+        self.draining.clear();
+        self.prefetched = None;
+        self.prefetch_inflight = None;
+        self.adoptable_prefetch = None;
+        self.appended = None;
+        self.pending_fade = None;
+        self.current_fade = None;
+        self.pending_tap = None;
+        self.current_tap = None;
+        self.pending_download = None;
+        self.current_download = None;
+        self.pending_play_session = None;
+        self.sleep_fade_item = None;
+        self.position_offset_ms = position_ms;
+        self.output.close();
+        // Whatever the closed stream still reports is none of ours
+        // (handle_output_failed).
+        self.output_dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.output_failed_pending = false;
+        tracing::info!(
+            "audio output closed after {} min of silence",
+            IDLE_OUTPUT_CLOSE.as_secs() / 60
+        );
+        if self.status == PlaybackStatus::Paused {
+            if self.parked.is_some() {
+                tracing::info!("the paused track keeps its download: Play resumes it from there");
+            } else {
+                tracing::info!("the paused track is reloaded on Play");
+            }
+        }
+        // The buffered range went with the download, unless it is parked.
+        self.emit();
+    }
+
+    /// The paused track's source, parked at `position_ms` for the output to
+    /// close under it (see `source::park`).
+    fn park_current(&self, position_ms: u64) -> Option<ParkedTrack> {
+        if self.status != PlaybackStatus::Paused || self.sink.is_none() {
+            return None;
+        }
+        let track = self.queue.get(self.index)?;
+        let source = source::park(
+            self.current_download.as_ref()?,
+            position_ms,
+            self.output.rate(),
+        )?;
+        Some(ParkedTrack {
+            entry_id: track.entry_id.clone(),
+            item_id: track.item_id.clone(),
+            source,
+        })
+    }
+
+    /// Open the output again for playback, after it closed for silence
+    /// (`close_idle_output`) or died with nothing to fall back on
+    /// (`handle_output_failed`). As at startup: the configured device, also
+    /// under a new id, else the system default — which then stands in for
+    /// it, with the toast. A fallback in place stays on the default: the
+    /// device coming back does not take playback back by itself (Settings
+    /// offers "Switch back"). "System default" opens what the default is
+    /// now, and the profile of the device that opens applies.
+    fn reopen_output(&mut self) -> AppResult<()> {
+        let mut step = ReopenStep::first(
+            self.playback.output_device.as_deref(),
+            self.playback.output_device_name.as_deref(),
+            crate::audio_devices::fallback_device().is_some(),
+        );
+        let (output, dead, opened) = loop {
+            let (device, name) = step.device();
+            match open_output_named(&device, name, &self.tempo, self.tx.clone()) {
+                Ok(opened) => break opened,
+                Err(e) => match step.after_failure() {
+                    Some(next) => {
+                        tracing::warn!("configured output device failed ({e}); using default");
+                        step = next;
+                    }
+                    None => return Err(e),
+                },
+            }
+        };
+        if let Some(requested) = step.stands_in_for() {
+            self.mark_fallback(requested.to_string());
+        }
+        self.output = output;
+        self.output_dead = dead;
+        self.output_alive = true;
+        self.output_failed_pending = false;
+        self.last_output_rebuild = Instant::now();
+        if let (true, Some(entry)) = (step.adopts(), &opened) {
+            if adopt_output_device(&mut self.playback, &entry.device) {
+                self.persist_playback();
+            }
+        }
+        self.output_opened(opened);
+        Ok(())
     }
 
     /// Whether `settings` ask for the configured device that plays now,
@@ -5009,6 +5902,8 @@ impl Worker {
     /// and dropping the ListenBrainz listen for the track being played.
     fn shutdown(&mut self) {
         self.save_volume();
+        // While the track is still there to say where it stands.
+        self.persist_position();
         let report = self.take_final_report(false);
         // Deliberately NOT stop_internal(): that ends in `emit()`, which
         // updates the tray, and the tray menu has to be touched on the main
@@ -5025,10 +5920,10 @@ impl Worker {
         self.fading_out = None;
         self.draining.clear();
         self.sink = None;
-        // Stopped before the output goes with the worker: its drop waits for
-        // a callback that may be waiting for one of these.
+        // The downloads stop, and their decoder threads with them.
         self.current_download = None;
         self.pending_download = None;
+        self.parked = None;
         self.status = PlaybackStatus::Idle;
         if let Some(report) = report {
             self.send_final_report(report);
@@ -5109,11 +6004,14 @@ impl Worker {
         if !self.extras.record_history {
             return false;
         }
+        let Some(owner) = listener(self.session_client().as_deref(), &self.store) else {
+            return false;
+        };
         let played_at = listen
             .ended_at
             .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
             .map(|since| since.as_millis() as i64);
-        match crate::history::record(&self.store, track, listen.listened_ms, played_at) {
+        match crate::history::record(&self.store, &owner, track, listen.listened_ms, played_at) {
             Ok(written) => written,
             Err(e) => {
                 tracing::warn!("play history not written: {e}");
@@ -5303,20 +6201,41 @@ impl Worker {
             .collect();
         heard.retain(|id| id != &request_track);
         heard.push(request_track.clone());
-        let sonic = (reason.kind == AutoDjSeedMode::Sonic).then(|| self.store.clone());
+        let sonic = (reason.kind == AutoDjSeedMode::Sonic)
+            .then(|| (self.store.clone(), crate::identity::Server::of(&client)));
         let tx = self.tx.clone();
+        let app = self.app.clone();
         tauri::async_runtime::spawn(async move {
+            // A revoked session (the device removed while the window sits in
+            // the tray): renewed the way every caller renews it, so the mix
+            // still arrives before the queue runs out.
+            let renew = |stale: Arc<JellyfinClient>, unauthorized| {
+                let app = app.clone();
+                async move {
+                    crate::commands::renew_session(&app, &stale, Instant::now(), unauthorized).await
+                }
+            };
+            let mut client = client;
             let mut reason = reason;
             let mut tracks = Vec::new();
-            if let Some(store) = sonic {
+            if let Some((store, server)) = sonic {
                 let exclude = existing.clone();
                 let ids = tokio::task::spawn_blocking(move || {
-                    crate::sonic::index(&store).continuation(&heard, max_tracks, &exclude)
+                    crate::sonic::index(&store, &server).continuation(&heard, max_tracks, &exclude)
                 })
                 .await
                 .unwrap_or_default();
                 if ids.len() >= 3 {
-                    match client.tracks_by_ids(&ids).await {
+                    let found = fetch_renewing(
+                        &mut client,
+                        |client| {
+                            let ids = ids.clone();
+                            async move { client.tracks_by_ids(&ids).await }
+                        },
+                        &renew,
+                    )
+                    .await;
+                    match found {
                         Ok(mut found) => {
                             let position =
                                 |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
@@ -5338,10 +6257,20 @@ impl Worker {
                 }
             }
             if tracks.is_empty() {
-                match client
-                    .instant_mix(&seed, (max_tracks as u32).saturating_mul(3))
-                    .await
-                {
+                let mix = fetch_renewing(
+                    &mut client,
+                    |client| {
+                        let seed = seed.clone();
+                        async move {
+                            client
+                                .instant_mix(&seed, (max_tracks as u32).saturating_mul(3))
+                                .await
+                        }
+                    },
+                    &renew,
+                )
+                .await;
+                match mix {
                     Ok(mix) => tracks = fresh_mix(mix, &existing, &heard_recordings, max_tracks),
                     Err(e) => tracing::warn!("auto-dj mix failed: {e}"),
                 }
@@ -5487,12 +6416,22 @@ impl Worker {
     }
 
     fn position_ms(&self) -> u64 {
-        self.position_offset_ms
-            + self
-                .sink
-                .as_ref()
-                .map(|s| s.get_pos().as_millis() as u64)
-                .unwrap_or(0)
+        let Some(sink) = &self.sink else {
+            return self.position_offset_ms;
+        };
+        // rodio counts the silence a source plays while its decoder has
+        // nothing for it (a stalled download, a seek on its way) as played;
+        // it is no media time. Past a gapless boundary not settled yet,
+        // rodio counts for the appended source already.
+        let playing = if self.appended.is_some() && sink.len() <= 1 {
+            &self.pending_download
+        } else {
+            &self.current_download
+        };
+        let silence = playing
+            .as_ref()
+            .map_or(Duration::ZERO, |download| download.silence());
+        self.position_offset_ms + sink.get_pos().saturating_sub(silence).as_millis() as u64
     }
 
     fn seek_ms(&mut self, position_ms: u64) {
@@ -5522,30 +6461,43 @@ impl Worker {
                     self.position_offset_ms = position_ms;
                     self.emit();
                 }
+                // Paused, its player gone with the output closed for
+                // silence: the target is where Play brings it back
+                // (resume_closed). The jump there is not listening.
+                PlaybackStatus::Paused if self.index < self.queue.len() => {
+                    self.position_offset_ms = position_ms;
+                    self.listen.rebase(Instant::now(), position_ms);
+                    self.report_progress(true);
+                    self.update_media_playback();
+                    self.emit();
+                }
                 _ => {}
             }
             return;
         };
-        // Seek natively only when the whole file is on disk. rodio carries out
-        // a native seek on the audio callback, and a decoder there waiting for
-        // the server to deliver the target range stalls all audio — and this
-        // thread, which waits for the callback. Anything else reopens the
-        // stream at the target, positioned on the open thread (`restart_at`);
-        // a live transcode always goes that way. A dead output never runs the
-        // callback at all.
-        let downloaded = self
+        // The source's decoder thread carries out the seek: rodio hands it to
+        // the source on the audio callback, which passes it on and plays
+        // silence until the target's audio is decoded. Wherever the download
+        // stands — the decoder steers it to the target and reads what is on
+        // disk. A live transcode cannot seek and is reopened at the target
+        // (`restart_at`), as is a source on a dead output, whose callback
+        // never runs.
+        let seekable = self
             .current_download
             .as_ref()
-            .is_some_and(|download| download.is_complete());
+            .is_some_and(|download| download.seekable());
         let output_dead = self.output_dead.load(std::sync::atomic::Ordering::Relaxed);
         // During the silence in front of a beat transition, a native seek
         // would position the silence, not the track.
         let in_lead = self
             .lead_until
             .is_some_and(|until| Instant::now() < until + Duration::from_millis(50));
-        if downloaded && !output_dead && !in_lead {
+        if seekable && !output_dead && !in_lead {
             match sink.try_seek(Duration::from_millis(position_ms)) {
                 Ok(()) => {
+                    if let Some(download) = &self.current_download {
+                        download.wake_decoder();
+                    }
                     // rodio's position now reads the absolute target, also for
                     // a source that was reopened mid-track.
                     self.position_offset_ms = 0;
@@ -5572,17 +6524,71 @@ impl Worker {
     }
 
     /// Reopen the current track at `position_ms` (seek on a live transcode, a
-    /// new output device). A transcode starts there via `startTimeTicks`, a
-    /// direct-play file is positioned on the open thread; the offset tracks
-    /// media time either way.
+    /// new output device). A direct-play source keeps its decoder thread and
+    /// download, positioned anew (`source::reposition`); a transcode starts
+    /// there via `startTimeTicks`, and anything else that cannot be
+    /// repositioned is opened anew and positioned on the open thread. The
+    /// offset tracks media time either way.
     fn restart_at(&mut self, position_ms: u64) {
+        // Before the decoder moves on: what rodio counted as played then.
+        let played_to = self.position_ms();
+        let carried = self.reposition(position_ms, self.output.rate());
+        self.reopen_at(position_ms, carried, played_to);
+    }
+
+    /// The current source once more, at `position_ms` and at `rate` (an
+    /// output's), from its own decoder thread and download — when it can be
+    /// (see `source::reposition`).
+    fn reposition(&self, position_ms: u64, rate: rodio::SampleRate) -> Option<OpenedSource> {
+        let track = self.queue.get(self.index)?;
+        let download = self.current_download.as_ref()?;
+        source::reposition(
+            download,
+            position_ms,
+            rate,
+            self.dsp.clone(),
+            self.normalization_gain_for(track),
+            self.tap.clone(),
+        )
+    }
+
+    /// `opened` at the output's rate. A source opened for an output that was
+    /// replaced by one at another rate while it loaded is moved onto a new
+    /// ring of the same decoder, resampled for this one, where it starts
+    /// (`start_ms`). One that cannot be repositioned (a live transcode) stays
+    /// as it is: the player's way into the mixer converts its rate then,
+    /// linearly, as rodio did for every track before.
+    fn refit(&self, track: &QueueTrack, opened: OpenedSource) -> OpenedSource {
+        use rodio::Source as _;
+        let rate = self.output.rate();
+        if opened.source.sample_rate() == rate {
+            return opened;
+        }
+        tracing::debug!(
+            "a source opened at {} Hz lands on an output at {rate} Hz",
+            opened.source.sample_rate()
+        );
+        source::reposition(
+            &opened.download,
+            opened.start_ms,
+            rate,
+            self.dsp.clone(),
+            self.normalization_gain_for(track),
+            self.tap.clone(),
+        )
+        .unwrap_or(opened)
+    }
+
+    /// [`Self::restart_at`], with the repositioned source when there is one;
+    /// `played_to` is where the current source stood before that.
+    fn reopen_at(&mut self, position_ms: u64, carried: Option<OpenedSource>, played_to: u64) {
         let Some(track) = self.queue.get(self.index).cloned() else {
             return;
         };
         let resume_paused = self.status == PlaybackStatus::Paused;
         // Listening continues from the target; the jump there is not counted.
         self.listen
-            .sample_at(Instant::now(), self.position_ms(), self.tempo.speed());
+            .sample_at(Instant::now(), played_to, self.tempo.speed());
         self.listen.rebase(Instant::now(), position_ms);
         self.generation = self.generation.wrapping_add(1);
         self.release_sink();
@@ -5604,6 +6610,22 @@ impl Worker {
         self.pending_pause = resume_paused;
         // Show the seek target while loading (get_pos is gone with the sink).
         self.position_offset_ms = position_ms;
+        if let Some(opened) = carried {
+            // Ready at once: the same attempt, the same play session.
+            let play_session = self
+                .play_session_id
+                .clone()
+                .unwrap_or_else(new_play_session);
+            self.source_ready(
+                self.generation,
+                self.prefetch_generation,
+                OpenPurpose::SeekRestart { position_ms },
+                track,
+                play_session,
+                Ok(Box::new(opened)),
+            );
+            return;
+        }
         self.status = PlaybackStatus::Loading;
         self.emit();
         self.spawn_open(OpenPurpose::SeekRestart { position_ms }, track);
@@ -5688,6 +6710,7 @@ impl Worker {
         let RestoredQueue {
             mut tracks,
             index,
+            position_ms,
             order,
         } = restored;
         // Lines persisted before entry ids existed get one now, so from here
@@ -5701,6 +6724,9 @@ impl Worker {
         *self.queue_mut() = tracks;
         self.index = index.min(self.queue.len().saturating_sub(1));
         self.status = PlaybackStatus::Idle;
+        // Play starts the track there, as after a seek made while nothing
+        // played. An index the list no longer reaches starts its track anew.
+        self.position_offset_ms = if self.index == index { position_ms } else { 0 };
         if self.shuffle {
             // The order it was playing in: what was heard stays heard, and
             // what was put next stays next.
@@ -5731,6 +6757,7 @@ impl Worker {
                 let entry = PersistedQueueIndex {
                     snapshot_id: written.snapshot_id.clone(),
                     index: self.index,
+                    position_ms: None,
                 };
                 if let Ok(json) = serde_json::to_string(&entry) {
                     if self.store.set(keys::QUEUE_INDEX, &json).is_ok() {
@@ -5779,10 +6806,12 @@ impl Worker {
         // reopened at a position or not (Jellyfin ignores startTimeTicks there
         // and sends the file from its start). A live transcode — the only
         // stream that starts mid-track — has no length, so no fraction.
-        let buffered_ms = buffered_range_ms(
-            self.current_download.as_ref().and_then(|d| d.fraction()),
-            duration_ms,
-        );
+        // A track parked while the output is closed is all on disk still.
+        let download = self
+            .current_download
+            .as_ref()
+            .or_else(|| self.parked.as_ref().map(|p| p.source.download()));
+        let buffered_ms = buffered_range_ms(download.and_then(|d| d.fraction()), duration_ms);
         let state = PlayerState {
             status: self.status,
             pending_pause: arrives_paused(self.status, self.pending_pause),
@@ -5857,9 +6886,7 @@ fn open_output_named(
         Some(stored) => {
             let mut outputs = list_outputs()?;
             let index = resolve_output(stored, name, outputs.iter().map(|(_, entry)| entry))
-                .ok_or_else(|| {
-                    AppError::Audio("the selected output device is not connected".into())
-                })?;
+                .ok_or_else(|| AppError::Audio(errors::OUTPUT_DEVICE_MISSING.into()))?;
             let (device, entry) = outputs.swap_remove(index);
             let builder = rodio::stream::DeviceSinkBuilder::from_device(device)
                 .map_err(|e| AppError::Audio(format!("cannot use output device: {e}")))?;
@@ -5868,7 +6895,7 @@ fn open_output_named(
         None => {
             let device = rodio::cpal::default_host()
                 .default_output_device()
-                .ok_or_else(|| AppError::Audio("no default output device".into()))?;
+                .ok_or_else(|| AppError::Audio(errors::NO_OUTPUT_DEVICE.into()))?;
             let entry = describe_output(&device);
             let builder = rodio::stream::DeviceSinkBuilder::from_device(device)
                 .map_err(|e| AppError::Audio(format!("cannot open default output: {e}")))?;
@@ -5877,7 +6904,7 @@ fn open_output_named(
     };
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = dead.clone();
-    let sink = builder
+    let mut sink = builder
         .with_error_callback(move |err| {
             tracing::warn!("audio stream error: {err}");
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5885,32 +6912,66 @@ fn open_output_named(
         })
         .open_stream()
         .map_err(|e| AppError::Audio(format!("cannot open audio output: {e}")))?;
+    // Closing it is routine (`Output::close`), not worth a line on stderr.
+    sink.log_on_drop(false);
     // The players mix into a mixer of their own, at the device's format,
     // which reaches the device through the tempo stage and the limiter: the
     // last stage keeps whatever the mix adds up to under full scale.
-    let (mixer, mixed) =
-        rodio::mixer::mixer(sink.config().channel_count(), sink.config().sample_rate());
+    let (channels, rate) = (sink.config().channel_count(), sink.config().sample_rate());
+    let (mixer, mixed) = rodio::mixer::mixer(channels, rate);
     sink.mixer().add(limiter::wrap(tempo::wrap(mixed, tempo)));
+    tracing::debug!("audio output at {rate} Hz, {channels} channels");
     Ok((
         Output {
-            mixer,
-            _device: sink,
+            mix: Mix {
+                mixer,
+                channels,
+                rate,
+            },
+            device: Some(sink),
         },
         dead,
         opened,
     ))
 }
 
-/// An open output: the device, and the mixer the players connect to.
+/// An output: the device stream, and the mixer the players connect to.
+/// Closed after a while of silence (`Worker::close_idle_output`), it holds no
+/// stream, and its mixer reaches nothing. No player joins it then: every way
+/// into Loading opens the output again first (`Worker::reopen_output`).
 struct Output {
-    mixer: rodio::mixer::Mixer,
-    _device: rodio::stream::MixerDeviceSink,
+    mix: Mix,
+    device: Option<rodio::stream::MixerDeviceSink>,
 }
 
 impl Output {
-    fn mixer(&self) -> &rodio::mixer::Mixer {
-        &self.mixer
+    fn mix(&self) -> &Mix {
+        &self.mix
     }
+
+    /// The rate everything is mixed at: what the tracks are resampled to.
+    /// A closed output keeps the one it had; whatever plays next opens an
+    /// output first, at its own.
+    fn rate(&self) -> rodio::SampleRate {
+        self.mix.rate
+    }
+
+    fn is_open(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Stop the stream and let go of the device. The players on the mixer
+    /// go with it.
+    fn close(&mut self) {
+        self.device = None;
+    }
+}
+
+/// The mixer the players join, and the format it mixes in.
+struct Mix {
+    mixer: rodio::mixer::Mixer,
+    channels: rodio::ChannelCount,
+    rate: rodio::SampleRate,
 }
 
 /// Output devices for the settings UI.
@@ -6092,6 +7153,185 @@ fn should_follow_default(
     active != Some(default)
         && failed.is_none_or(|failed| failed.retry(default))
         && standing_in_for != Some(default)
+}
+
+/// Whether the tick looks for a new default device at all: for "system
+/// default" or a fallback (`follows`), on an output that is open and healthy,
+/// and not right after it was rebuilt. An output closed for silence opens
+/// whatever the default is when the music goes on; following the default
+/// meanwhile would open a stream nobody hears.
+fn watches_default(
+    follows: bool,
+    open: bool,
+    alive: bool,
+    failure_pending: bool,
+    since_rebuild: Duration,
+) -> bool {
+    follows && open && alive && !failure_pending && since_rebuild >= DEFAULT_OUTPUT_POLL
+}
+
+/// Whether nothing is audible or about to be: paused or stopped, with no
+/// player still ramping out (`fading`: a crossfade tail, a release) and no
+/// output failure waiting for its retry. A load is about to play.
+fn output_silent(status: PlaybackStatus, fading: bool, failure_pending: bool) -> bool {
+    matches!(status, PlaybackStatus::Paused | PlaybackStatus::Idle) && !fading && !failure_pending
+}
+
+/// The source a paused track kept when the output closed under it
+/// (`Worker::close_idle_output`), and the queue entry it belongs to.
+struct ParkedTrack {
+    entry_id: String,
+    item_id: String,
+    source: source::Parked,
+}
+
+impl ParkedTrack {
+    /// It is `track`'s: the same entry, not just another copy of the song.
+    fn holds(&self, track: &QueueTrack) -> bool {
+        track.entry_id == self.entry_id && track.item_id == self.item_id
+    }
+}
+
+/// Whether a parked source is still wanted (`Worker::drop_stale_parked`):
+/// its track is the current one (`holds`), paused, and has no player — the
+/// output closed under it, and Play has not brought it back yet. A device
+/// opened meanwhile (one picked in Settings) changes none of that.
+fn keeps_parked(status: PlaybackStatus, has_player: bool, holds: bool) -> bool {
+    status == PlaybackStatus::Paused && !has_player && holds
+}
+
+/// How long the open output has played nothing (`Worker::watch_idle_output`).
+#[derive(Debug, Default)]
+struct IdleClock {
+    since: Option<Instant>,
+}
+
+impl IdleClock {
+    /// Look at the output at `now`: whether it is open, and silent
+    /// ([`output_silent`]). True once it has been both for
+    /// [`IDLE_OUTPUT_CLOSE`]: it closes now.
+    fn due(&mut self, open: bool, silent: bool, now: Instant) -> bool {
+        if !open || !silent {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) < IDLE_OUTPUT_CLOSE {
+            return false;
+        }
+        self.since = None;
+        true
+    }
+
+    /// A stream opened: its silence counts from now.
+    fn reset(&mut self) {
+        self.since = None;
+    }
+}
+
+/// One attempt of an output opened again for playback
+/// (`Worker::reopen_output`), as at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReopenStep {
+    /// The configured device: by its stored id, or by its name as last seen
+    /// should Windows list it under a new id. Opened, it keeps the id it
+    /// opened under (`adopt_output_device`).
+    Configured { id: String, name: Option<String> },
+    /// The system default, as itself: "system default" is the setting, or
+    /// the default stands in for the configured device already.
+    Default,
+    /// The system default standing in for the configured device `requested`
+    /// (its stored id), which did not open: marked as a fallback, with the
+    /// toast, until Settings switches back.
+    FallBack { requested: String },
+}
+
+impl ReopenStep {
+    /// What to try first. A fallback stays on the default: the device coming
+    /// back does not take playback back by itself.
+    fn first(configured: Option<&str>, name: Option<&str>, fallback_active: bool) -> Self {
+        match configured {
+            Some(id) if !fallback_active => Self::Configured {
+                id: id.to_string(),
+                name: name.map(str::to_string),
+            },
+            _ => Self::Default,
+        }
+    }
+
+    /// What to try once this did not open; None: the reopen failed.
+    fn after_failure(&self) -> Option<Self> {
+        match self {
+            Self::Configured { id, .. } => Some(Self::FallBack {
+                requested: id.clone(),
+            }),
+            Self::Default | Self::FallBack { .. } => None,
+        }
+    }
+
+    /// The device to open, and the name to find it by, for
+    /// [`open_output_named`]; None is the system default.
+    fn device(&self) -> (Option<String>, Option<&str>) {
+        match self {
+            Self::Configured { id, name } => (Some(id.clone()), name.as_deref()),
+            Self::Default | Self::FallBack { .. } => (None, None),
+        }
+    }
+
+    /// Whether the device that opened is the configured one, whose id is
+    /// then stored as it opened.
+    fn adopts(&self) -> bool {
+        matches!(self, Self::Configured { .. })
+    }
+
+    /// The configured device the opened default stands in for, to mark as a
+    /// fallback (with the toast).
+    fn stands_in_for(&self) -> Option<&str> {
+        match self {
+            Self::FallBack { requested } => Some(requested),
+            Self::Configured { .. } | Self::Default => None,
+        }
+    }
+}
+
+/// What a reopen at a position that did not open leaves
+/// (`Worker::reopen_failed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedReopen {
+    /// It resumed a paused track whose player went with the idle close
+    /// (`resume_closed`): paused again where it was, in the same play
+    /// session, with what was heard of it, for Play to try again. Closing
+    /// the session here would make one listen two — two history rows, two
+    /// scrobbles — once the next Play started a new one.
+    StayPaused,
+    /// A reopen of a track reported started (a seek in a transcode, a device
+    /// switch, a broken stream picked up): its session is closed like at any
+    /// stop, and the track stops where it was to start.
+    CloseSession,
+    /// An open at a position before the track was reported started (Play
+    /// from a seek target while stopped): it simply failed.
+    Fail,
+}
+
+/// [`FailedReopen`] for a reopen that did not open. `resuming`: it was the
+/// reload of a paused track after the idle close (`Worker::fade_in_arrival`);
+/// `reported`: its play session was reported started.
+fn failed_reopen(resuming: bool, reported: bool) -> FailedReopen {
+    if resuming {
+        FailedReopen::StayPaused
+    } else if reported {
+        FailedReopen::CloseSession
+    } else {
+        FailedReopen::Fail
+    }
+}
+
+/// Whether an `OutputFailed` is one to act on: from the stream that plays
+/// now (its error callback set `dead`), not from one replaced since, and not
+/// while the output is closed for silence — a stream closed on purpose
+/// failed nobody.
+fn output_failure_counts(open: bool, dead: bool) -> bool {
+    open && dead
 }
 
 #[cfg(test)]
@@ -6418,6 +7658,162 @@ mod output_tests {
     }
 
     #[test]
+    fn the_idle_clock_fires_once_after_the_whole_while_of_open_silence() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let close = IDLE_OUTPUT_CLOSE.as_secs();
+        let mut clock = IdleClock::default();
+        // Open and silent: not yet.
+        assert!(!clock.due(true, true, t0));
+        assert!(!clock.due(true, true, at(close - 1)));
+        // Silent for the whole while: due now, once.
+        assert!(clock.due(true, true, at(close)));
+        // Closed, it is never due again, however long the silence goes on.
+        assert!(!clock.due(false, true, at(close + 1)));
+        assert!(!clock.due(false, true, at(10 * close)));
+    }
+
+    #[test]
+    fn silence_is_paused_or_stopped_with_nothing_ramping_or_failing() {
+        use PlaybackStatus::*;
+        assert!(output_silent(Paused, false, false));
+        assert!(output_silent(Idle, false, false));
+        // Playing, or loading to play, is not; neither is a crossfade tail
+        // or a release still ramping out, nor a failure waiting for its
+        // retry.
+        assert!(!output_silent(Playing, false, false));
+        assert!(!output_silent(Loading, false, false));
+        assert!(!output_silent(Idle, true, false));
+        assert!(!output_silent(Paused, true, false));
+        assert!(!output_silent(Paused, false, true));
+    }
+
+    #[test]
+    fn a_parked_source_is_kept_only_while_its_track_waits_paused_without_a_player() {
+        use PlaybackStatus::*;
+        // Closed under the paused track, before Play: kept.
+        assert!(keeps_parked(Paused, false, true));
+        // Play brought it back (it has a player again, or it loads), it was
+        // stopped, or another track or entry is current now: let go of.
+        assert!(!keeps_parked(Paused, true, true));
+        assert!(!keeps_parked(Loading, false, true));
+        assert!(!keeps_parked(Playing, true, true));
+        assert!(!keeps_parked(Idle, false, true));
+        assert!(!keeps_parked(Paused, false, false));
+    }
+
+    #[test]
+    fn the_idle_clock_starts_over_after_a_moment_of_sound() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let close = IDLE_OUTPUT_CLOSE.as_secs();
+        let mut clock = IdleClock::default();
+        assert!(!clock.due(true, true, t0));
+        assert!(!clock.due(true, false, at(close - 10)));
+        assert!(!clock.due(true, true, at(close - 9)));
+        assert!(!clock.due(true, true, at(close + 60)));
+        assert!(clock.due(true, true, at(2 * close - 9)));
+    }
+
+    #[test]
+    fn a_reset_idle_clock_counts_from_its_next_look() {
+        // What `output_opened` does for a stream opened during a long
+        // pause (a device picked in Settings): it gets a whole while.
+        let t0 = Instant::now();
+        let close = IDLE_OUTPUT_CLOSE.as_secs();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut clock = IdleClock::default();
+        assert!(!clock.due(true, true, t0));
+        clock.reset();
+        assert!(!clock.due(true, true, at(close)));
+        assert!(!clock.due(true, true, at(2 * close - 1)));
+        assert!(clock.due(true, true, at(2 * close)));
+    }
+
+    #[test]
+    fn a_reopen_tries_the_configured_device_by_id_and_name_then_the_default() {
+        let name = Some("Speakers (Focusrite USB Audio)");
+        let first = ReopenStep::first(Some("wasapi:{44k}"), name, false);
+        // By its id, and by the name it was last seen under, should Windows
+        // list it under a new one: what opens keeps the id it opened under.
+        assert_eq!(first.device(), (Some("wasapi:{44k}".to_string()), name));
+        assert!(first.adopts());
+        assert_eq!(first.stands_in_for(), None);
+        // It did not open: the default stands in, marked as a fallback for
+        // the configured device (the toast names it), with no id adopted.
+        let fallback = first.after_failure().expect("the default is tried next");
+        assert_eq!(fallback.device(), (None, None));
+        assert_eq!(fallback.stands_in_for(), Some("wasapi:{44k}"));
+        assert!(!fallback.adopts());
+        // And when that does not open either, the reopen fails.
+        assert_eq!(fallback.after_failure(), None);
+    }
+
+    #[test]
+    fn a_reopen_for_system_default_or_a_fallback_opens_the_default_as_itself() {
+        // "System default": whatever the default is by then, nothing to
+        // adopt or to mark, and nothing after it.
+        let default = ReopenStep::first(None, None, false);
+        assert_eq!(default, ReopenStep::Default);
+        assert_eq!(default.device(), (None, None));
+        assert!(!default.adopts());
+        assert_eq!(default.stands_in_for(), None);
+        assert_eq!(default.after_failure(), None);
+        // The default stood in for the device before the close: it goes on
+        // standing in, also when the device is back by then (switching back
+        // is the user's call), and is not marked or announced again.
+        let standing_in = ReopenStep::first(Some("wasapi:{dac}"), Some("USB DAC"), true);
+        assert_eq!(standing_in, ReopenStep::Default);
+        assert_eq!(standing_in.stands_in_for(), None);
+    }
+
+    #[test]
+    fn a_failed_resume_after_the_close_stays_paused_in_its_session() {
+        // Play after the idle close could not reload the track: paused
+        // again where it was, the session open, the listen one listen.
+        assert_eq!(failed_reopen(true, true), FailedReopen::StayPaused);
+        assert_eq!(failed_reopen(true, false), FailedReopen::StayPaused);
+        // Any other reopen of a track reported started closes its session;
+        // one before any start report just fails.
+        assert_eq!(failed_reopen(false, true), FailedReopen::CloseSession);
+        assert_eq!(failed_reopen(false, false), FailedReopen::Fail);
+    }
+
+    #[test]
+    fn a_failure_counts_only_when_the_open_stream_died() {
+        // The stream that plays died: handled.
+        assert!(output_failure_counts(true, true));
+        // The error of a stream replaced since: not.
+        assert!(!output_failure_counts(true, false));
+        // Closed for silence: whatever the old stream still reports, there
+        // is nothing to fall back from.
+        assert!(!output_failure_counts(false, true));
+        assert!(!output_failure_counts(false, false));
+    }
+
+    #[test]
+    fn the_default_is_watched_only_on_an_open_healthy_output() {
+        let settled = DEFAULT_OUTPUT_POLL;
+        // "System default" (or a fallback) on an open, healthy output.
+        assert!(watches_default(true, true, true, false, settled));
+        // Closed for silence: no stream for a new default; Play opens
+        // whatever the default is then.
+        assert!(!watches_default(true, false, true, false, settled));
+        // As before: a configured device, a dead output, a failure waiting
+        // for its retry, a rebuild a moment ago.
+        assert!(!watches_default(false, true, true, false, settled));
+        assert!(!watches_default(true, true, false, false, settled));
+        assert!(!watches_default(true, true, true, true, settled));
+        assert!(!watches_default(
+            true,
+            true,
+            true,
+            false,
+            Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
     fn a_fallback_follows_the_default_but_not_back_to_its_device() {
         let (dac, bt, speakers) = ("wasapi:{dac}", "wasapi:{bt}", "wasapi:{speakers}");
         // Standing in for the DAC on the speakers: headphones that become
@@ -6494,10 +7890,11 @@ pub fn load_persisted_queue(store: &Store) -> Option<RestoredQueue> {
         let _ = store.delete(keys::QUEUE_INDEX);
         return None;
     }
-    let index = restored_index(&snapshot, store.get(keys::QUEUE_INDEX).as_deref());
+    let (index, position_ms) = restored_index(&snapshot, store.get(keys::QUEUE_INDEX).as_deref());
     Some(RestoredQueue {
         tracks: snapshot.tracks,
         index,
+        position_ms,
         order: snapshot.order,
     })
 }
@@ -6516,7 +7913,8 @@ mod tests {
         PlaybackStatus, PlayerCommand, QueueTrack, QueueWrite, ShuffleMode, StopAfter, TickClock,
         AUTO_DJ_ATTEMPTS, AUTO_DJ_RETRY_AFTER, TICK,
     };
-    use super::{sleep_fade_step, stream_broke_off, SleepFadeStep};
+    use super::{listener, sleep_fade_step, stream_broke_off, Mix, SleepFadeStep};
+    use crate::api::JellyfinClient;
     use crate::store::{keys, Store};
     use proptest::prelude::*;
     use rodio::buffer::SamplesBuffer;
@@ -7219,6 +8617,7 @@ mod tests {
             PlayerCommand::RestoreQueue(super::RestoredQueue {
                 tracks: vec![queue_track("old")],
                 index: 0,
+                position_ms: 0,
                 order: None,
             }),
         );
@@ -7306,9 +8705,14 @@ mod tests {
         let rate = rodio::SampleRate::new(48_000).unwrap();
         let stereo = rodio::ChannelCount::new(2).unwrap();
         let (mixer, mixed) = rodio::mixer::mixer(stereo, rate);
+        let mix = Mix {
+            mixer,
+            channels: stereo,
+            rate,
+        };
         // Left and right apart, so a channel mix-up shows.
         let frames: Vec<f32> = (0..2_000).flat_map(|_| [0.5, -0.5]).collect();
-        let _player = start_player(&mixer, 1.0, false, |player| {
+        let _player = start_player(&mix, 1.0, false, |player| {
             player.append(SamplesBuffer::new(stereo, rate, frames))
         });
         let out: Vec<f32> = mixed.take(2_000).collect();
@@ -7325,7 +8729,12 @@ mod tests {
         let rate = rodio::SampleRate::new(48_000).unwrap();
         let mono = rodio::ChannelCount::new(1).unwrap();
         let (mixer, mixed) = rodio::mixer::mixer(mono, rate);
-        let _player = start_player(&mixer, 1.0, true, |player| {
+        let mix = Mix {
+            mixer,
+            channels: mono,
+            rate,
+        };
+        let _player = start_player(&mix, 1.0, true, |player| {
             player.append(SamplesBuffer::new(mono, rate, vec![0.5; 4_000]))
         });
         assert!(mixed.take(2_000).all(|sample| sample == 0.0));
@@ -7935,10 +9344,10 @@ mod tests {
             r#"{"tracks":[],"index":2,"server_url":"https://music.home","user_id":"u"}"#,
         )
         .unwrap();
-        assert_eq!(restored_index(&old, None), 2);
+        assert_eq!(restored_index(&old, None), (2, 0));
         assert_eq!(
             restored_index(&old, Some(r#"{"snapshot_id":"a","index":5}"#)),
-            2
+            (2, 0)
         );
 
         let json = serde_json::to_string(&PersistedQueue {
@@ -7951,17 +9360,43 @@ mod tests {
         })
         .unwrap();
         let current: PersistedQueue = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored_index(&current, None), 2);
+        assert_eq!(restored_index(&current, None), (2, 0));
         assert_eq!(
             restored_index(&current, Some(r#"{"snapshot_id":"a","index":5}"#)),
-            5
+            (5, 0),
+            "an entry from before positions were saved"
         );
         assert_eq!(
-            restored_index(&current, Some(r#"{"snapshot_id":"b","index":5}"#)),
-            2,
+            restored_index(
+                &current,
+                Some(r#"{"snapshot_id":"a","index":5,"position_ms":83500}"#)
+            ),
+            (5, 83_500)
+        );
+        assert_eq!(
+            restored_index(
+                &current,
+                Some(r#"{"snapshot_id":"b","index":5,"position_ms":83500}"#)
+            ),
+            (2, 0),
             "left over from an earlier track list"
         );
-        assert_eq!(restored_index(&current, Some("not json")), 2);
+        assert_eq!(restored_index(&current, Some("not json")), (2, 0));
+    }
+
+    #[test]
+    fn a_track_change_drops_the_saved_position() {
+        // The index entry written on a track change says nothing about a
+        // position: the new track starts from the beginning.
+        let entry = super::PersistedQueueIndex {
+            snapshot_id: "a".into(),
+            index: 3,
+            position_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"snapshot_id":"a","index":3}"#
+        );
     }
 
     #[test]
@@ -8007,6 +9442,43 @@ mod tests {
         assert!(load_persisted_queue(&store).is_none(), "another account");
         assert!(store.get(keys::QUEUE).is_none());
         assert!(store.get(keys::QUEUE_INDEX).is_none());
+    }
+
+    #[test]
+    fn a_listen_after_the_server_ended_the_session_still_has_its_account() {
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("sonarune-listener-{}", uuid::Uuid::new_v4())),
+        );
+        let store = Store::open(&dir.0).unwrap();
+        store.set(keys::SERVER_URL, "https://music.home").unwrap();
+        store.set(keys::USER_ID, "u1").unwrap();
+        store.record_server("https://music.home", "s1").unwrap();
+        // The session's own account, on the session's server.
+        let mut client = JellyfinClient::new("https://other.home", "test", Vec::new())
+            .unwrap()
+            .with_session("token".into(), "u2".into());
+        client.set_server_id(Some("s2".into()));
+        let owner = listener(Some(&client), &store).unwrap();
+        assert_eq!(
+            (owner.user.as_str(), owner.server.id.as_deref()),
+            ("u2", Some("s2"))
+        );
+        // Ended by the server: the track plays on, and the account the
+        // store names is still the one listening.
+        let owner = listener(None, &store).unwrap();
+        assert_eq!(
+            (owner.user.as_str(), owner.server.id.as_deref()),
+            ("u1", Some("s1"))
+        );
+        // Signed out: nobody's.
+        store.delete(keys::USER_ID).unwrap();
+        assert!(listener(None, &store).is_none());
     }
 
     #[test]

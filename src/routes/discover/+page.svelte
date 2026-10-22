@@ -8,6 +8,7 @@
     type DiscoverRow,
     type SimilarArtistsRow,
   } from "#lib/api/discovery.js";
+  import { errorCause, errorReport } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import LibraryAlbumCard from "#lib/components/LibraryAlbumCard.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
@@ -80,16 +81,16 @@
       saveRow("discover:decades", decades);
     } catch (cause) {
       if (seq !== generation) return;
-      const message = String(cause);
-      randomAlbums = { items: randomAlbums?.items ?? [], error: message };
-      genres = { items: genres?.items ?? [], error: message };
-      mixSeeds = { items: mixSeeds?.items ?? [], error: message };
+      const error = errorReport(cause);
+      randomAlbums = { items: randomAlbums?.items ?? [], error };
+      genres = { items: genres?.items ?? [], error };
+      mixSeeds = { items: mixSeeds?.items ?? [], error };
       similarArtists = {
         seed: similarArtists?.seed ?? null,
         items: similarArtists?.items ?? [],
-        error: message,
+        error,
       };
-      decades = { items: decades?.items ?? [], error: message };
+      decades = { items: decades?.items ?? [], error };
     }
   }
 
@@ -105,7 +106,7 @@
       saveRow("discover:long-not-heard", longNotHeard);
     } catch (cause) {
       if (seq !== longNotHeardGeneration) return;
-      longNotHeard = { items: longNotHeard?.items ?? [], error: String(cause) };
+      longNotHeard = { items: longNotHeard?.items ?? [], error: errorReport(cause) };
     }
   }
 
@@ -189,7 +190,7 @@
 {#snippet rowState(row: DiscoverRow<unknown> | null)}
   {#if row?.error}
     <div class="mb-3 flex items-center gap-3 rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
-      <span>{m.discover_section_error({ message: row.error })}</span>
+      <span>{m.discover_section_error({ message: errorCause(row.error) })}</span>
       <button class="ml-auto shrink-0 font-bold underline" onclick={load}>{m.discover_retry()}</button>
     </div>
   {/if}

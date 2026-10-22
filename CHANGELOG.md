@@ -7,58 +7,72 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-23
+
+0.6.1 was never released; everything it would have brought is part of 0.7.0.
+
 ### Added
 
-- **Play history.** Sonarune now records every track you listen to (by the
-  ListenBrainz rule: half the track or four minutes), on this computer only,
-  per server and account. The new *History* page shows it as a timeline by
-  day, folds a track played several times in a row into one row, pages back
-  in time and plays a track again on click. Single entries or the whole
-  history can be removed, and recording can be switched off in the settings.
-- **Sonic similarity, without a server plugin.** Sonarune's own audio analysis
-  now also measures how a track sounds (timbre, brightness, attack, dynamics)
-  next to its tempo and key, and can analyse the whole library in the
-  background (Settings → Sonic similarity; off by default, two tracks at a
-  time, each fetched as a small transcode). On top of it: a **sonic radio**
-  from any track, a **sonic path** that walks from one track to another in
-  ten steps (right-click "Sonic path from here…", then "… here" on the
-  destination), and an Auto-DJ mode that continues **by sound**, following
-  where the last few tracks have gone. Tracks you play are analysed anyway.
-- **Year in review**, built from that history: plays, listening time, how
-  many different tracks and artists, the most played artists, albums and
-  tracks, and plays per month. A year the history only started in says so.
+- **Play history.** Every track you listen to is recorded on this computer
+  (by the ListenBrainz rule: half the track or four minutes). The *History*
+  page shows it by day and plays a track again on click; entries can be
+  removed and recording switched off. A **year in review** is built from it.
+- **Sonic similarity, without a server plugin.** Sonarune analyses how your
+  tracks sound (Settings → Sonic similarity, off by default) and offers a
+  **sonic radio** from any track, a **sonic path** from one track to another,
+  and an Auto-DJ mode that continues **by sound**.
+- **A beta channel** (Settings → Updates): betas as soon as they are out, and
+  the stable release after them. Back on stable, the beta stays installed until
+  a stable release is newer.
 
 ### Changed
 
-- **Output devices are told apart by their Windows id**, so two devices with
-  the same name keep their own selection and sound profile; 0.6.0 settings move
-  over by themselves. *System default* now follows the Windows default device.
+- **Each track decodes on its own thread**, 1.5 s ahead of the speakers: a
+  slow connection silences only its own track, Next, Stop and a device switch
+  act at once, and a seek in a track still downloading goes straight there.
+- **Music at another sample rate than the device sounds better**: CD rips on a
+  48 kHz device are resampled with a band-limited filter, so the treble is no
+  longer dulled. **Gapless albums join without a trace** at any sample rate.
+- **Seeking back in a long variable-bitrate MP3** (a two-hour mix) jumps
+  straight to the target and lands on the exact sample.
 - **A limiter** catches peaks that normalization, preamp or equalizer push past
   full scale, instead of clipping them.
-- **Signing out also removes the ListenBrainz token** and cancels running
-  downloads; the search history is kept per account.
-- Certificates are checked by **Windows' own verifier**; pinned self-signed
-  servers work as before. The Windows proxy bypass list is honoured.
+- **The audio device is released after five minutes without sound**, so
+  Windows can sleep while Sonarune waits in the tray. Play carries on where the
+  track was paused.
+- **Sonarune remembers where the track stood** after quitting, a restart or an
+  update.
+- **Output devices are told apart by their Windows id**, so two devices with
+  the same name keep their own selection and sound profile. *System default*
+  follows the Windows default device.
+- **A server is recognised by its Jellyfin id**, not by its address: after a
+  move to https or a new address, the history and sonic similarity carry on.
+- **Long playlists open at once**, big download batches stay light, and the
+  download panel can *Cancel all*.
+- **Errors are shown in your language.**
+- Certificates are checked by Windows' own verifier, and the Windows proxy
+  bypass list is honoured. Signing out also removes the ListenBrainz token.
 
 ### Fixed
 
-- **The visualizer did not start in 0.6.0** ("createVisualizer is not a
-  function"). Since the move to Vite 8 the built app wraps the butterchurn
-  module once more than the dev server does; it is now found either way.
-- Clicking an artist name reloaded the app; drag and drop did nothing on
-  Windows; Space on a clicked track row restarted it instead of pausing; menus
-  closed while the lyrics scrolled.
-- Jellyfin 10.11: genres were missing on music-only servers and genre playback
-  found no tracks; a playlist with a track twice did not open, and cleaning up
-  its duplicates removed every copy.
-- The metadata editor split artists with a comma in their name.
-- The sleep timer's fade-out was lost at a track change; a broken stream could
-  freeze playback.
-- Sonic similarity: Auto-DJ rows read "undefined", radios and paths were
-  shuffled, tracks were downloaded again on every scan.
+- **Sonarune starts on a Windows without the Visual C++ Redistributable**;
+  0.6.0 quit there without a word, as on a fresh installation.
+- **The visualizer did not start in 0.6.0.** Drag and drop did nothing on
+  Windows, and clicking an artist name reloaded the app.
+- Playback in the background survives a revoked sign-in.
+- Jellyfin 10.11: genres were missing on music-only servers, and a playlist
+  with a track twice did not open.
+- The sleep timer's fade-out was lost at a track change, a broken stream could
+  freeze playback, and 5.1 tracks on a stereo device could switch channels.
 - Shuffle order survives a restart; *Stop after this album* waits for its last
-  track; a Windows shutdown saves the last history entry.
+  track.
 - Many smaller fixes from a full code review.
+
+### Security
+
+- **Uninstalling with "Delete the application data" also removes the saved
+  sign-in** (server token, password, ListenBrainz token) from the Windows
+  Credential Manager. Updates and a plain uninstall leave it.
 
 ## [0.6.0] — 2026-10-18
 
@@ -345,7 +359,8 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Ariazonaa/sonarune/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Ariazonaa/sonarune/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Ariazonaa/sonarune/compare/v0.4.0...v0.5.0

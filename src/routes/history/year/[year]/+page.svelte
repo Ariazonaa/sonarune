@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import { formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
   import BarList, { type BarItem } from "#lib/components/BarList.svelte";
@@ -32,7 +33,7 @@
       review = nextReview;
       years = nextYears;
     } catch (e) {
-      if (seq === generation) error = String(e);
+      if (seq === generation) error = errorCause(e);
     }
   }
 

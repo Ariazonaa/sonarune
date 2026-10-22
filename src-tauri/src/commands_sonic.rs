@@ -4,6 +4,7 @@
 use crate::api::types::TrackDto;
 use crate::commands::{to_queue_tracks, with_retry};
 use crate::error::{AppError, AppResult};
+use crate::identity::{Owner, Server};
 use crate::player::PlayTicket;
 use crate::sonic::SonicIndex;
 use crate::sonic_scan::ScanStatus;
@@ -53,13 +54,18 @@ pub fn sonic_set_scan(state: State<'_, AppState>, enabled: bool) {
     state.sonic_scan.set_enabled(&state.store, enabled);
 }
 
-/// The index, holding `needed` if they have been analysed by now.
+/// The index of the session's server, holding `needed` if they have been
+/// analysed by now.
 async fn index(state: &AppState, needed: &[&str]) -> AppResult<Arc<SonicIndex>> {
+    let server = {
+        let session = state.session.read().await;
+        Server::of(session.as_deref().ok_or(AppError::NotConnected)?)
+    };
     let store = state.store.clone();
     let needed: Vec<String> = needed.iter().map(|id| id.to_string()).collect();
     tokio::task::spawn_blocking(move || {
         let needed: Vec<&str> = needed.iter().map(String::as_str).collect();
-        crate::sonic::index_containing(&store, &needed)
+        crate::sonic::index_containing(&store, &server, &needed)
     })
     .await
     .map_err(|e| AppError::Other(format!("sonic index: {e}")))
@@ -75,7 +81,7 @@ async fn play_in_order(
     ids: Vec<String>,
     min_tracks: usize,
 ) -> AppResult<()> {
-    let (queue, server, user, gone) = with_retry(state, |c| {
+    let (queue, owner, gone) = with_retry(state, |c| {
         let ids = ids.clone();
         async move {
             let mut tracks = c.tracks_by_ids(&ids).await?;
@@ -88,8 +94,7 @@ async fn play_in_order(
             let position = |id: &str| ids.iter().position(|x| x == id).unwrap_or(usize::MAX);
             tracks.sort_by_key(|t| position(&t.id));
             let queue = to_queue_tracks(&c, without_copies(tracks))?;
-            let user = c.user_id().unwrap_or_default().to_string();
-            Ok((queue, c.base_url().to_string(), user, gone))
+            Ok((queue, Owner::of(&c).ok_or(AppError::NotConnected)?, gone))
         }
     })
     .await?;
@@ -97,10 +102,8 @@ async fn play_in_order(
     // item id): out of the index, or every radio keeps reaching for them —
     // unless another account here may still see them.
     let store = state.store.clone();
-    let released = tokio::task::spawn_blocking(move || {
-        crate::sonic::release_gone(&store, &server, &user, gone)
-    })
-    .await;
+    let released =
+        tokio::task::spawn_blocking(move || crate::sonic::release_gone(&store, &owner, gone)).await;
     match released {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!("cannot release the analyses of gone tracks: {e}"),

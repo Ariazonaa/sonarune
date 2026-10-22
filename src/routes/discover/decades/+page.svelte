@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { apiDiscovery, type DecadeDto } from "#lib/api/discovery.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import EmptyState from "#lib/components/EmptyState.svelte";
   import { player } from "#lib/state/player.svelte.js";
@@ -18,7 +19,7 @@
       swrSet("discover:all:decades", result);
       error = null;
     } catch (cause) {
-      if (seq === generation && !decades) error = String(cause);
+      if (seq === generation && !decades) error = errorCause(cause);
     }
   }
   onMount(load);

@@ -26,8 +26,9 @@ class UpdateStore {
   checking = $state(false);
   installing = $state(false);
   progress = $state<Progress | null>(null);
-  /** Message of the last failed check or install, shown next to the button. */
-  error = $state<string | null>(null);
+  /** Why the last check or install failed, as it was rejected; shown next
+   *  to the button in the words of `updateErrors.ts`. */
+  error = $state<unknown>(null);
   /** Set once the user has seen the announcement, so it does not reappear on
    *  every navigation — a new version resets it. */
   announced = $state<string | null>(null);
@@ -74,10 +75,18 @@ class UpdateStore {
     try {
       this.info = await api.checkForUpdate();
     } catch (e) {
-      this.error = String(e);
+      this.error = e;
     } finally {
       this.checking = false;
     }
+  }
+
+  /** Drop what the last check said, after a switch of the channel: it was
+   *  the other channel's answer. Rust keeps its copy per channel. */
+  forget() {
+    if (this.checking || this.installing) return;
+    this.info = null;
+    this.error = null;
   }
 
   /**
@@ -92,7 +101,7 @@ class UpdateStore {
     try {
       await api.installUpdate();
     } catch (e) {
-      this.error = String(e);
+      this.error = e;
       this.installing = false;
       this.progress = null;
     }

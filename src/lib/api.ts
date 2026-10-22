@@ -10,6 +10,7 @@ import type {
   ConnectResult,
   DesktopSettings,
   DownloadRequest,
+  DownloadSnapshot,
   DownloadTask,
   DspParams,
   ExtrasSettings,
@@ -82,9 +83,12 @@ export const api = {
   getTrackInfo: (itemId: string) => invoke<TrackInfoDto>("get_track_info", { itemId }),
   queueDownloads: (requests: DownloadRequest[]) =>
     invoke<DownloadTask[]>("queue_downloads", { requests }),
-  getDownloads: () => invoke<DownloadTask[]>("get_downloads"),
+  getDownloads: () => invoke<DownloadSnapshot>("get_downloads"),
   cancelDownload: (id: string) => invoke<void>("cancel_download", { id }),
   retryDownload: (id: string) => invoke<void>("retry_download", { id }),
+  /** Retry every failed and cancelled download; how many were requeued. */
+  retryFailedDownloads: () => invoke<number>("retry_failed_downloads"),
+  cancelAllDownloads: () => invoke<void>("cancel_all_downloads"),
   clearFinishedDownloads: () => invoke<void>("clear_finished_downloads"),
   openDownloadsFolder: () => invoke<void>("open_downloads_folder"),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),

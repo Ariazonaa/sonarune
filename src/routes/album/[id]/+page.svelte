@@ -4,6 +4,7 @@
   import { goto } from "$app/navigation";
   import { api, formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause, errorMessage, isNotFound } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import CoverBackdrop from "#lib/components/CoverBackdrop.svelte";
@@ -60,10 +61,10 @@
       })
       .catch((e) => {
         if (id !== page.params.id) return;
-        const msg = String(e);
+        const msg = errorCause(e);
         // Removed on the server: drop the cached ghost so its Play button
         // doesn't linger. Otherwise (offline/transient) keep the stale copy.
-        if (msg.includes("returned 404")) {
+        if (isNotFound(e)) {
           swrDelete(key);
           detail = null;
           error = msg;
@@ -165,7 +166,7 @@
       library.poke(); // other views drop the album on their next revalidate
       goto("/");
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 

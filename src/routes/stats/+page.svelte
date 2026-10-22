@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale } from "#lib/paraglide/runtime.js";
   import Cover from "#lib/components/Cover.svelte";
@@ -25,7 +26,7 @@
         error = null;
       })
       .catch((e) => {
-        if (!stats) error = String(e);
+        if (!stats) error = errorCause(e);
       });
   }
 

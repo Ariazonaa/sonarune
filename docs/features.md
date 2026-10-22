@@ -21,21 +21,26 @@ the current build does.
 - **Smart crossfade** (opt-in): overlaps two tracks with gain ramps instead,
   and leaves a continuous album alone.
 - **10-band equalizer** with presets and your own saved presets, **volume
-  normalization**, and a clamp against clipping. Changes apply to the running
-  track, no restart.
+  normalization**, and a limiter that turns peaks down instead of clipping
+  them. Changes apply to the running track, no restart.
 - **Normalization per track or per album.** Album mode plays every track of an
   album at one gain, so the quiet piece stays quieter than the loud one — what
   the album was mixed for. Jellyfin sends an album value only from 10.11;
   without one the gain is the median of the album's tracks in the queue.
 - **Click-free pause and resume** through a sample-accurate fade stage — the
   same one that fades a sleep timer out.
-- **Seeking inside a live transcode**: a server transcode restarts at the new
-  position, a direct-play file is positioned before it reaches the audio graph.
-  Native seeks wait until the file is fully downloaded, because a decoder
-  waiting on an undownloaded range would stall the audio callback.
+- **Decoding ahead of the speakers**: every track decodes on its own thread, a
+  second and a half ahead, so a slow or broken connection silences only that
+  track — the other one of a crossfade plays on — and Next, Stop and a device
+  switch act at once.
+- **Seeking**, downloaded or not: in a direct-play file a seek goes straight
+  to the new position, even while the file is still downloading, and plays as
+  soon as that part has arrived; a server transcode restarts there. A device
+  switch carries on without downloading the track again.
 - **Output device** is selectable, and survives hotplug: if the chosen device
   disappears, playback falls back to the default one and resumes at the same
-  position.
+  position. After five minutes without sound the device is released, so
+  Windows can sleep; Play opens it again (that needs the server).
 - **Sleep timer**, by minutes or at the end of the current track, with an
   optional fade-out.
 - **Stop after this track, or after this album**, from a queue entry's context
@@ -72,7 +77,8 @@ the current build does.
   decade as bars you can walk into.
 - **Play history and year in review**: every track you listen to (half of it
   or four minutes, the ListenBrainz rule) is recorded on this computer, per
-  server and account — a timeline by day, and a review per year with plays,
+  server (known by its Jellyfin id, so a new address keeps it) and account — a
+  timeline by day, and a review per year with plays,
   listening time, the most played artists, albums and tracks, and plays per
   month. Entries can be removed, recording switched off.
 - **Deleting** items on the server, when the account is allowed to.
@@ -105,6 +111,9 @@ UI shows it, it never computes it.
 
 - Create, rename, duplicate and delete playlists.
 - Reorder entries by drag-and-drop, remove entries, remove duplicates.
+- **Long playlists**: above 300 entries only the rows in view are drawn, so a
+  playlist with thousands of tracks opens, filters and reorders at once. Back
+  and Forward return to the same spot and filter.
 - **Transfer entries between playlists.**
 - Add anything to a playlist from its context menu, including multi-selections.
 - **A track in a playlist twice**: Jellyfin 10.11 tells playlist entries
@@ -199,9 +208,13 @@ UI shows it, it never computes it.
   Settings. The download is verified against the project's signing key before
   the installer is opened, and an update never runs while a track is playing —
   the installer closes the app. The portable build says so instead of
-  installing anything.
+  installing anything. Betas are opt-in: on the beta channel Sonarune offers
+  them as soon as they are out, and the stable release after them.
 - **Downloads**: export original files, two at a time, with progress, cancel
-  and retry. This is an export, not an offline cache.
+  and retry, or *Retry all* for every failed one. Batches of thousands stay
+  light: the panel lists the running ones, the next 50 waiting, the failed and
+  cancelled ones and the last 50 completed. This is an export, not an offline
+  cache.
 
 </details>
 
@@ -263,7 +276,8 @@ UI shows it, it never computes it.
   certificate only after you confirmed its fingerprint. There is no blanket
   "accept invalid certificates".
 - **Tokens live in the OS credential store**, not in the database and not in an
-  export — the ListenBrainz token included.
+  export — the ListenBrainz token included. Uninstalling with *Delete the
+  application data* ticked removes them as well.
 - **A Content-Security-Policy** limits the WebView to the app's own resources,
   the IPC channel and the cover-art protocol.
 - **Remote visualizer presets are treated as code**: opt-in, downloaded in

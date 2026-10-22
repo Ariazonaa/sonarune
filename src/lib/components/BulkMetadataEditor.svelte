@@ -1,5 +1,6 @@
 <script lang="ts">
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause, errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { modalFocus } from "#lib/modal.js";
   import { portal } from "#lib/portal.js";
@@ -77,7 +78,7 @@
     try {
       result = await apiLibrary.updateItemsMetadata(itemIds, edits);
     } catch (e) {
-      saveError = String(e);
+      saveError = errorMessage(e);
       return;
     } finally {
       saving = false;
@@ -97,7 +98,7 @@
       // not the same as refused.
       saveError = m.edit_bulk_stopped({
         count: result.failed + result.skipped,
-        message: result.error ?? "",
+        message: result.error ? errorCause(result.error) : "",
       });
       return;
     }
@@ -106,7 +107,7 @@
       // reason rather than closing on a half-done write.
       saveError = m.edit_bulk_partial({
         count: result.failed,
-        message: result.error ?? "",
+        message: result.error ? errorCause(result.error) : "",
       });
       return;
     }

@@ -7,7 +7,7 @@ use crate::api::types::{
 use crate::api::MAX_IDS_PER_REQUEST;
 use crate::commands::{to_queue_tracks, with_retry};
 use crate::commands_discover::{shuffle_items, validate_page};
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorReport};
 use crate::AppState;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -303,7 +303,7 @@ pub struct PlaylistTransfer {
     /// A move whose copy went through but whose removal from the source
     /// failed — a playlist the user may read but not change, say. The tracks
     /// are in the target either way, so this is reported, not an error.
-    pub remove_error: Option<String>,
+    pub remove_error: Option<ErrorReport>,
 }
 
 /// Copy or move exact entries between two playlists. Resolution is performed
@@ -355,7 +355,7 @@ pub async fn transfer_playlist_entries(
         .await;
         if let Err(e) = removed {
             tracing::warn!("moved tracks were copied but not removed from the source: {e}");
-            remove_error = Some(e.to_string());
+            remove_error = Some(e.report());
         }
     }
 

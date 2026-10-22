@@ -1,5 +1,6 @@
 <script lang="ts">
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { sameNames, splitNames } from "#lib/metadataNames.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
@@ -51,7 +52,7 @@
         discNumber = meta.discNumber != null ? String(meta.discNumber) : "";
       })
       .catch((e) => {
-        if (id === itemId) loadError = String(e);
+        if (id === itemId) loadError = errorCause(e);
       });
   });
 
@@ -159,7 +160,7 @@
     try {
       await apiLibrary.updateItemMetadata(itemId, edits);
     } catch (e) {
-      saveError = String(e);
+      saveError = errorCause(e);
       return;
     } finally {
       saving = false;

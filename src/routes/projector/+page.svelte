@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { formatDuration } from "#lib/api.js";
   import Cover from "#lib/components/Cover.svelte";
@@ -133,7 +134,7 @@
       await window.setFullscreen(fullscreen);
       persist({ ...settings, fullscreen });
     } catch (cause) {
-      banner.notice(String(cause));
+      banner.notice(errorCause(cause));
     }
   }
 
@@ -215,7 +216,7 @@
         });
         if (container) observer.observe(container);
       } catch (cause) {
-        banner.error(String(cause));
+        banner.error(errorCause(cause));
       }
     })();
 

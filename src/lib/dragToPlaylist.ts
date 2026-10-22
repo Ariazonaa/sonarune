@@ -45,6 +45,13 @@ export function decodeDrag(text: string | null | undefined): DragPayload | null 
   };
 }
 
+/**
+ * Whether a drag that started in this window is under way. The MIME type alone
+ * proves nothing: a page in another Chromium-based app can set it on its own
+ * drag and drop it onto a playlist here.
+ */
+let started = false;
+
 /** Start a drag carrying `payload`. */
 export function startDrag(event: DragEvent, payload: DragPayload) {
   const data = event.dataTransfer;
@@ -52,10 +59,26 @@ export function startDrag(event: DragEvent, payload: DragPayload) {
   data.effectAllowed = "copy";
   data.setData(DRAG_MIME, encodeDrag(payload));
   data.setData("text/plain", (payload.trackIds ?? [payload.albumId ?? ""]).join("\n"));
+  started = true;
+  // The end of the drag, wherever it happens: `dragend` on the source — on the
+  // element itself too, since a virtual list may have dropped it from the page
+  // meanwhile and the event then never passes the window — or a drop here once
+  // the drop targets have read the payload.
+  const source = event.target;
+  const end = () => {
+    started = false;
+    source?.removeEventListener("dragend", end);
+    window.removeEventListener("dragend", end, true);
+    window.removeEventListener("drop", end);
+  };
+  source?.addEventListener("dragend", end);
+  window.addEventListener("dragend", end, true);
+  window.addEventListener("drop", end);
 }
 
 /** The payload of a drag in progress, or null when it is not one of ours. */
 export function readDrag(event: DragEvent): DragPayload | null {
+  if (!started) return null;
   return decodeDrag(event.dataTransfer?.getData(DRAG_MIME));
 }
 
@@ -64,5 +87,5 @@ export function readDrag(event: DragEvent): DragPayload | null {
  * data itself is not readable, only the list of types it carries.
  */
 export function isOurDrag(event: DragEvent): boolean {
-  return event.dataTransfer?.types.includes(DRAG_MIME) ?? false;
+  return started && (event.dataTransfer?.types.includes(DRAG_MIME) ?? false);
 }

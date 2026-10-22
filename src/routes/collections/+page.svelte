@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { apiDiscovery, type CollectionDto } from "#lib/api/discovery.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import CardSkeleton from "#lib/components/CardSkeleton.svelte";
@@ -41,7 +42,7 @@
         total = merged.total;
       }
     } catch (cause) {
-      if (seq === generation && (!reset || collections.length === 0)) error = String(cause);
+      if (seq === generation && (!reset || collections.length === 0)) error = errorCause(cause);
     } finally {
       if (seq === generation) loading = false;
     }

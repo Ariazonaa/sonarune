@@ -4,6 +4,7 @@
   import { page } from "$app/state";
   import { VList } from "virtua/svelte";
   import { api } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { appendPage, pageUntil, type PagedList } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import AlphabetRail from "#lib/components/AlphabetRail.svelte";
@@ -116,7 +117,7 @@
       total = merged.total;
       return merged.grew;
     } catch (e) {
-      if (seq === requestSeq) error = String(e);
+      if (seq === requestSeq) error = errorCause(e);
       return false;
     } finally {
       if (seq === requestSeq) {
@@ -222,7 +223,7 @@
         align: "start",
       });
     } catch (e) {
-      if (current()) error = String(e);
+      if (current()) error = errorCause(e);
     }
   }
 

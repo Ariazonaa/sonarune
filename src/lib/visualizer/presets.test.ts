@@ -141,7 +141,18 @@ describe("resolvePreset", () => {
       false,
       () => m.visualizer_preset_error_download({ message: "network error: builder error" }),
     ],
-  ])("classifies the command error %s (permanent: %s)", async (wire, permanent, message) => {
+    // As the command rejects since the codes (`ErrorReport`, `appErrors.ts`).
+    [
+      { code: "preset:http", arg: "404", detail: "preset:http:404" },
+      true,
+      () => m.visualizer_preset_error_http({ status: 404 }),
+    ],
+    [
+      { code: "network", detail: "network error: builder error" },
+      false,
+      () => m.visualizer_preset_error_download({ message: m.player_error_cause_network() }),
+    ],
+  ])("classifies the command error %o (permanent: %s)", async (wire, permanent, message) => {
     const { url } = uniqueWeekly();
     const remote = entry("remote", url);
     invokeMock.mockRejectedValueOnce(wire);

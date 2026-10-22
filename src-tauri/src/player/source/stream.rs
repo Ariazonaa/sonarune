@@ -1,8 +1,9 @@
 //! The bytes under a playing track: one HTTP download into a temp file
 //! (stream-download), plus the failure handling that library leaves to its
-//! stream type. Decoders read the download on the audio callback, where a
-//! read of bytes that have not arrived waits for them, so everything here is
-//! about never leaving such a read waiting for good:
+//! stream type. A decoder reads the download on its own thread (`feed.rs`),
+//! where a read of bytes that have not arrived waits for them; its source
+//! plays silence meanwhile. Everything here is about never leaving such a
+//! read waiting for good:
 //!
 //! - a body that fails ends right there. stream-download only logs a failed
 //!   chunk and polls again, and neither an HTTP/2 stream reset nor reqwest's
@@ -20,9 +21,11 @@
 //!   over, and stream-download would append that at the current offset. A
 //!   silent one is held on to until a decoder has waited too long;
 //! - the player can stop a download at any time, which also wakes a decoder
-//!   waiting on it;
+//!   waiting on it, and the decoder thread can cut a wait short to seek
+//!   elsewhere ([`StreamReader::cut_short_by`]);
 //! - the decoder reads only what is on disk ([`StreamReader`]).
 
+use super::feed::Interrupt;
 use super::{DownloadState, FileSlot, Storage};
 use crate::error::{AppError, AppResult};
 use bytes::Bytes;
@@ -61,8 +64,8 @@ const LIBRARY_SILENCE: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Patience {
     /// A decoder waiting this long for bytes that do not come makes the
-    /// download give up: its read then fails rather than holding the audio
-    /// callback any longer.
+    /// download give up: its read then fails, its source ends, and the
+    /// player picks the track up again where it broke off.
     pub stall: Duration,
     /// With nobody waiting (paused, or still playing what is buffered), an
     /// outage this long makes it give up all the same.
@@ -143,6 +146,7 @@ pub(super) async fn open(
             steered: None,
             watch,
             calls: 0,
+            interrupt: None,
         },
         mpeg,
     })
@@ -250,12 +254,24 @@ pub struct StreamReader {
     steered: Option<u64>,
     watch: Arc<ReadWatch>,
     calls: u64,
+    /// Raised when a read waiting for the download is no longer wanted (see
+    /// [`Self::cut_short_by`]).
+    interrupt: Option<Arc<Interrupt>>,
 }
 
 impl StreamReader {
     /// The stream's length, when the server announced one (direct play).
     pub fn content_length(&self) -> Option<u64> {
         self.len
+    }
+
+    /// A read that would wait for the download fails instead while
+    /// `interrupt` is pending: the decoder thread's source asked to seek
+    /// elsewhere. Not an `Interrupted` error, which Symphonia retries at
+    /// once; the decoder takes it for the end of what it was reading, and
+    /// the thread for no end at all.
+    pub fn cut_short_by(&mut self, interrupt: Arc<Interrupt>) {
+        self.interrupt = Some(interrupt);
     }
 
     fn enter(&mut self) {
@@ -286,6 +302,9 @@ impl StreamReader {
             }
             if self.stop.is_cancelled() || self.task_done.is_cancelled() || self.state.is_broken() {
                 return Err(io::Error::other("stream failed to download"));
+            }
+            if self.interrupt.as_ref().is_some_and(|i| i.pending()) {
+                return Err(io::Error::other("read cut short for a seek"));
             }
             self.steer()?;
             self.state.on_disk_from(self.pos, want, Some(READ_POLL));
@@ -546,18 +565,21 @@ pub(super) struct ServerStream {
 }
 
 impl ServerStream {
+    /// Errors keep their kind: a server's answer is `AppError::Server` with
+    /// its status — a 401 is what the player renews the session for — and a
+    /// connection that failed is `AppError::Network`, its URL stripped (it
+    /// carries the user and device ids).
     async fn open(origin: Arc<Origin>) -> AppResult<Self> {
         let response = tokio::select! {
-            response = origin.client.get(origin.url.clone()).send() => response.map_err(|e| {
-                AppError::Audio(format!("stream open failed: {}", e.without_url()))
-            })?,
+            response = origin.client.get(origin.url.clone()).send() => response?,
             () = origin.stop.cancelled() => return Err(stopped()),
         };
         let status = response.status();
         if !status.is_success() {
-            return Err(AppError::Audio(format!(
-                "stream open failed: server returned {status}"
-            )));
+            return Err(AppError::Server {
+                status: status.as_u16(),
+                message: "stream open failed".into(),
+            });
         }
         let content_length = response.content_length();
         let header = |name| {
@@ -1340,6 +1362,63 @@ mod tests {
         );
     }
 
+    /// What opening `url` fails with.
+    fn open_error(url: reqwest::Url) -> AppError {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reading = FileSlot::default();
+        let storage = AdaptiveStorageProvider::new(
+            super::super::StreamFiles {
+                dir: None,
+                wave_file: None,
+                reading: reading.clone(),
+            },
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        );
+        let opened = runtime.block_on(open(
+            reqwest::Client::new(),
+            url,
+            (storage, reading),
+            Settings::default().prefetch_bytes(0),
+            CancellationToken::new(),
+            Arc::new(DownloadState::default()),
+            TEST_PATIENCE,
+        ));
+        match opened {
+            Ok(_) => panic!("the open went through"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
+    fn a_refused_open_says_what_the_server_answered() {
+        // A revoked session: what the player renews the session for.
+        let server = serve(data(1_000), vec![Answer::Status(401)]);
+        let err = open_error(server.url.clone());
+        assert!(
+            matches!(err, AppError::Server { status: 401, .. }),
+            "{err:?}"
+        );
+        // Any other refusal keeps its own status, and nothing names the URL.
+        let server = serve(data(1_000), vec![Answer::Status(404)]);
+        let err = open_error(server.url.clone());
+        assert!(
+            matches!(err, AppError::Server { status: 404, .. }),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("127.0.0.1"), "{err}");
+        // A server that is not there is a network error, not an answer.
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/stream", listener.local_addr().unwrap())
+        };
+        let err = open_error(closed.parse().unwrap());
+        assert!(matches!(err, AppError::Network(_)), "{err:?}");
+        assert!(!err.to_string().contains("127.0.0.1"), "{err}");
+    }
+
     #[test]
     fn a_refusing_server_is_not_asked_again_and_again() {
         let body = data(900_000);
@@ -1517,6 +1596,113 @@ mod tests {
     }
 
     #[test]
+    fn a_read_waiting_for_the_download_is_cut_short_for_a_seek() {
+        let body = data(900_000);
+        let server = serve(body.clone(), vec![Answer::Stall(100_000)]);
+        let Download {
+            mut reader,
+            runtime,
+            ..
+        } = open_test(&server, ENDLESS_PATIENCE);
+        let interrupt = Arc::<Interrupt>::default();
+        reader.cut_short_by(interrupt.clone());
+        let raised = interrupt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            raised.raise();
+        });
+        let (waited, again) = within(Duration::from_secs(10), move || {
+            let started = Instant::now();
+            // Past what arrived: the read waits, until the seek comes.
+            reader.seek(SeekFrom::Start(200_000)).unwrap();
+            let failed = reader.read(&mut [0u8; 1024]).is_err();
+            let waited = started.elapsed();
+            assert!(failed, "the wait was not cut short");
+            // Once the decoder thread has seen to it, reads go on as before.
+            interrupt.settle();
+            reader.seek(SeekFrom::Start(1_000)).unwrap();
+            let mut again = vec![0u8; 1_000];
+            let again = reader.read_exact(&mut again).map(|()| again);
+            drop(runtime);
+            (waited, again)
+        });
+        assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+        assert_eq!(again.expect("what is on disk"), body[1_000..2_000]);
+    }
+
+    #[test]
+    fn a_stalled_download_silences_its_source_and_nothing_else() {
+        use rodio::Source as _;
+        // About three seconds of audio arrive, then the server goes quiet,
+        // and stays so for longer than the test runs.
+        let server = serve(ogg_opus(30), vec![Answer::Stall(100_000)]);
+        let Download {
+            mut reader,
+            stop,
+            runtime,
+            ..
+        } = open_test(&server, ENDLESS_PATIENCE);
+        let interrupt = Arc::<Interrupt>::default();
+        reader.cut_short_by(interrupt.clone());
+        let opus = crate::player::opus::probe(reader, true)
+            .map_err(|(_, e)| e)
+            .expect("an Ogg-Opus stream");
+        let (stalled, handle) = super::super::feed::start(
+            opus,
+            Duration::ZERO,
+            true,
+            stop.clone(),
+            interrupt,
+            rodio::SampleRate::new(48_000).unwrap(),
+        )
+        .expect("started");
+        let (channels, rate) = (stalled.channels(), stalled.sample_rate());
+        // Mixed with what stands for the other track of a crossfade.
+        let (mixer, mut mixed) = rodio::mixer::mixer(channels, rate);
+        mixer.add(stalled);
+        let other = rodio::buffer::SamplesBuffer::new(channels, rate, vec![0.25; 48_000 * 2 * 8]);
+        mixer.add(other);
+        let (slowest, late, silence) = within(Duration::from_secs(30), move || {
+            // As the audio callback pulls: 10 ms at a time, at about the
+            // pace it plays.
+            let mut slowest = Duration::ZERO;
+            let mut late = Vec::new();
+            for block in 0..600 {
+                let pulled = Instant::now();
+                let samples: Vec<f32> = mixed.by_ref().take(960).collect();
+                slowest = slowest.max(pulled.elapsed());
+                assert_eq!(samples.len(), 960, "the mix ran out");
+                if block >= 500 {
+                    late.extend(samples);
+                }
+                std::thread::sleep(Duration::from_millis(9));
+            }
+            let silence = handle.silence();
+            // Stopping the download ends the decoder thread.
+            stop.cancel();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handle.running() {
+                assert!(Instant::now() < deadline, "the decoder thread lives on");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(runtime);
+            (slowest, late, silence)
+        });
+        // Generous for a busy machine: a pull that waited for the download
+        // would wait for good here, and the test would time out above.
+        assert!(
+            slowest < Duration::from_secs(1),
+            "the callback waited {slowest:?}"
+        );
+        // Five seconds in, the stalled source is silent, and the other plays.
+        assert!(
+            late.iter().all(|s| *s == 0.25),
+            "only the other track plays"
+        );
+        assert!(silence > Duration::from_secs(1), "silent for {silence:?}");
+    }
+
+    #[test]
     fn a_seek_near_the_end_does_not_wait_for_the_whole_file() {
         let body = data(2_000_000);
         // The download from the start stops after the head start, and the
@@ -1599,5 +1785,63 @@ mod tests {
         watch.leave(2);
         assert_eq!(watch.waited(later), Duration::ZERO);
         assert_eq!(*watch.seen.lock().unwrap(), None);
+    }
+
+    /// The seek times of `mp3::demux`'s `long_mix_seek_times` (run that
+    /// first: it makes the file), read through the download as the player
+    /// reads it, once the download is complete.
+    ///
+    /// `cargo test --lib long_mix_seek_times_through_the_download -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the file long_mix_seek_times makes"]
+    fn long_mix_seek_times_through_the_download() {
+        use rodio::Source as _;
+        let path = std::env::temp_dir().join("sonarune-test-chirp-noise-2h-vbr.mp3");
+        let body = std::fs::read(&path).expect("long_mix_seek_times made the file");
+        let len = body.len() as u64;
+        let server = serve(body, vec![Answer::Serve]);
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        let downloaded = || {
+            let download = open_test(&server, ENDLESS_PATIENCE);
+            let mut reader = download.reader;
+            io::copy(&mut reader, &mut io::sink()).expect("downloads");
+            reader.seek(SeekFrom::Start(0)).unwrap();
+            (reader, download.runtime)
+        };
+        fn timed(what: &str, seek: impl FnOnce()) {
+            let begun = Instant::now();
+            seek();
+            println!("{what}: {:?}", begun.elapsed());
+        }
+
+        let (reader, _runtime) = downloaded();
+        let mut theirs = rodio::Decoder::builder()
+            .with_data(reader)
+            .with_byte_len(len)
+            .with_gapless(true)
+            .build()
+            .unwrap();
+        timed("rodio, to 100 min", || {
+            theirs.try_seek(minutes(100)).unwrap()
+        });
+        timed("rodio, back to 10 min", || {
+            theirs.try_seek(minutes(10)).unwrap()
+        });
+        timed("rodio, back to 99 min", || {
+            theirs.try_seek(minutes(100)).unwrap();
+            theirs.try_seek(minutes(99)).unwrap()
+        });
+
+        let (reader, _runtime) = downloaded();
+        let mut ours = super::super::symphonia_decoder(reader, Some(len), true).unwrap();
+        assert!(matches!(ours, super::super::SymphoniaSource::Indexed(_)));
+        timed("index, to 100 min", || ours.try_seek(minutes(100)).unwrap());
+        timed("index, back to 10 min", || {
+            ours.try_seek(minutes(10)).unwrap()
+        });
+        timed("index, back to 99 min", || {
+            ours.try_seek(minutes(100)).unwrap();
+            ours.try_seek(minutes(99)).unwrap()
+        });
     }
 }

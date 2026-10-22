@@ -4,6 +4,7 @@
   import { afterNavigate, goto } from "$app/navigation";
   import { page } from "$app/state";
   import { api, formatDuration } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { appendPage } from "#lib/paging.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
@@ -180,7 +181,7 @@
       answered = true;
       queueMicrotask(maybeLoadMore);
     } catch (cause) {
-      if (id === requestId) error = String(cause);
+      if (id === requestId) error = errorCause(cause);
     } finally {
       if (id === requestId) searching = false;
     }
@@ -203,7 +204,7 @@
       total = merged.total;
       return merged.grew;
     } catch (cause) {
-      if (id === requestId) error = String(cause);
+      if (id === requestId) error = errorCause(cause);
       return false;
     } finally {
       if (id === requestId) loadingMore = false;

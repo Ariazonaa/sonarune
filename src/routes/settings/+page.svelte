@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api } from "#lib/api.js";
+  import { errorCause, errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale, setLocale } from "#lib/paraglide/runtime.js";
   import { player } from "#lib/state/player.svelte.js";
@@ -159,7 +160,7 @@
         const snapshot = await api.listAudioDevices();
         if (!disposed) showDevices(snapshot);
       } catch (e) {
-        if (reportError && !disposed) player.error = String(e);
+        if (reportError && !disposed) player.error = errorMessage(e);
       } finally {
         refreshingDevices = false;
       }
@@ -195,7 +196,7 @@
         cacheInfo = nextCache;
         await refreshAudioDevices(true);
       } catch (e) {
-        if (!disposed) player.error = String(e);
+        if (!disposed) player.error = errorMessage(e);
       }
     }
 
@@ -220,7 +221,7 @@
       settings = await api.getAudioSettings();
       audioProfiles = await api.getAudioProfiles();
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -236,7 +237,7 @@
     try {
       audioProfiles = await api.setAudioProfilesEnabled(enabled);
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -244,7 +245,7 @@
     try {
       audioProfiles = await api.deleteAudioProfile(deviceId);
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -266,7 +267,7 @@
         playback.outputDeviceName = applied.outputDeviceName;
       }
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     } finally {
       playbackSavesPending--;
     }
@@ -302,7 +303,7 @@
       playbackSave++;
       playback = await api.getPlaybackSettings();
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     } finally {
       restoringOutput = false;
     }
@@ -319,7 +320,7 @@
       desktop = await api.setDesktopSettings($state.snapshot(desktop));
       cacheInfo = await api.getCacheInfo();
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -345,7 +346,7 @@
       cacheInfo = await api.clearCoverCache();
       maintenanceMessage = m.settings_cache_cleared();
     } catch (e) {
-      maintenanceError = String(e);
+      maintenanceError = errorCause(e);
     } finally {
       maintenanceBusy = false;
     }
@@ -362,7 +363,7 @@
         name: path.split(/[\\/]/).pop() ?? path,
       });
     } catch (e) {
-      maintenanceError = String(e);
+      maintenanceError = errorCause(e);
     } finally {
       maintenanceBusy = false;
     }
@@ -370,7 +371,7 @@
 
   function revealDiagnostics() {
     if (diagnosticsPath) {
-      void api.revealPath(diagnosticsPath).catch((e) => (maintenanceError = String(e)));
+      void api.revealPath(diagnosticsPath).catch((e) => (maintenanceError = errorCause(e)));
     }
   }
 
@@ -446,7 +447,7 @@
     try {
       await session.disconnect();
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     } finally {
       signingOut = false;
     }
@@ -591,7 +592,7 @@
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      backupError = String(e);
+      backupError = errorCause(e);
     }
   }
 
@@ -612,7 +613,7 @@
       cacheInfo = await api.getCacheInfo();
       audioProfiles = await api.getAudioProfiles();
     } catch (e) {
-      backupError = String(e);
+      backupError = errorCause(e);
     }
   }
 </script>

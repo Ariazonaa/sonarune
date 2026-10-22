@@ -1,5 +1,6 @@
 import type { EnergyLevel } from "./engine";
 import { api } from "#lib/api.js";
+import { errorCause, errorDetail } from "#lib/appErrors.js";
 import { m } from "#lib/paraglide/messages.js";
 
 export type PresetComplexity = "light" | "medium" | "heavy";
@@ -132,7 +133,7 @@ function throwIfAborted(signal?: AbortSignal) {
  * only pause online presets.
  */
 function commandError(error: unknown): PresetFetchError {
-  const text = error instanceof Error ? error.message : String(error);
+  const text = errorDetail(error);
   const match = /^preset:([a-z-]+)(?::([\s\S]*))?$/.exec(text);
   const detail = match?.[2] ?? "";
   switch (match?.[1]) {
@@ -155,7 +156,7 @@ function commandError(error: unknown): PresetFetchError {
     case "network":
       return new PresetFetchError(m.visualizer_preset_error_download({ message: detail }), false);
     default:
-      return new PresetFetchError(m.visualizer_preset_error_download({ message: text }), false);
+      return new PresetFetchError(m.visualizer_preset_error_download({ message: errorCause(error) }), false);
   }
 }
 

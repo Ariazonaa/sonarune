@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { entryRowKeys, firstOccurrences, sharedEntryIds } from "./playlistEntries";
+import {
+  entryRowKeys,
+  filterRows,
+  firstOccurrences,
+  searchTexts,
+  sharedEntryIds,
+} from "./playlistEntries";
 import type { PlaylistTrackDto, TrackDto } from "#lib/types.js";
 
 /** An entry the way Jellyfin 10.11 lists it: its entry id is the track's id. */
@@ -43,5 +49,41 @@ describe("firstOccurrences", () => {
   it("keeps the first entry of every track, in order", () => {
     const entries = [entry("t"), entry("a"), entry("t"), entry("b"), entry("a")];
     expect(firstOccurrences(entries)).toEqual([entries[0], entries[1], entries[3]]);
+  });
+});
+
+describe("filterRows", () => {
+  const named = (id: string, name: string, artist = "", album = ""): PlaylistTrackDto => ({
+    track: { id, name, artist, album } as TrackDto,
+    entryId: id,
+  });
+  const entries = [
+    named("a", "Teardrop", "Massive Attack", "Mezzanine"),
+    named("b", "Angel", "Massive Attack", "Mezzanine"),
+    named("c", "Roads", "Portishead", "Dummy"),
+    named("a", "Teardrop", "Massive Attack", "Mezzanine"),
+  ];
+  const keys = entryRowKeys(entries);
+  const haystacks = searchTexts(entries);
+
+  it("keeps every row, with its place in the playlist and its key, for no filter", () => {
+    const rows = filterRows(entries, keys, haystacks, "  ");
+    expect(rows.map((row) => [row.originalIndex, row.key])).toEqual([
+      [0, "e:a"],
+      [1, "e:b"],
+      [2, "e:c"],
+      [3, "e:a#2"],
+    ]);
+  });
+
+  it("matches title, artist and album, ignoring case, and keeps the playlist's positions", () => {
+    expect(filterRows(entries, keys, haystacks, "TEAR").map((row) => row.originalIndex)).toEqual([0, 3]);
+    expect(filterRows(entries, keys, haystacks, " portis ").map((row) => row.originalIndex)).toEqual([2]);
+    expect(filterRows(entries, keys, haystacks, "mezz").map((row) => row.originalIndex)).toEqual([0, 1, 3]);
+  });
+
+  it("does not match across two fields", () => {
+    expect(filterRows(entries, keys, haystacks, "roadsportis")).toEqual([]);
+    expect(filterRows(entries, keys, haystacks, "attackmezz")).toEqual([]);
   });
 });

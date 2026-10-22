@@ -8,17 +8,21 @@
 //!
 //! Every row belongs to the account it was played on: signing in elsewhere
 //! shows that account's history, not a mix of both. The account is its
-//! Jellyfin user id, a GUID the server minted, so it names server and account
-//! at once — and, unlike the address typed at sign-in, stays the same when
-//! the server moves behind a proxy, to https or to another IP. Each row still
-//! records the address it was played under.
+//! Jellyfin user id on the server it was played on, by the server's id
+//! (`identity.rs`) — unlike the address typed at sign-in, both stay the same
+//! when the server moves behind a proxy, to https or to another IP, and two
+//! servers whose accounts share user ids keep two histories. Each row still
+//! records the address it was played under. Rows from before the server id
+//! was kept go by the user id alone until a sign-in at their address tells
+//! whose server they are (`adopt`).
 
 use crate::api::types::{ArtistRef, TrackDto};
 use crate::commands_library::{top_artists, ArtistPlays};
 use crate::error::AppResult;
+use crate::identity::Owner;
 use crate::player::QueueTrack;
-use crate::store::{keys, Store};
-use rusqlite::params;
+use crate::store::{Store, ADDRESSES_OF};
+use rusqlite::{named_params, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -141,9 +145,11 @@ const TOP_ALBUMS: usize = 10;
 /// Upper bound for one page of the timeline.
 pub const MAX_PAGE: u32 = 500;
 
-/// The table. Created with the store (`Store::open`). The indexes serve the
-/// timeline (an account's rows by id) and the years (by time); the one by
-/// server address went with the address as part of the owner.
+/// The table. Created with the store (`Store::open`), which also adds the
+/// `server_id` column — the Jellyfin id of the server it was played on, empty
+/// in rows from before it was kept. The indexes serve the timeline (an
+/// account's rows by id) and the years (by time); the one by server address
+/// went with the address as part of the owner.
 pub const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS play_history (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,9 +168,14 @@ pub const SCHEMA: &str = "
 
 /// The account the history is kept under right now; `None` while signed
 /// out, when there is nothing to show.
-fn account(store: &Store) -> Option<String> {
-    store.get(keys::USER_ID)
+fn account(store: &Store) -> Option<Owner> {
+    Owner::current(store)
 }
+
+/// The rows of the account (`:user`, on the server `:id`): its own, and the
+/// ones from before server ids were kept. With the server's id not known,
+/// every row of the user id, as before ids were kept.
+const MINE: &str = "user_id = :user AND (:id IS NULL OR server_id IS NULL OR server_id = :id)";
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -173,41 +184,51 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Write a listen that ended at `played_at` (Unix milliseconds; now when
-/// `None`). Returns whether a row was written.
+/// Write a listen of `owner`'s — the session the track played in — that
+/// ended at `played_at` (Unix milliseconds; now when `None`). Returns whether
+/// a row was written.
 pub fn record(
     store: &Store,
+    owner: &Owner,
     track: &QueueTrack,
     listened_ms: u64,
     played_at: Option<i64>,
 ) -> AppResult<bool> {
     let played_at = played_at.unwrap_or_else(now_ms);
-    record_at(store, &HistoryTrack::from(track), listened_ms, played_at)
+    record_at(
+        store,
+        owner,
+        &HistoryTrack::from(track),
+        listened_ms,
+        played_at,
+    )
 }
 
 fn record_at(
     store: &Store,
+    owner: &Owner,
     track: &HistoryTrack,
     listened_ms: u64,
     played_at: i64,
 ) -> AppResult<bool> {
-    let (Some(server), Some(user)) = (store.get(keys::SERVER_URL), account(store)) else {
+    if owner.user.is_empty() {
         return Ok(false);
-    };
+    }
     let json = serde_json::to_string(track)
         .map_err(|e| crate::error::AppError::Other(format!("cannot serialize track: {e}")))?;
     store.with_conn(|conn| {
         conn.execute(
             "INSERT INTO play_history
-                 (server_url, user_id, played_at, listened_ms, item_id, track)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (server_url, user_id, played_at, listened_ms, item_id, track, server_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                server,
-                user,
+                owner.server.address,
+                owner.user,
                 played_at,
                 listened_ms as i64,
                 track.item_id,
-                json
+                json,
+                owner.server.id
             ],
         )
     })?;
@@ -231,7 +252,7 @@ fn entry(id: i64, played_at: i64, listened_ms: i64, json: &str) -> Option<Histor
 /// read is skipped and the page filled up from further back, because the
 /// timeline takes a short page for the end.
 pub fn page(store: &Store, before: Option<i64>, limit: u32) -> AppResult<Vec<HistoryEntry>> {
-    let Some(user) = account(store) else {
+    let Some(owner) = account(store) else {
         return Ok(Vec::new());
     };
     let limit = limit.clamp(1, MAX_PAGE) as usize;
@@ -240,20 +261,28 @@ pub fn page(store: &Store, before: Option<i64>, limit: u32) -> AppResult<Vec<His
     loop {
         let wanted = limit - out.len();
         let rows = store.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare(&format!(
                 "SELECT id, played_at, listened_ms, track FROM play_history
-                 WHERE user_id = ?1 AND id < ?2
-                 ORDER BY id DESC LIMIT ?3",
-            )?;
+                 WHERE {MINE} AND id < :before
+                 ORDER BY id DESC LIMIT :limit"
+            ))?;
             let rows = statement
-                .query_map(params![user, cursor, wanted as i64], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })?
+                .query_map(
+                    named_params! {
+                        ":user": owner.user,
+                        ":id": owner.server.id,
+                        ":before": cursor,
+                        ":limit": wanted as i64,
+                    },
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?;
@@ -307,16 +336,18 @@ pub fn years(store: &Store) -> AppResult<HistoryYears> {
         years: Vec::new(),
         recorded_since: None,
     };
-    let Some(user) = account(store) else {
+    let Some(owner) = account(store) else {
         return Ok(none);
     };
     store.with_conn(|conn| {
         // The first and the last play through the time index, then each year
         // between them asked for a play.
         let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
-            "SELECT (SELECT MIN(played_at) FROM play_history WHERE user_id = ?1),
-                    (SELECT MAX(played_at) FROM play_history WHERE user_id = ?1)",
-            params![user],
+            &format!(
+                "SELECT (SELECT MIN(played_at) FROM play_history WHERE {MINE}),
+                        (SELECT MAX(played_at) FROM play_history WHERE {MINE})"
+            ),
+            named_params! { ":user": owner.user, ":id": owner.server.id },
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let (Some(first), Some(last)) = (first, last) else {
@@ -328,9 +359,16 @@ pub fn years(store: &Store) -> AppResult<HistoryYears> {
                 continue;
             };
             let played: bool = conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM play_history
-                                WHERE user_id = ?1 AND played_at >= ?2 AND played_at < ?3)",
-                params![user, start, end],
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM play_history
+                                    WHERE {MINE} AND played_at >= :start AND played_at < :end)"
+                ),
+                named_params! {
+                    ":user": owner.user,
+                    ":id": owner.server.id,
+                    ":start": start,
+                    ":end": end,
+                },
                 |row| row.get(0),
             )?;
             if played {
@@ -348,28 +386,36 @@ pub fn years(store: &Store) -> AppResult<HistoryYears> {
 pub fn year(store: &Store, year: i32) -> AppResult<YearReview> {
     let rows = match account(store) {
         None => Vec::new(),
-        Some(user) => store.with_conn(|conn| {
+        Some(owner) => store.with_conn(|conn| {
             let Some((start, end)) = year_bounds(conn, year)? else {
                 return Ok(Vec::new());
             };
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare(&format!(
                 "SELECT id, played_at, listened_ms, track,
                         CAST(strftime('%m', played_at / 1000, 'unixepoch', 'localtime')
                              AS INTEGER)
                  FROM play_history
-                 WHERE user_id = ?1 AND played_at >= ?2 AND played_at < ?3
-                 ORDER BY id",
-            )?;
+                 WHERE {MINE} AND played_at >= :start AND played_at < :end
+                 ORDER BY id"
+            ))?;
             let rows = statement
-                .query_map(params![user, start, end], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, u32>(4)?,
-                    ))
-                })?
+                .query_map(
+                    named_params! {
+                        ":user": owner.user,
+                        ":id": owner.server.id,
+                        ":start": start,
+                        ":end": end,
+                    },
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, u32>(4)?,
+                        ))
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })?,
@@ -702,33 +748,100 @@ fn review(year: i32, plays: &[(HistoryEntry, u32)]) -> YearReview {
 }
 
 /// Forget the history of the account signed in now, under whatever address
-/// it was played. Other accounts keep theirs.
+/// it was played. Other accounts keep theirs, and so does the same user id
+/// on another server.
 pub fn clear(store: &Store) -> AppResult<usize> {
-    let Some(user) = account(store) else {
+    let Some(owner) = account(store) else {
         return Ok(0);
     };
     store.with_conn(|conn| {
-        conn.execute("DELETE FROM play_history WHERE user_id = ?1", params![user])
+        conn.execute(
+            &format!("DELETE FROM play_history WHERE {MINE}"),
+            named_params! { ":user": owner.user, ":id": owner.server.id },
+        )
     })
 }
 
 /// Forget one listen.
 pub fn delete(store: &Store, id: i64) -> AppResult<bool> {
-    let Some(user) = account(store) else {
+    let Some(owner) = account(store) else {
         return Ok(false);
     };
     let removed = store.with_conn(|conn| {
         conn.execute(
-            "DELETE FROM play_history WHERE id = ?1 AND user_id = ?2",
-            params![id, user],
+            &format!("DELETE FROM play_history WHERE id = :row AND {MINE}"),
+            named_params! { ":row": id, ":user": owner.user, ":id": owner.server.id },
         )
     })?;
     Ok(removed > 0)
 }
 
+/// Give `owner`'s plays stored before server ids were kept, under its
+/// server's address now or one it was seen at last, that server's id
+/// (`identity::settle`). Only the account's own: another account's plays
+/// there may be of a server that stood at that address before, and given to
+/// this one they would no longer show where they belong. Left without an
+/// id, they show for their user id on any server, as before ids were kept.
+/// Returns how many. Without the id, nothing to give.
+pub fn adopt(store: &Store, owner: &Owner) -> AppResult<usize> {
+    let Some(id) = owner.server.id.as_deref() else {
+        return Ok(0);
+    };
+    if owner.user.is_empty() {
+        return Ok(0);
+    }
+    let mut addresses = store.addresses_of(id)?;
+    if !addresses.contains(&owner.server.address) {
+        addresses.push(owner.server.address.clone());
+    }
+    store.with_conn(|conn| {
+        let mut statement = conn.prepare(ADOPT_PLAYS)?;
+        let mut moved = 0;
+        for address in &addresses {
+            moved += statement.execute(params![id, address, owner.user])?;
+        }
+        Ok(moved)
+    })
+}
+
+/// [`adopt`], [`addresses_before_ids`] and [`others_played_before_ids`]:
+/// through the indexes of the plays from before ids (`store::INDEXES`),
+/// which shrink as they get theirs, never through an account's whole
+/// history.
+pub(crate) const ADOPT_PLAYS: &str = "UPDATE play_history SET server_id = ?1
+     WHERE server_id IS NULL AND server_url = ?2 AND user_id = ?3";
+pub(crate) const ADDRESSES_BEFORE_IDS: &str = "SELECT DISTINCT server_url FROM play_history
+     WHERE server_id IS NULL AND user_id = ?1 AND server_url <> ''";
+pub(crate) const OTHERS_BEFORE_IDS: &str = "SELECT EXISTS (
+         SELECT 1 FROM play_history
+         WHERE server_id IS NULL AND server_url = ?1 AND user_id <> ?2)";
+
+/// Give `user`'s plays on the server `old` to `new`: the server that took
+/// its place (`Store::replaced_ids`). Returns how many.
+pub fn take_over(store: &Store, user: &str, old: &str, new: &str) -> AppResult<usize> {
+    store.with_conn(|conn| {
+        conn.execute(
+            "UPDATE play_history SET server_id = ?1 WHERE server_id = ?2 AND user_id = ?3",
+            params![new, old, user],
+        )
+    })
+}
+
+/// Whether `user` has plays on the server `id`.
+pub fn has_plays_on(store: &Store, user: &str, id: &str) -> AppResult<bool> {
+    store.with_conn(|conn| {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM play_history WHERE user_id = ?1 AND server_id = ?2)",
+            params![user, id],
+            |row| row.get(0),
+        )
+    })
+}
+
 /// The addresses other than `server` the account `user` has played under.
 /// A Jellyfin user id is minted by one server, so they are all that server,
-/// reached another way — a new IP, a host name, https through a proxy.
+/// reached another way — a new IP, a host name, https through a proxy. What
+/// ties addresses together while the server's id is not known.
 pub fn other_addresses(store: &Store, user: &str, server: &str) -> AppResult<Vec<String>> {
     store.with_conn(|conn| {
         let mut statement = conn.prepare(
@@ -742,34 +855,73 @@ pub fn other_addresses(store: &Store, user: &str, server: &str) -> AppResult<Vec
     })
 }
 
-/// Whether another account has played on the server `user` is signed in to:
-/// under `server`, or under an address `user` has played under.
-pub fn shared_with_others(store: &Store, user: &str, server: &str) -> AppResult<bool> {
+/// The addresses `user` played under before server ids were kept.
+pub fn addresses_before_ids(store: &Store, user: &str) -> AppResult<Vec<String>> {
+    store.with_conn(|conn| {
+        let mut statement = conn.prepare(ADDRESSES_BEFORE_IDS)?;
+        let addresses = statement
+            .query_map(params![user], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(addresses)
+    })
+}
+
+/// Whether an account other than `user` played under `address` before
+/// server ids were kept.
+pub fn others_played_before_ids(store: &Store, user: &str, address: &str) -> AppResult<bool> {
+    store.with_conn(|conn| {
+        conn.query_row(OTHERS_BEFORE_IDS, params![address, user], |row| row.get(0))
+    })
+}
+
+/// Whether another account has played on `owner`'s server: by its id, or —
+/// in rows from before ids were kept, or with the id not known — under its
+/// address, an address it was seen at last, or an address `owner` has
+/// played under.
+pub fn shared_with_others(store: &Store, owner: &Owner) -> AppResult<bool> {
     store.with_conn(|conn| {
         conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM play_history
-                            WHERE user_id <> ?1
-                              AND (server_url = ?2
-                                   OR server_url IN (SELECT server_url FROM play_history
-                                                     WHERE user_id = ?1)))",
-            params![user, server],
+            &format!(
+                "SELECT EXISTS (
+                     SELECT 1 FROM play_history
+                     WHERE user_id <> :user
+                       AND ((:id IS NOT NULL AND server_id = :id)
+                            OR ((server_id IS NULL OR :id IS NULL)
+                                AND (server_url = :address
+                                     OR server_url IN ({ADDRESSES_OF})
+                                     OR server_url IN (SELECT server_url FROM play_history
+                                                       WHERE {MINE})))))"
+            ),
+            named_params! {
+                ":user": owner.user,
+                ":id": owner.server.id,
+                ":address": owner.server.address,
+            },
             |row| row.get(0),
         )
     })
 }
 
-/// Which of `item_ids` the account `user` has played, under any address.
-pub fn played_by(store: &Store, user: &str, item_ids: &[String]) -> AppResult<HashSet<String>> {
+/// Which of `item_ids` the account `owner` has played, under any address.
+pub fn played_by(store: &Store, owner: &Owner, item_ids: &[String]) -> AppResult<HashSet<String>> {
+    use rusqlite::types::Value;
     let mut played = HashSet::new();
     // Well under the number of parameters SQLite takes in one statement.
     for chunk in item_ids.chunks(500) {
         let sql = format!(
-            "SELECT DISTINCT item_id FROM play_history WHERE user_id = ? AND item_id IN ({})",
+            "SELECT DISTINCT item_id FROM play_history
+             WHERE user_id = ?1 AND (?2 IS NULL OR server_id IS NULL OR server_id = ?2)
+               AND item_id IN ({})",
             vec!["?"; chunk.len()].join(", ")
         );
         let found = store.with_conn(|conn| {
             let mut statement = conn.prepare(&sql)?;
-            let values = std::iter::once(user).chain(chunk.iter().map(String::as_str));
+            let values = [
+                Value::Text(owner.user.clone()),
+                owner.server.id.clone().map_or(Value::Null, Value::Text),
+            ]
+            .into_iter()
+            .chain(chunk.iter().cloned().map(Value::Text));
             let found = statement
                 .query_map(rusqlite::params_from_iter(values), |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -783,6 +935,8 @@ pub fn played_by(store: &Store, user: &str, item_ids: &[String]) -> AppResult<Ha
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::Server;
+    use crate::store::keys;
     use std::path::PathBuf;
 
     /// A store in its own temp directory, closed before the directory goes:
@@ -816,6 +970,29 @@ mod tests {
         store.set(keys::SERVER_URL, "https://music.home").unwrap();
         store.set(keys::USER_ID, "u1").unwrap();
         store
+    }
+
+    /// A listen of whoever the store says is signed in.
+    fn play(store: &Store, track: &HistoryTrack, listened_ms: u64, at: i64) -> AppResult<bool> {
+        let nobody = Owner {
+            server: Server {
+                address: String::new(),
+                id: None,
+            },
+            user: String::new(),
+        };
+        let owner = Owner::current(store).unwrap_or(nobody);
+        record_at(store, &owner, track, listened_ms, at)
+    }
+
+    fn owner(user: &str, address: &str, id: Option<&str>) -> Owner {
+        Owner {
+            server: Server {
+                address: address.into(),
+                id: id.map(str::to_string),
+            },
+            user: user.into(),
+        }
     }
 
     fn track(id: &str, artist: &str, album: Option<&str>) -> HistoryTrack {
@@ -861,7 +1038,7 @@ mod tests {
     fn pages_go_back_in_time_and_end() {
         let store = signed_in();
         for i in 0..5 {
-            record_at(
+            play(
                 &store,
                 &track(&i.to_string(), "A", Some("x")),
                 1_000,
@@ -893,11 +1070,11 @@ mod tests {
     #[test]
     fn each_account_sees_only_its_own_history() {
         let store = signed_in();
-        record_at(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
+        play(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
         store.set(keys::USER_ID, "u2").unwrap();
         assert!(page(&store, None, 50).unwrap().is_empty());
         assert!(years(&store).unwrap().years.is_empty());
-        record_at(&store, &track("b", "B", None), 1_000, day(1, 6)).unwrap();
+        play(&store, &track("b", "B", None), 1_000, day(1, 6)).unwrap();
         assert_eq!(clear(&store).unwrap(), 1);
 
         store.set(keys::USER_ID, "u1").unwrap();
@@ -911,12 +1088,12 @@ mod tests {
     #[test]
     fn the_same_account_under_a_new_address_keeps_its_history() {
         let store = signed_in();
-        record_at(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
+        play(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
         // The server moved behind a reverse proxy; the account is the same.
         store
             .set(keys::SERVER_URL, "https://music.example.org")
             .unwrap();
-        record_at(&store, &track("b", "A", None), 1_000, day(1, 6)).unwrap();
+        play(&store, &track("b", "A", None), 1_000, day(1, 6)).unwrap();
         assert_eq!(page(&store, None, 50).unwrap().len(), 2);
         assert_eq!(year(&store, 2026).unwrap().plays, 2);
         assert_eq!(years(&store).unwrap().recorded_since, Some(day(1, 5)));
@@ -940,7 +1117,7 @@ mod tests {
         };
         unreadable(&store);
         for i in 0..3 {
-            record_at(
+            play(
                 &store,
                 &track(&i.to_string(), "A", None),
                 1_000,
@@ -950,7 +1127,7 @@ mod tests {
         }
         unreadable(&store);
         for i in 3..5 {
-            record_at(
+            play(
                 &store,
                 &track(&i.to_string(), "A", None),
                 1_000,
@@ -981,7 +1158,7 @@ mod tests {
             ("last", local(2026, 12, 31, "23:59:00")),
             ("next", local(2027, 1, 1, "00:01:00")),
         ] {
-            record_at(&store, &track(id, "A", None), 1_000, at).unwrap();
+            play(&store, &track(id, "A", None), 1_000, at).unwrap();
         }
         let review = year(&store, 2026).unwrap();
         assert_eq!(review.plays, 2);
@@ -1166,11 +1343,11 @@ mod tests {
     #[test]
     fn the_plays_of_an_account_tie_its_addresses_together() {
         let store = signed_in();
-        record_at(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
+        play(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
         store
             .set(keys::SERVER_URL, "https://music.example.org")
             .unwrap();
-        record_at(&store, &track("b", "A", None), 1_000, day(1, 6)).unwrap();
+        play(&store, &track("b", "A", None), 1_000, day(1, 6)).unwrap();
         assert_eq!(
             other_addresses(&store, "u1", "https://music.example.org").unwrap(),
             ["https://music.home"]
@@ -1179,28 +1356,145 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            played_by(&store, "u1", &["a".into(), "b".into(), "c".into()]).unwrap(),
+            played_by(
+                &store,
+                &owner("u1", "https://music.example.org", None),
+                &["a".into(), "b".into(), "c".into()]
+            )
+            .unwrap(),
             HashSet::from(["a".to_string(), "b".to_string()])
         );
-        assert!(played_by(&store, "u2", &["a".into()]).unwrap().is_empty());
+        assert!(played_by(
+            &store,
+            &owner("u2", "https://music.example.org", None),
+            &["a".into()]
+        )
+        .unwrap()
+        .is_empty());
 
         // Alone on its server, under both of its addresses.
-        assert!(!shared_with_others(&store, "u1", "https://music.example.org").unwrap());
+        assert!(
+            !shared_with_others(&store, &owner("u1", "https://music.example.org", None)).unwrap()
+        );
         // A second account plays on the server under its old address.
         store.set(keys::SERVER_URL, "https://music.home").unwrap();
         store.set(keys::USER_ID, "kid").unwrap();
-        record_at(&store, &track("k", "K", None), 1_000, day(1, 7)).unwrap();
-        assert!(shared_with_others(&store, "u1", "https://music.example.org").unwrap());
-        assert!(shared_with_others(&store, "kid", "https://music.home").unwrap());
+        play(&store, &track("k", "K", None), 1_000, day(1, 7)).unwrap();
+        assert!(
+            shared_with_others(&store, &owner("u1", "https://music.example.org", None)).unwrap()
+        );
+        assert!(shared_with_others(&store, &owner("kid", "https://music.home", None)).unwrap());
         // An account on another server shares nothing with them.
-        assert!(!shared_with_others(&store, "far", "https://far.away").unwrap());
+        assert!(!shared_with_others(&store, &owner("far", "https://far.away", None)).unwrap());
+    }
+
+    fn ids(rows: &[HistoryEntry]) -> Vec<&str> {
+        rows.iter().map(|e| e.track.item_id.as_str()).collect()
+    }
+
+    #[test]
+    fn two_servers_with_the_same_user_ids_keep_two_histories() {
+        // A server set up as a copy of another: the same user ids, a server
+        // id of its own.
+        let store = signed_in();
+        store.record_server("https://music.home", "first").unwrap();
+        play(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
+        store.set(keys::SERVER_URL, "https://copy.home").unwrap();
+        store.record_server("https://copy.home", "copy").unwrap();
+        assert!(page(&store, None, 50).unwrap().is_empty());
+        assert!(years(&store).unwrap().years.is_empty());
+        play(&store, &track("b", "A", None), 1_000, day(1, 6)).unwrap();
+        let mine = page(&store, None, 50).unwrap();
+        assert_eq!(ids(&mine), ["b"]);
+        assert_eq!(year(&store, 2026).unwrap().plays, 1);
+
+        store.set(keys::SERVER_URL, "https://music.home").unwrap();
+        let first = page(&store, None, 50).unwrap();
+        assert_eq!(ids(&first), ["a"]);
+        assert!(!delete(&store, mine[0].id).unwrap(), "the copy's play");
+        assert_eq!(clear(&store).unwrap(), 1);
+        store.set(keys::SERVER_URL, "https://copy.home").unwrap();
+        assert_eq!(ids(&page(&store, None, 50).unwrap()), ["b"]);
+    }
+
+    #[test]
+    fn plays_from_before_server_ids_go_to_the_server_seen_at_their_address() {
+        // Recorded by 0.6.1: no server id.
+        let store = signed_in();
+        play(&store, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
+        store.set(keys::SERVER_URL, "http://old.box:8096").unwrap();
+        play(&store, &track("w", "A", None), 1_000, day(1, 6)).unwrap();
+        store.set(keys::USER_ID, "kid").unwrap();
+        store.set(keys::SERVER_URL, "https://music.home").unwrap();
+        play(&store, &track("k", "K", None), 1_000, day(1, 7)).unwrap();
+        store.set(keys::USER_ID, "u1").unwrap();
+        // Until a server answers with its id, they are the user id's, on
+        // whatever server it signs in to.
+        assert_eq!(ids(&page(&store, None, 50).unwrap()), ["w", "a"]);
+
+        // The update signs in at music.home and learns its id.
+        store.record_server("https://music.home", "s1").unwrap();
+        let me = owner("u1", "https://music.home", Some("s1"));
+        assert_eq!(adopt(&store, &me).unwrap(), 1, "the account's own");
+        assert_eq!(adopt(&store, &me).unwrap(), 0, "once");
+        // The kid's play stays the kid's on any server: music.home may have
+        // been another server's address when it was heard. It still tells
+        // that another account plays here.
+        assert_eq!(
+            addresses_before_ids(&store, "kid").unwrap(),
+            ["https://music.home"]
+        );
+        assert!(others_played_before_ids(&store, "u1", "https://music.home").unwrap());
+        assert!(!others_played_before_ids(&store, "kid", "https://music.home").unwrap());
+        assert!(shared_with_others(&store, &me).unwrap());
+        // So it does for an account that has played nothing yet, reaching
+        // the server through another address.
+        store.record_server("https://proxy.home", "s1").unwrap();
+        let newcomer = owner("new", "https://proxy.home", Some("s1"));
+        assert!(shared_with_others(&store, &newcomer).unwrap());
+        assert!(
+            !shared_with_others(&store, &owner("new", "https://far.home", Some("s9"))).unwrap()
+        );
+        assert_eq!(
+            addresses_before_ids(&store, "u1").unwrap(),
+            ["http://old.box:8096"]
+        );
+        // The play under an address no server was seen at still counts for
+        // the account, on this server and on a copy of it alike.
+        assert_eq!(ids(&page(&store, None, 50).unwrap()), ["w", "a"]);
+        store.set(keys::SERVER_URL, "https://copy.home").unwrap();
+        store.record_server("https://copy.home", "copy").unwrap();
+        assert_eq!(ids(&page(&store, None, 50).unwrap()), ["w"]);
+    }
+
+    #[test]
+    fn another_account_counts_only_on_the_same_server() {
+        let store = signed_in();
+        let me = owner("u1", "https://music.home", Some("s1"));
+        record_at(&store, &me, &track("a", "A", None), 1_000, day(1, 5)).unwrap();
+        // The same user id on a copy of the server, under another id.
+        let copy = owner("kid", "https://copy.home", Some("s2"));
+        record_at(&store, &copy, &track("k", "K", None), 1_000, day(1, 6)).unwrap();
+        assert!(!shared_with_others(&store, &me).unwrap());
+        // The kid on this server, under another of its addresses.
+        let kid = owner("kid", "https://proxy.home", Some("s1"));
+        record_at(&store, &kid, &track("k", "K", None), 1_000, day(1, 7)).unwrap();
+        assert!(shared_with_others(&store, &me).unwrap());
+        assert_eq!(
+            played_by(&store, &me, &["a".into(), "k".into()]).unwrap(),
+            HashSet::from(["a".to_string()])
+        );
+        let me_on_the_copy = owner("u1", "https://copy.home", Some("s2"));
+        assert!(played_by(&store, &me_on_the_copy, &["a".into()])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn nothing_is_recorded_while_signed_out() {
         let store = signed_in();
         store.delete(keys::USER_ID).unwrap();
-        assert!(!record_at(&store, &track("a", "A", None), 1_000, day(1, 1)).unwrap());
+        assert!(!play(&store, &track("a", "A", None), 1_000, day(1, 1)).unwrap());
         assert!(page(&store, None, 50).unwrap().is_empty());
     }
 
@@ -1215,7 +1509,7 @@ mod tests {
             ("4", "Beta", None, day(12, 31)),
         ];
         for (id, artist, album, at) in plays {
-            record_at(&store, &track(id, artist, album), 60_000, at).unwrap();
+            play(&store, &track(id, artist, album), 60_000, at).unwrap();
         }
         let review = year(&store, 2026).unwrap();
         assert_eq!(review.plays, 5);
@@ -1274,7 +1568,7 @@ mod tests {
     #[test]
     fn an_unreadable_row_is_skipped() {
         let store = signed_in();
-        record_at(&store, &track("a", "A", None), 1_000, day(1, 1)).unwrap();
+        play(&store, &track("a", "A", None), 1_000, day(1, 1)).unwrap();
         store
             .with_conn(|conn| {
                 conn.execute(

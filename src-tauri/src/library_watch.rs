@@ -7,10 +7,11 @@
 //! makes it feel immediate after adding music on the server.
 
 use crate::api::LibrarySignature;
+use crate::error::AppError;
 use crate::player::SharedSession;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 
@@ -87,7 +88,26 @@ pub fn spawn(app: AppHandle, session: SharedSession) -> LibraryWatchHandle {
             // the frontend's spinner debounce elapses, so it stays invisible
             // for the routine 30 s ticks and only shows on a slow/manual check.
             let _ = app.emit("library:sync", "checking");
-            match client.library_signature().await {
+            let signature = match client.library_signature().await {
+                // A revoked session: renewed the way every caller renews it,
+                // and asked once more. The renewed one is the same account,
+                // so the baseline still applies.
+                Err(unauthorized @ AppError::Server { status: 401, .. }) => {
+                    match crate::commands::renew_session(
+                        &app,
+                        &client,
+                        Instant::now(),
+                        unauthorized,
+                    )
+                    .await
+                    {
+                        Ok(renewed) => renewed.library_signature().await,
+                        Err(e) => Err(e),
+                    }
+                }
+                other => other,
+            };
+            match signature {
                 Ok(sig) => {
                     if library_changed(last.as_ref(), &identity, &sig) {
                         tracing::debug!("library changed on server");

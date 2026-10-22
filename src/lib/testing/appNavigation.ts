@@ -5,3 +5,11 @@
  * navigates mocks this module.
  */
 export async function goto(_url: string | URL, _options?: unknown): Promise<void> {}
+
+/** No history in a test: nothing is captured or restored. */
+export function snapshot<T>(_options: {
+  id?: string;
+  capture: () => T;
+  restore: (value: T) => void;
+  reset?: () => void;
+}): void {}

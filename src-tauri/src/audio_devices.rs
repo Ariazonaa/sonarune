@@ -30,7 +30,8 @@ fn fallback_device_slot() -> &'static Mutex<Option<String>> {
 }
 
 /// The device the open output actually plays through (resolved from "system
-/// default" too). Keys the per-device sound profiles.
+/// default" too). Keys the per-device sound profiles. Kept while the output
+/// is closed after a long pause: the music goes on there.
 static ACTIVE_DEVICE: Mutex<Option<OutputDevice>> = Mutex::new(None);
 
 pub fn set_active_device(device: Option<OutputDevice>) {

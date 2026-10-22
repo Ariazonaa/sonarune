@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { api, formatDuration } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause, errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
   import AlbumContextMenu from "#lib/components/AlbumContextMenu.svelte";
@@ -28,7 +29,7 @@
     toggleFavorite: (album) => {
       dropAlbum(album.id);
       apiLibrary.setFavorite(album.id, false).catch((e) => {
-        player.error = String(e);
+        player.error = errorMessage(e);
         load();
       });
     },
@@ -64,7 +65,7 @@
         error = null;
       })
       .catch((e) => {
-        if (seq === loadSeq && !favorites) error = String(e);
+        if (seq === loadSeq && !favorites) error = errorCause(e);
       });
   }
 
@@ -115,7 +116,7 @@
               // the page either way until then. Through the player store, so
               // the player bar's heart lets go too when this track plays.
               player.setFavorite(ids[0], false).catch((e) => {
-                player.error = String(e);
+                player.error = errorMessage(e);
                 load();
               });
             },
@@ -155,7 +156,7 @@
         if (seq === generation && favorites) favorites.tracks = mergePage(favorites.tracks, next);
       }
     } catch (e) {
-      if (seq === generation) moreError[section] = String(e);
+      if (seq === generation) moreError[section] = errorCause(e);
     } finally {
       if (seq === generation) loadingMore[section] = false;
     }

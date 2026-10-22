@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { VList } from "virtua/svelte";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { player } from "#lib/state/player.svelte.js";
   import VisualizerProjectorPanel from "#lib/components/VisualizerProjectorPanel.svelte";
@@ -284,7 +285,7 @@
         });
         if (container) observer.observe(container);
       } catch (e) {
-        banner.error(String(e));
+        banner.error(errorCause(e));
       }
     })();
 

@@ -1,0 +1,134 @@
+name: Beta channel
+
+# Moves the beta channel's pointer. Installs that chose the beta channel in
+# Settings -> Updates ask `releases/download/beta-channel/beta.json` as well as
+# the stable `releases/latest/download/latest.json`, and take the newer answer
+# (src-tauri/src/updater.rs). `beta.json` is a copy of a pre-release's own
+# `latest.json`, kept as the only file of the fixed pre-release `beta-channel`:
+# the release workflow cannot write it, because a draft's files are not
+# downloadable yet, and the draft is published by hand. So this runs when it
+# is, and points the channel at it.
+#
+# Nothing here is signed or needs a secret. The pointer only names an
+# installer whose signature the app checks against its public key, the same
+# as on the stable path; a pointer that is wrong, stale or missing for a
+# moment holds nobody back from the stable releases either, since a beta
+# install takes the newer of both answers.
+#
+# **Publishing a beta**: push a tag with a pre-release version (`v0.7.0-beta.1`,
+# the version in the manifests first, as for any release). The release
+# workflow drafts it as a pre-release; publish the draft and this runs. A
+# pre-release published after a newer one (a late beta for an older line)
+# leaves the pointer where it is.
+#
+# **Rolling a beta back**: un-publish or delete it, then run this by hand with
+# the tag the channel should offer instead -- the beta before it, or the
+# current stable release, which leaves the channel with nothing beyond stable.
+# A manual run points the channel wherever it is told, older or not. As on the
+# stable path, nothing downgrades an install that already took the bad beta.
+#
+# Should the repository ever switch on immutable releases, the files of a
+# published release can no longer be replaced, and this job fails at the
+# upload: the pointer then needs a host of its own.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release the beta channel offers from now on, e.g. v0.7.0-beta.2"
+        required: true
+
+# Nothing by default; the one job names what it needs.
+permissions: {}
+
+# Two betas published in quick succession must not race for the pointer.
+concurrency:
+  group: beta-channel
+  cancel-in-progress: false
+
+jobs:
+  point:
+    # Pre-releases only: a stable release reaches beta installs through the
+    # stable endpoint. The pointer's own release never points at itself.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.release.prerelease && github.event.release.tag_name != 'beta-channel')
+    runs-on: ubuntu-latest
+    permissions:
+      # Replacing the file of the `beta-channel` release. Nothing of the
+      # project runs in this job, only `gh`.
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+      MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Point beta.json at the release
+        shell: pwsh
+        run: |
+          # Semantic version precedence (semver.org, section 11). PowerShell's
+          # own [semver] compares pre-release labels as plain strings, which
+          # would put beta.10 before beta.2.
+          function Get-Parts([string] $version) {
+            $core, $pre = ($version -split '\+')[0] -split '-', 2
+            [pscustomobject]@{
+              Core = [long[]]($core -split '\.')
+              # Inside @(): an `if` alone would unroll a one-part label into
+              # a plain string, and index its characters below.
+              Pre  = @(if ($pre) { $pre -split '\.' })
+            }
+          }
+          function Compare-SemVer([string] $a, [string] $b) {
+            $x = Get-Parts $a; $y = Get-Parts $b
+            for ($i = 0; $i -lt 3; $i++) {
+              if ($x.Core[$i] -ne $y.Core[$i]) { return [Math]::Sign($x.Core[$i] - $y.Core[$i]) }
+            }
+            if ($x.Pre.Count -eq 0 -or $y.Pre.Count -eq 0) { return [Math]::Sign($y.Pre.Count - $x.Pre.Count) }
+            for ($i = 0; $i -lt [Math]::Min($x.Pre.Count, $y.Pre.Count); $i++) {
+              $p = $x.Pre[$i]; $q = $y.Pre[$i]
+              $pn = $p -match '^\d+$'; $qn = $q -match '^\d+$'
+              if ($pn -and $qn) { $d = [Math]::Sign([long]$p - [long]$q) }
+              elseif ($pn) { $d = -1 }
+              elseif ($qn) { $d = 1 }
+              else { $d = [Math]::Sign([string]::CompareOrdinal($p, $q)) }
+              if ($d) { return $d }
+            }
+            return [Math]::Sign($x.Pre.Count - $y.Pre.Count)
+          }
+
+          gh release download $env:TAG --repo $env:REPO --pattern latest.json --dir new
+          if ($LASTEXITCODE) { "::error::$($env:TAG) carries no latest.json, or is not published"; exit 1 }
+          $version = (Get-Content new/latest.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne $env:TAG) { "::error::latest.json of $($env:TAG) announces $version"; exit 1 }
+
+          gh release view beta-channel --repo $env:REPO --json tagName | Out-Null
+          if ($LASTEXITCODE) {
+            # The first beta: the pointer's release does not exist yet. A
+            # pre-release, so it never becomes the latest release the stable
+            # endpoint answers from.
+            @(
+              "The beta channel's pointer, not a release to download: it holds"
+              "``beta.json``, which names the latest beta for installs that chose"
+              "the beta channel in Settings -> Updates. The betas themselves are"
+              "the pre-releases on this page."
+            ) | Out-File -FilePath notes.md -Encoding utf8
+            gh release create beta-channel --repo $env:REPO --prerelease --latest=false --title "Beta channel" --notes-file notes.md
+            if ($LASTEXITCODE) { "::error::could not create the release beta-channel"; exit 1 }
+          } elseif ($env:MANUAL -ne 'true') {
+            gh release download beta-channel --repo $env:REPO --pattern beta.json --dir old
+            if (-not $LASTEXITCODE) {
+              $current = (Get-Content old/beta.json -Raw | ConvertFrom-Json).version
+              if ((Compare-SemVer $version $current) -le 0) {
+                "the beta channel already offers $current; $version is not newer, so the pointer stays"
+                exit 0
+              }
+            }
+          }
+
+          Move-Item new/latest.json new/beta.json
+          gh release upload beta-channel new/beta.json --repo $env:REPO --clobber
+          if ($LASTEXITCODE) { "::error::could not replace beta.json on the release beta-channel"; exit 1 }
+          "the beta channel offers $version ($($env:TAG)) from now on"

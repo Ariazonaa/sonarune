@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import { api } from "#lib/api.js";
   import { apiDiscovery, type SimilarArtistsRow } from "#lib/api/discovery.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import DiscoveryArtistCard from "#lib/components/DiscoveryArtistCard.svelte";
   import CardSkeleton from "#lib/components/CardSkeleton.svelte";
@@ -28,11 +29,11 @@
       const result = await apiDiscovery.getSimilarArtists(artistId, 100);
       if (seq !== generation) return;
       row = result;
-      error = result.error;
+      error = result.error ? errorCause(result.error) : null;
       const key = result.seed?.id ?? artistId;
       if (key && (result.items.length || !result.error)) swrSet(cacheKey(key), { ...result, error: null });
     } catch (cause) {
-      if (seq === generation) error = String(cause);
+      if (seq === generation) error = errorCause(cause);
     }
   }
 

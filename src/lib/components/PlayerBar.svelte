@@ -2,6 +2,7 @@
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
+  import { errorMessage } from "#lib/appErrors.js";
   import { player } from "#lib/state/player.svelte.js";
   import { api } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
@@ -87,7 +88,7 @@
         title: "Sonarune Mini",
       });
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 

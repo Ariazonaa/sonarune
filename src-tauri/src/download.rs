@@ -1,3 +1,4 @@
+use crate::api::JellyfinClient;
 use crate::commands::{
     collision_filename, filename_len, sanitize_filename, truncate_to_filename_len, MAX_FILENAME_LEN,
 };
@@ -15,10 +16,10 @@ use tokio::sync::{Notify, Semaphore};
 
 const MAX_CONCURRENT: usize = 2;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
-/// How often progress alone may send the task list to the UI. Every event
-/// carries all tasks, finished ones included, so a tick from each running
-/// download would re-send and re-render a long batch some 13 times a second.
-/// A change of status still goes out at once.
+/// How often progress alone may go to the UI: a tick from each running
+/// download would otherwise send some 13 events a second. A change of status
+/// still goes out at once, and progress held back goes out at the latest when
+/// the interval is over, even if no further tick comes (a stalled server).
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
 /// Ceiling for a single track when the server announces no `Content-Length`.
 /// Far above any real audio file, including long high-resolution material.
@@ -44,7 +45,7 @@ pub enum DownloadStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadTask {
     pub id: String,
@@ -55,7 +56,49 @@ pub struct DownloadTask {
     pub total_bytes: Option<u64>,
     pub path: Option<String>,
     pub error: Option<String>,
+    /// The list's revision at this task's last change. The UI keeps the newer
+    /// of two copies of a task by it, whichever way they reached it.
+    pub revision: u64,
 }
+
+/// The whole task list: the `download:state` event and what `get_downloads`
+/// answers.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadSnapshot {
+    /// The list's revision when it was taken. Every change raises it, so a
+    /// list older than one the UI already has can be told apart.
+    pub revision: u64,
+    pub tasks: Vec<DownloadTask>,
+}
+
+/// What goes to the UI.
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    /// `download:state`: the whole list, after a change to which tasks there
+    /// are (added, cleared, dropped at sign-out).
+    State(DownloadSnapshot),
+    /// `download:changed`: only the tasks that changed since the last event —
+    /// progress, status, name, size. A batch of thousands costs per event
+    /// what its running downloads cost, not what the whole list does.
+    Changed(Vec<DownloadTask>),
+}
+
+type EventSink = Box<dyn Fn(DownloadEvent) + Send + Sync>;
+
+/// Renews a revoked session (`commands::renew_session`). Handed in like the
+/// sink, so tests reach `request` without linking the app's runtime: the
+/// test binary has no manifest for the common controls it would pull in.
+type Renewal = Box<
+    dyn Fn(
+            Arc<JellyfinClient>,
+            Instant,
+            AppError,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = AppResult<Arc<JellyfinClient>>> + Send>,
+        > + Send
+        + Sync,
+>;
 
 struct ManagedTask {
     public: DownloadTask,
@@ -64,18 +107,96 @@ struct ManagedTask {
     attempt: u64,
 }
 
+/// The tasks, with what the UI has not been told yet.
+#[derive(Default)]
+struct TaskList {
+    tasks: Vec<ManagedTask>,
+    /// Raised by every change. A changed task carries the value it was
+    /// raised to.
+    revision: u64,
+    /// Tasks changed since the last event went out.
+    changed: HashSet<String>,
+}
+
+impl TaskList {
+    fn snapshot(&self) -> DownloadSnapshot {
+        DownloadSnapshot {
+            revision: self.revision,
+            tasks: self.tasks.iter().map(|task| task.public.clone()).collect(),
+        }
+    }
+
+    fn position(&self, id: &str, attempt: u64) -> Option<usize> {
+        self.tasks
+            .iter()
+            .position(|task| task.public.id == id && task.attempt == attempt)
+    }
+
+    /// Apply `update` to the task at `index`. Only a real change raises the
+    /// revision and waits to be sent: a cancelled download that winds down
+    /// and reports "cancelled" once more sends nothing.
+    fn modify_at(&mut self, index: usize, update: impl FnOnce(&mut DownloadTask)) -> bool {
+        let Some(task) = self.tasks.get_mut(index) else {
+            return false;
+        };
+        let before = task.public.clone();
+        update(&mut task.public);
+        if task.public == before {
+            return false;
+        }
+        self.revision += 1;
+        task.public.revision = self.revision;
+        self.changed.insert(task.public.id.clone());
+        true
+    }
+
+    /// The tasks changed since the last event, in list order.
+    fn take_changed(&mut self) -> Vec<DownloadTask> {
+        if self.changed.is_empty() {
+            return Vec::new();
+        }
+        let changed = std::mem::take(&mut self.changed);
+        self.tasks
+            .iter()
+            .filter(|task| changed.contains(&task.public.id))
+            .map(|task| task.public.clone())
+            .collect()
+    }
+}
+
+/// What the UI is sent next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Emit {
+    /// The whole list: which tasks there are changed.
+    List,
+    /// The changed tasks, now: a status changed.
+    Changes,
+    /// The changed tasks, once [`PROGRESS_EMIT_INTERVAL`] allows.
+    Progress,
+}
+
+#[derive(Default)]
+struct EmitState {
+    /// When the last event went out.
+    last: Option<Instant>,
+    /// A send of held-back progress is scheduled.
+    flush_scheduled: bool,
+}
+
 struct DownloadInner {
-    app: AppHandle,
+    sink: EventSink,
+    /// For a revoked session (`request`); tests run without one.
+    renewal: Option<Renewal>,
     session: SharedSession,
     dir: PathBuf,
     semaphore: Arc<Semaphore>,
-    tasks: Mutex<Vec<ManagedTask>>,
+    tasks: Mutex<TaskList>,
     reserved_paths: Mutex<HashSet<PathBuf>>,
-    /// When the task list last went to the UI. Held while a list is taken and
-    /// sent, so lists arrive in the order they were taken: two tasks finishing
-    /// at once could otherwise leave the older list, with one of them still
-    /// running, as the last word.
-    last_emit: Mutex<Option<Instant>>,
+    /// Held while an event is taken and sent, so events arrive in the order
+    /// they were taken: two tasks finishing at once could otherwise leave the
+    /// older word, with one of them still running, as the last one. Locked
+    /// before `tasks`, never while holding it.
+    emit: Mutex<EmitState>,
 }
 
 #[derive(Clone)]
@@ -113,105 +234,118 @@ impl Drop for PartGuard {
 
 impl DownloadManager {
     pub fn new(app: AppHandle, session: SharedSession, dir: PathBuf) -> AppResult<Self> {
+        let events = app.clone();
+        let sink = move |event: DownloadEvent| {
+            let _ = match event {
+                DownloadEvent::State(snapshot) => events.emit("download:state", snapshot),
+                DownloadEvent::Changed(tasks) => events.emit("download:changed", tasks),
+            };
+        };
+        let renewal: Renewal = Box::new(move |client, at, unauthorized| {
+            let app = app.clone();
+            Box::pin(async move {
+                crate::commands::renew_session(&app, &client, at, unauthorized).await
+            })
+        });
+        Self::with_sink(Box::new(sink), Some(renewal), session, dir)
+    }
+
+    fn with_sink(
+        sink: EventSink,
+        renewal: Option<Renewal>,
+        session: SharedSession,
+        dir: PathBuf,
+    ) -> AppResult<Self> {
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Other(format!("cannot create downloads folder: {e}")))?;
         cleanup_stale_parts(&dir);
         Ok(Self {
             inner: Arc::new(DownloadInner {
-                app,
+                sink,
+                renewal,
                 session,
                 dir,
                 semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT)),
-                tasks: Mutex::new(Vec::new()),
+                tasks: Mutex::new(TaskList::default()),
                 reserved_paths: Mutex::new(HashSet::new()),
-                last_emit: Mutex::new(None),
+                emit: Mutex::new(EmitState::default()),
             }),
         })
     }
 
-    pub fn list(&self) -> Vec<DownloadTask> {
-        self.inner
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|task| task.public.clone())
-            .collect()
+    /// The whole list with its revision, as the UI reads it on start and
+    /// when its window comes back.
+    pub fn snapshot(&self) -> DownloadSnapshot {
+        self.inner.tasks.lock().unwrap().snapshot()
     }
 
     pub fn enqueue(&self, requests: Vec<DownloadRequest>) -> Vec<DownloadTask> {
-        let mut ids = Vec::new();
+        let added = self.add(requests);
+        for task in &added {
+            self.spawn(task.id.clone(), 0);
+        }
+        added
+    }
+
+    /// Put the requested tracks on the list, queued, and send the list.
+    fn add(&self, requests: Vec<DownloadRequest>) -> Vec<DownloadTask> {
+        let mut added = Vec::new();
         {
-            let mut tasks = self.inner.tasks.lock().unwrap();
+            let mut list = self.inner.tasks.lock().unwrap();
+            list.revision += 1;
+            let revision = list.revision;
             for request in requests {
                 let item_id = request.item_id.trim().to_string();
                 if item_id.is_empty() {
                     continue;
                 }
-                let id = uuid::Uuid::new_v4().to_string();
-                ids.push(id.clone());
-                tasks.push(ManagedTask {
-                    public: DownloadTask {
-                        id,
-                        item_id,
-                        name: display_name(&request.name),
-                        status: DownloadStatus::Queued,
-                        received_bytes: 0,
-                        total_bytes: None,
-                        path: None,
-                        error: None,
-                    },
+                let public = DownloadTask {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    item_id,
+                    name: display_name(&request.name),
+                    status: DownloadStatus::Queued,
+                    received_bytes: 0,
+                    total_bytes: None,
+                    path: None,
+                    error: None,
+                    revision,
+                };
+                added.push(public.clone());
+                list.tasks.push(ManagedTask {
+                    public,
                     cancel: Arc::new(AtomicBool::new(false)),
                     cancel_wake: Arc::new(Notify::new()),
                     attempt: 0,
                 });
             }
         }
-        self.emit();
-        for id in &ids {
-            self.spawn(id.clone(), 0);
-        }
-        let id_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
-        self.list()
-            .into_iter()
-            .filter(|task| id_set.contains(task.id.as_str()))
-            .collect()
+        self.send(Emit::List);
+        added
     }
 
     pub fn cancel(&self, id: &str) -> AppResult<()> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
-        let task = tasks
-            .iter_mut()
-            .find(|task| task.public.id == id)
+        let mut list = self.inner.tasks.lock().unwrap();
+        let index = list
+            .tasks
+            .iter()
+            .position(|task| task.public.id == id)
             .ok_or_else(|| AppError::Other("download not found".into()))?;
-        if matches!(
-            task.public.status,
-            DownloadStatus::Queued | DownloadStatus::Downloading
-        ) {
-            task.cancel.store(true, Ordering::Release);
-            task.cancel_wake.notify_one();
-            task.public.status = DownloadStatus::Cancelled;
-            task.public.error = None;
-        }
-        drop(tasks);
-        self.emit();
+        cancel_at(&mut list, index);
+        drop(list);
+        self.send(Emit::Changes);
         Ok(())
     }
 
     /// Signal every running download to stop. Used on the quit paths so the
     /// in-progress `.part` files are abandoned deliberately (the startup sweep
     /// removes them) instead of the process being pulled out from under them.
+    /// Sends nothing itself, as it runs on the quit paths: after a blocked
+    /// update, the first download that winds down carries all of them to the
+    /// panel.
     pub fn cancel_all(&self) {
-        let mut tasks = self.inner.tasks.lock().unwrap();
-        for task in tasks.iter_mut() {
-            if matches!(
-                task.public.status,
-                DownloadStatus::Queued | DownloadStatus::Downloading
-            ) {
-                task.cancel.store(true, Ordering::Release);
-                task.cancel_wake.notify_one();
-                task.public.status = DownloadStatus::Cancelled;
-            }
+        let mut list = self.inner.tasks.lock().unwrap();
+        for index in 0..list.tasks.len() {
+            cancel_at(&mut list, index);
         }
     }
 
@@ -221,45 +355,62 @@ impl DownloadManager {
     /// update.
     pub fn reset(&self) {
         self.cancel_all();
-        self.inner.tasks.lock().unwrap().clear();
-        self.emit();
+        {
+            let mut list = self.inner.tasks.lock().unwrap();
+            list.tasks.clear();
+            list.revision += 1;
+        }
+        self.send(Emit::List);
     }
 
     pub fn retry(&self, id: &str) -> AppResult<()> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
-        let task = tasks
-            .iter_mut()
-            .find(|task| task.public.id == id)
+        let mut list = self.inner.tasks.lock().unwrap();
+        let index = list
+            .tasks
+            .iter()
+            .position(|task| task.public.id == id)
             .ok_or_else(|| AppError::Other("download not found".into()))?;
-        if !matches!(
-            task.public.status,
-            DownloadStatus::Failed | DownloadStatus::Cancelled
-        ) {
+        let Some(attempt) = requeue_at(&mut list, index) else {
             return Ok(());
-        }
-        task.cancel = Arc::new(AtomicBool::new(false));
-        task.cancel_wake = Arc::new(Notify::new());
-        task.attempt = task.attempt.saturating_add(1);
-        let attempt = task.attempt;
-        task.public.status = DownloadStatus::Queued;
-        task.public.received_bytes = 0;
-        task.public.total_bytes = None;
-        task.public.path = None;
-        task.public.error = None;
-        drop(tasks);
-        self.emit();
+        };
+        drop(list);
+        self.send(Emit::Changes);
         self.spawn(id.to_string(), attempt);
         Ok(())
     }
 
+    /// Retry every failed and cancelled download at once — a batch of
+    /// thousands in one call, and what an update hand-over cancelled.
+    /// Returns how many went back into the queue.
+    pub fn retry_failed(&self) -> usize {
+        let mut list = self.inner.tasks.lock().unwrap();
+        let mut runs = Vec::new();
+        for index in 0..list.tasks.len() {
+            if let Some(attempt) = requeue_at(&mut list, index) {
+                runs.push((list.tasks[index].public.id.clone(), attempt));
+            }
+        }
+        drop(list);
+        self.send(Emit::Changes);
+        let count = runs.len();
+        for (id, attempt) in runs {
+            self.spawn(id, attempt);
+        }
+        count
+    }
+
     pub fn clear_finished(&self) {
-        self.inner.tasks.lock().unwrap().retain(|task| {
-            matches!(
-                task.public.status,
-                DownloadStatus::Queued | DownloadStatus::Downloading
-            )
-        });
-        self.emit();
+        {
+            let mut list = self.inner.tasks.lock().unwrap();
+            list.tasks.retain(|task| {
+                matches!(
+                    task.public.status,
+                    DownloadStatus::Queued | DownloadStatus::Downloading
+                )
+            });
+            list.revision += 1;
+        }
+        self.send(Emit::List);
     }
 
     pub fn open_folder(&self) -> AppResult<()> {
@@ -275,13 +426,11 @@ impl DownloadManager {
 
     async fn run(&self, id: String, attempt: u64) {
         let (cancel, cancel_wake) = {
-            let tasks = self.inner.tasks.lock().unwrap();
-            let Some(task) = tasks
-                .iter()
-                .find(|task| task.public.id == id && task.attempt == attempt)
-            else {
+            let list = self.inner.tasks.lock().unwrap();
+            let Some(index) = list.position(&id, attempt) else {
                 return;
             };
+            let task = &list.tasks[index];
             (task.cancel.clone(), task.cancel_wake.clone())
         };
 
@@ -333,7 +482,7 @@ impl DownloadManager {
         // client's timeout is hours long, and a stalled server would otherwise
         // keep a cancelled task holding one of the concurrency slots.
         let (mut response, filename) = tokio::select! {
-            result = client.download_item_stream(&item_id) => {
+            result = self.request(client, &item_id) => {
                 result.map_err(|error| RunError::Failed(error.to_string()))?
             }
             _ = cancel_wake.notified() => return Err(RunError::Cancelled),
@@ -421,39 +570,50 @@ impl DownloadManager {
         result
     }
 
+    /// Ask for the file. A revoked session gets one renewal, the way every
+    /// caller renews it (`commands::renew_session`), and one more request.
+    async fn request(
+        &self,
+        client: Arc<JellyfinClient>,
+        item_id: &str,
+    ) -> AppResult<(reqwest::Response, String)> {
+        match client.download_item_stream(item_id).await {
+            Err(unauthorized @ AppError::Server { status: 401, .. }) => {
+                let Some(renewal) = &self.inner.renewal else {
+                    return Err(unauthorized);
+                };
+                let renewed = renewal(client, Instant::now(), unauthorized).await?;
+                renewed.download_item_stream(item_id).await
+            }
+            other => other,
+        }
+    }
+
     fn task(&self, id: &str, attempt: u64) -> Option<DownloadTask> {
-        self.inner
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|task| task.public.id == id && task.attempt == attempt)
-            .map(|task| task.public.clone())
+        let list = self.inner.tasks.lock().unwrap();
+        list.position(id, attempt)
+            .map(|index| list.tasks[index].public.clone())
     }
 
     fn update(&self, id: &str, attempt: u64, update: impl FnOnce(&mut DownloadTask)) {
         self.modify(id, attempt, update);
-        self.emit();
+        // Even when this changed nothing, what is pending goes out: after
+        // `cancel_all`, the runs winding down only repeat "cancelled".
+        self.send(Emit::Changes);
     }
 
-    /// Progress alone waits for [`PROGRESS_EMIT_INTERVAL`]; the next list to
-    /// go out carries it either way.
+    /// Progress alone waits for [`PROGRESS_EMIT_INTERVAL`]; whatever goes
+    /// out next carries it either way.
     fn update_progress(&self, id: &str, attempt: u64, received: u64) {
-        self.modify(id, attempt, |task| task.received_bytes = received);
-        self.send_list(true);
+        if self.modify(id, attempt, |task| task.received_bytes = received) {
+            self.send(Emit::Progress);
+        }
     }
 
-    fn modify(&self, id: &str, attempt: u64, update: impl FnOnce(&mut DownloadTask)) {
-        if let Some(task) = self
-            .inner
-            .tasks
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .find(|task| task.public.id == id && task.attempt == attempt)
-        {
-            update(&mut task.public);
-        }
+    fn modify(&self, id: &str, attempt: u64, update: impl FnOnce(&mut DownloadTask)) -> bool {
+        let mut list = self.inner.tasks.lock().unwrap();
+        list.position(id, attempt)
+            .is_some_and(|index| list.modify_at(index, update))
     }
 
     fn finish(&self, id: &str, attempt: u64, result: Result<PathBuf, RunError>) {
@@ -499,28 +659,105 @@ impl DownloadManager {
         self.inner.reserved_paths.lock().unwrap().remove(path);
     }
 
-    fn emit(&self) {
-        self.send_list(false);
+    fn send(&self, kind: Emit) {
+        let mut emit = self.inner.emit.lock().unwrap();
+        self.send_locked(&mut emit, kind);
     }
 
-    fn send_list(&self, progress_only: bool) {
-        let mut last_emit = self.inner.last_emit.lock().unwrap();
+    fn send_locked(&self, emit: &mut EmitState, kind: Emit) {
         let now = Instant::now();
-        if !emit_due(*last_emit, now, progress_only) {
+        let event = match kind {
+            Emit::List => {
+                let mut list = self.inner.tasks.lock().unwrap();
+                // The list carries every change.
+                list.changed.clear();
+                DownloadEvent::State(list.snapshot())
+            }
+            Emit::Changes | Emit::Progress => {
+                let mut list = self.inner.tasks.lock().unwrap();
+                if list.changed.is_empty() {
+                    return;
+                }
+                if kind == Emit::Progress {
+                    if let Some(wait) = progress_wait(emit.last, now) {
+                        drop(list);
+                        self.schedule_flush(emit, wait);
+                        return;
+                    }
+                }
+                DownloadEvent::Changed(list.take_changed())
+            }
+        };
+        (self.inner.sink)(event);
+        emit.last = Some(now);
+    }
+
+    /// Send held-back progress once the interval is over, should nothing else
+    /// carry it before.
+    fn schedule_flush(&self, emit: &mut EmitState, wait: Duration) {
+        if emit.flush_scheduled {
             return;
         }
-        let _ = self.inner.app.emit("download:state", self.list());
-        *last_emit = Some(now);
+        emit.flush_scheduled = true;
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let mut emit = manager.inner.emit.lock().unwrap();
+            emit.flush_scheduled = false;
+            manager.send_locked(&mut emit, Emit::Progress);
+        });
     }
 }
 
-/// Whether a change to the task list goes out now: a change of status always
-/// does, progress alone once [`PROGRESS_EMIT_INTERVAL`] has passed since the
-/// last list was sent, whatever that one was for.
-fn emit_due(last_emit: Option<Instant>, now: Instant, progress_only: bool) -> bool {
-    !progress_only
-        || last_emit
-            .is_none_or(|last| now.saturating_duration_since(last) >= PROGRESS_EMIT_INTERVAL)
+/// Cancel the task at `index` if it is still to run or running.
+fn cancel_at(list: &mut TaskList, index: usize) {
+    let task = &list.tasks[index];
+    if !matches!(
+        task.public.status,
+        DownloadStatus::Queued | DownloadStatus::Downloading
+    ) {
+        return;
+    }
+    task.cancel.store(true, Ordering::Release);
+    task.cancel_wake.notify_one();
+    list.modify_at(index, |task| {
+        task.status = DownloadStatus::Cancelled;
+        task.error = None;
+    });
+}
+
+/// Put the failed or cancelled task at `index` back into the queue under a
+/// new attempt, which its run is spawned with; None for any other task.
+fn requeue_at(list: &mut TaskList, index: usize) -> Option<u64> {
+    let task = &mut list.tasks[index];
+    if !matches!(
+        task.public.status,
+        DownloadStatus::Failed | DownloadStatus::Cancelled
+    ) {
+        return None;
+    }
+    task.cancel = Arc::new(AtomicBool::new(false));
+    task.cancel_wake = Arc::new(Notify::new());
+    task.attempt = task.attempt.saturating_add(1);
+    let attempt = task.attempt;
+    list.modify_at(index, |task| {
+        task.status = DownloadStatus::Queued;
+        task.received_bytes = 0;
+        task.total_bytes = None;
+        task.path = None;
+        task.error = None;
+    });
+    Some(attempt)
+}
+
+/// How long progress alone still has to wait: nothing once
+/// [`PROGRESS_EMIT_INTERVAL`] has passed since the last event, whatever that
+/// one was for. A change of status never waits.
+fn progress_wait(last_emit: Option<Instant>, now: Instant) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(last_emit?);
+    PROGRESS_EMIT_INTERVAL
+        .checked_sub(elapsed)
+        .filter(|wait| !wait.is_zero())
 }
 
 fn display_name(name: &str) -> String {
@@ -691,9 +928,15 @@ fn open_folder(path: &Path) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_name, emit_due, finalize, part_path, PROGRESS_EMIT_INTERVAL};
+    use super::{
+        display_name, finalize, part_path, progress_wait, DownloadEvent, DownloadManager,
+        DownloadRequest, DownloadStatus, DownloadTask, RunError, PROGRESS_EMIT_INTERVAL,
+    };
     use crate::commands::{collision_filename, filename_len, sanitize_filename, MAX_FILENAME_LEN};
+    use crate::player::SharedSession;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -703,17 +946,380 @@ mod tests {
         dir
     }
 
+    type Events = Arc<Mutex<Vec<DownloadEvent>>>;
+
+    /// A manager without a session that records what it would send the UI.
+    fn recording(tag: &str) -> (DownloadManager, Events, PathBuf) {
+        let dir = temp_dir(tag);
+        let events: Events = Arc::default();
+        let sink = events.clone();
+        let session: SharedSession = Arc::new(tokio::sync::RwLock::new(None));
+        let manager = DownloadManager::with_sink(
+            Box::new(move |event| sink.lock().unwrap().push(event)),
+            None,
+            session,
+            dir.clone(),
+        )
+        .unwrap();
+        (manager, events, dir)
+    }
+
+    fn requests(count: usize) -> Vec<DownloadRequest> {
+        (0..count)
+            .map(|n| DownloadRequest {
+                item_id: format!("item-{n}"),
+                name: format!("Track {n}"),
+            })
+            .collect()
+    }
+
+    fn take(events: &Events) -> Vec<DownloadEvent> {
+        std::mem::take(&mut *events.lock().unwrap())
+    }
+
+    fn changed(event: &DownloadEvent) -> &[DownloadTask] {
+        match event {
+            DownloadEvent::Changed(tasks) => tasks,
+            DownloadEvent::State(_) => panic!("expected changes, got the whole list"),
+        }
+    }
+
+    fn start(manager: &DownloadManager, id: &str) {
+        manager.update(id, 0, |task| task.status = DownloadStatus::Downloading);
+    }
+
+    /// What the UI makes of the events (`downloads.svelte.ts`): a list older
+    /// than the one it holds is dropped, and of two copies of a task the one
+    /// with the higher revision wins.
+    fn replay<'a>(events: impl IntoIterator<Item = &'a DownloadEvent>) -> Vec<DownloadTask> {
+        let mut base = 0;
+        let mut tasks: Vec<DownloadTask> = Vec::new();
+        for event in events {
+            match event {
+                DownloadEvent::State(snapshot) => {
+                    if snapshot.revision < base {
+                        continue;
+                    }
+                    let held: HashMap<&str, &DownloadTask> =
+                        tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+                    tasks = snapshot
+                        .tasks
+                        .iter()
+                        .map(|task| match held.get(task.id.as_str()) {
+                            Some(mine) if mine.revision > task.revision => (*mine).clone(),
+                            _ => task.clone(),
+                        })
+                        .collect();
+                    base = snapshot.revision;
+                }
+                DownloadEvent::Changed(changes) => {
+                    for change in changes {
+                        if let Some(mine) = tasks.iter_mut().find(|task| task.id == change.id) {
+                            if change.revision > mine.revision {
+                                *mine = change.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tasks
+    }
+
     #[test]
     fn progress_alone_goes_out_at_most_every_interval() {
         let start = Instant::now();
         // Nothing sent yet: the first progress goes out.
-        assert!(emit_due(None, start, true));
+        assert_eq!(progress_wait(None, start), None);
         let soon = start + Duration::from_millis(150);
-        assert!(!emit_due(Some(start), soon, true));
-        assert!(emit_due(Some(start), start + PROGRESS_EMIT_INTERVAL, true));
-        // A change of status never waits.
-        assert!(emit_due(Some(start), soon, false));
-        assert!(emit_due(Some(start), start, false));
+        assert_eq!(
+            progress_wait(Some(start), soon),
+            Some(PROGRESS_EMIT_INTERVAL - Duration::from_millis(150))
+        );
+        assert_eq!(
+            progress_wait(Some(start), start + PROGRESS_EMIT_INTERVAL),
+            None
+        );
+        assert_eq!(
+            progress_wait(Some(start), start + 2 * PROGRESS_EMIT_INTERVAL),
+            None
+        );
+    }
+
+    #[test]
+    fn a_batch_goes_out_once_whole_and_then_only_as_changes() {
+        let (manager, events, dir) = recording("batch");
+        let added = manager.add(requests(500));
+        let sent = take(&events);
+        assert_eq!(sent.len(), 1);
+        let DownloadEvent::State(list) = &sent[0] else {
+            panic!("a new batch goes out as the whole list");
+        };
+        assert_eq!(list.tasks.len(), 500);
+        assert!(added.iter().all(|task| task.revision <= list.revision));
+
+        // Starting and finishing one download sends that one task, never the
+        // other 499.
+        start(&manager, &added[0].id);
+        manager.update_progress(&added[0].id, 0, 1024);
+        manager.finish(&added[0].id, 0, Ok(dir.join("Track 0.flac")));
+        let sent = take(&events);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!sent.is_empty());
+        for event in &sent {
+            let tasks = changed(event);
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].id, added[0].id);
+        }
+        let last = changed(sent.last().unwrap());
+        assert_eq!(last[0].status, DownloadStatus::Completed);
+        assert_eq!(last[0].received_bytes, 1024);
+    }
+
+    #[test]
+    fn progress_held_back_goes_out_when_the_interval_is_over() {
+        let (manager, events, dir) = recording("flush");
+        let id = manager.add(requests(1))[0].id.clone();
+        start(&manager, &id);
+        take(&events);
+
+        // Just after the start went out: held back, and the later ticks
+        // replace the earlier ones.
+        manager.update_progress(&id, 0, 100);
+        manager.update_progress(&id, 0, 200);
+        manager.update_progress(&id, 0, 300);
+        assert!(take(&events).is_empty());
+
+        // No further tick comes (a stalled server): the last one still
+        // arrives, once.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while events.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the held-back progress never went out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(PROGRESS_EMIT_INTERVAL);
+        let sent = take(&events);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let tasks = changed(&sent[0]);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].received_bytes, 300);
+    }
+
+    #[test]
+    fn a_change_of_status_carries_the_progress_held_back() {
+        let (manager, events, dir) = recording("carry");
+        let added = manager.add(requests(2));
+        let (a, b) = (added[0].id.clone(), added[1].id.clone());
+        start(&manager, &a);
+        start(&manager, &b);
+        take(&events);
+
+        manager.update_progress(&a, 0, 4096);
+        assert!(take(&events).is_empty());
+        manager.finish(&b, 0, Err(RunError::Failed("server returned 500".into())));
+        let sent = take(&events);
+        assert_eq!(sent.len(), 1);
+        let tasks = changed(&sent[0]);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].received_bytes, 4096);
+        assert_eq!(tasks[1].status, DownloadStatus::Failed);
+
+        // Nothing is left for the scheduled send.
+        std::thread::sleep(PROGRESS_EMIT_INTERVAL + Duration::from_millis(300));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(take(&events).is_empty());
+    }
+
+    #[test]
+    fn a_task_that_did_not_change_sends_nothing() {
+        let (manager, events, dir) = recording("noop");
+        let id = manager.add(requests(1))[0].id.clone();
+        take(&events);
+        manager.cancel(&id).unwrap();
+        assert_eq!(
+            changed(&take(&events)[0])[0].status,
+            DownloadStatus::Cancelled
+        );
+        // The cancelled run winds down and says so once more; a second press.
+        manager.finish(&id, 0, Err(RunError::Cancelled));
+        manager.cancel(&id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(take(&events).is_empty());
+    }
+
+    #[test]
+    fn cancelling_everything_reaches_the_panel_with_the_first_run_to_stop() {
+        // The update hand-over cancels all and sends nothing; should the
+        // installer not start, the panel must not show them running.
+        let (manager, events, dir) = recording("cancel-all");
+        let added = manager.add(requests(3));
+        start(&manager, &added[0].id);
+        take(&events);
+        manager.cancel_all();
+        assert!(take(&events).is_empty());
+        manager.finish(&added[0].id, 0, Err(RunError::Cancelled));
+        let sent = take(&events);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sent.len(), 1);
+        let tasks = changed(&sent[0]);
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks
+            .iter()
+            .all(|task| task.status == DownloadStatus::Cancelled));
+    }
+
+    #[test]
+    fn retrying_all_requeues_the_failed_and_cancelled_in_one_go() {
+        let (manager, events, dir) = recording("retry-all");
+        let added = manager.add(requests(5));
+        let ids: Vec<String> = added.iter().map(|task| task.id.clone()).collect();
+        manager.finish(&ids[0], 0, Ok(dir.join("Track 0.flac")));
+        manager.finish(
+            &ids[1],
+            0,
+            Err(RunError::Failed("server returned 500".into())),
+        );
+        manager.cancel(&ids[2]).unwrap();
+        manager.finish(&ids[3], 0, Err(RunError::Failed("timed out".into())));
+        take(&events);
+
+        assert_eq!(manager.retry_failed(), 3);
+        let sent = take(&events);
+        // One event for the lot, before any run starts.
+        let first = changed(&sent[0]);
+        let requeued: Vec<&str> = first.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(
+            requeued,
+            [ids[1].as_str(), ids[2].as_str(), ids[3].as_str()]
+        );
+        assert!(first
+            .iter()
+            .all(|task| task.status == DownloadStatus::Queued && task.error.is_none()));
+
+        // The runs start under the new attempt: without a session they fail
+        // again, and say so.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failed_again = || {
+            let mut all = sent.clone();
+            all.extend(events.lock().unwrap().iter().cloned());
+            let tasks = replay(
+                std::iter::once(&DownloadEvent::State(super::DownloadSnapshot {
+                    revision: 0,
+                    tasks: added.clone(),
+                }))
+                .chain(all.iter()),
+            );
+            [1, 2, 3]
+                .iter()
+                .all(|&n| tasks[n].status == DownloadStatus::Failed)
+        };
+        while !failed_again() {
+            assert!(
+                Instant::now() < deadline,
+                "the retried downloads did not run"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let truth = manager.snapshot();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(truth.tasks[0].status, DownloadStatus::Completed);
+        assert_eq!(truth.tasks[4].status, DownloadStatus::Queued);
+        assert_eq!(manager.retry_failed(), 3);
+    }
+
+    #[test]
+    fn clearing_sends_the_whole_list_newer_than_every_task() {
+        let (manager, events, dir) = recording("clear");
+        let added = manager.add(requests(3));
+        manager.finish(&added[1].id, 0, Ok(dir.join("Track 1.flac")));
+        let newest = changed(take(&events).last().unwrap())[0].revision;
+        manager.clear_finished();
+        let sent = take(&events);
+        let _ = std::fs::remove_dir_all(&dir);
+        let [DownloadEvent::State(list)] = &sent[..] else {
+            panic!("clearing sends the whole list: {sent:?}");
+        };
+        assert!(list.revision > newest);
+        let ids: Vec<&str> = list.tasks.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, [added[0].id.as_str(), added[2].id.as_str()]);
+    }
+
+    #[test]
+    fn the_changes_rebuild_the_list_in_any_order() {
+        let (manager, events, dir) = recording("order");
+        let added = manager.add(requests(3));
+        let ids: Vec<String> = added.iter().map(|task| task.id.clone()).collect();
+        start(&manager, &ids[0]);
+        start(&manager, &ids[1]);
+        manager.update(&ids[0], 0, |task| task.total_bytes = Some(10_000));
+        manager.finish(&ids[0], 0, Ok(dir.join("Track 0.flac")));
+        manager.cancel(&ids[2]).unwrap();
+        manager.finish(&ids[1], 0, Err(RunError::Failed("timed out".into())));
+        let sent = take(&events);
+        let truth = manager.snapshot();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Revisions only grow, in the order things were sent.
+        let mut last = 0;
+        for event in &sent {
+            let revision = match event {
+                DownloadEvent::State(list) => list.revision,
+                DownloadEvent::Changed(tasks) => {
+                    tasks.iter().map(|task| task.revision).max().unwrap()
+                }
+            };
+            assert!(revision > last, "{sent:?}");
+            last = revision;
+        }
+        assert!(truth.revision >= last);
+
+        assert_eq!(replay(&sent), truth.tasks);
+        // The list first, then the changes the other way round: a late
+        // change never overwrites a newer one.
+        let (list, changes) = sent.split_first().unwrap();
+        assert_eq!(
+            replay(std::iter::once(list).chain(changes.iter().rev())),
+            truth.tasks
+        );
+        // An answer to `get_downloads` from before the batch, arriving last,
+        // is dropped as a whole.
+        let stale = DownloadEvent::State(super::DownloadSnapshot {
+            revision: 0,
+            tasks: Vec::new(),
+        });
+        assert_eq!(replay(sent.iter().chain([&stale])), truth.tasks);
+    }
+
+    #[test]
+    fn downloads_that_fail_report_through_changes_only() {
+        let (manager, events, dir) = recording("run");
+        manager.enqueue(requests(4));
+        // Without a session every attempt fails at once — as far as the
+        // events tell.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let all_failed = || {
+            replay(events.lock().unwrap().iter())
+                .iter()
+                .filter(|task| task.status == DownloadStatus::Failed)
+                .count()
+                == 4
+        };
+        while !all_failed() {
+            assert!(Instant::now() < deadline, "downloads did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let sent = take(&events);
+        let truth = manager.snapshot();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(sent[0], DownloadEvent::State(_)));
+        assert!(sent[1..]
+            .iter()
+            .all(|event| matches!(event, DownloadEvent::Changed(_))));
+        assert_eq!(replay(&sent), truth.tasks);
     }
 
     #[tokio::test]
