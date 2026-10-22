@@ -1,21 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { formatDuration } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
   import Cover from "#lib/components/Cover.svelte";
+  import { hasNext } from "#lib/queueOrder.js";
+  import PlaybackProgress from "#lib/components/PlaybackProgress.svelte";
   import { player } from "#lib/state/player.svelte.js";
 
   const s = $derived(player.state);
-  const playing = $derived(s.status === "playing" || s.status === "loading");
+  const playing = $derived(player.playing);
+  // The player bar's rule (TransportControls): follows queue and repeat mode.
+  const repeat = $derived(player.state.repeat);
+  const canGoNext = $derived(hasNext(player.queue, repeat));
 
   // This window bypasses the app shell (see root layout), so it wires up its
   // own player event listeners. Rust state/session are shared process-wide.
   onMount(() => {
     player.init();
   });
-
-  let dragging = $state<number | null>(null);
-  const shownPosition = $derived(dragging ?? s.positionMs);
 
   async function closeWindow() {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -70,32 +71,18 @@
       <button
         class="rounded-full p-1 text-ink-muted transition-colors hover:text-ink disabled:opacity-40"
         onclick={() => player.run(player.next())}
-        disabled={!s.current || (s.index + 1 >= s.queueLen && s.repeat === "off" && !s.shuffle)}
+        disabled={!s.current || !canGoNext}
         aria-label={m.cmd_next()}
       >
         <svg viewBox="0 0 24 24" class="h-4.5 w-4.5" fill="currentColor"><path d="M16 6h2v12h-2V6zM6 18l8.5-6L6 6v12z"/></svg>
       </button>
-      <span class="ml-1 text-[10px] text-ink-muted tabular-nums">
-        {formatDuration(shownPosition)} / {formatDuration(s.durationMs)}
-      </span>
     </div>
 
-    <input
-      type="range"
-      class="h-1 w-full accent-ink"
-      min="0"
-      max={s.durationMs || 1}
-      value={shownPosition}
-      disabled={!s.current || s.status === "loading"}
-      oninput={(e) => (dragging = Number(e.currentTarget.value))}
-      onchange={() => {
-        if (dragging !== null) {
-          player.run(player.seek(dragging));
-          dragging = null;
-        }
-      }}
-      aria-label={m.player_seek()}
-    />
+    <!-- The player bar's own seek row: 5 s key steps instead of a range
+         input's 1 ms (each press reopened a stream not yet downloaded), and a
+         drag held across a track change is dropped instead of seeking the new
+         track to a spot picked on the old one. -->
+    <PlaybackProgress />
   </div>
 
   <button

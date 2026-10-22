@@ -1,5 +1,6 @@
 import type { EnergyLevel } from "./engine";
 import { api } from "#lib/api.js";
+import { errorCause, errorDetail } from "#lib/appErrors.js";
 import { m } from "#lib/paraglide/messages.js";
 
 export type PresetComplexity = "light" | "medium" | "heavy";
@@ -132,7 +133,7 @@ function throwIfAborted(signal?: AbortSignal) {
  * only pause online presets.
  */
 function commandError(error: unknown): PresetFetchError {
-  const text = error instanceof Error ? error.message : String(error);
+  const text = errorDetail(error);
   const match = /^preset:([a-z-]+)(?::([\s\S]*))?$/.exec(text);
   const detail = match?.[2] ?? "";
   switch (match?.[1]) {
@@ -155,7 +156,7 @@ function commandError(error: unknown): PresetFetchError {
     case "network":
       return new PresetFetchError(m.visualizer_preset_error_download({ message: detail }), false);
     default:
-      return new PresetFetchError(m.visualizer_preset_error_download({ message: text }), false);
+      return new PresetFetchError(m.visualizer_preset_error_download({ message: errorCause(error) }), false);
   }
 }
 
@@ -362,6 +363,20 @@ export async function loadAdditionalPresetPacks(
 
 const RECENT_MEMORY = 10;
 
+/**
+ * Whether `candidate` takes the place of the same-named `current` entry. A
+ * bundled preset always beats an online one, whatever the pack priorities:
+ * the online copy would only download code the app already ships, and while
+ * online presets are off (the default) it cannot be picked at all, so the
+ * bundled preset would vanish. Between two of a kind, the higher priority
+ * (the fuller pack) wins.
+ */
+function replaces(candidate: PresetEntry, current: PresetEntry): boolean {
+  const remote = Boolean(candidate.sourceUrl);
+  if (remote !== Boolean(current.sourceUrl)) return !remote;
+  return candidate.priority > current.priority;
+}
+
 /** Shuffle-bag rotation that can grow while optional chunks are loading. */
 export class PresetRotation {
   #entries: PresetEntry[] = [];
@@ -410,7 +425,7 @@ export class PresetRotation {
         this.#byName.set(entry.name, this.#entries.length);
         this.#entries.push(entry);
         added += 1;
-      } else if (entry.priority > this.#entries[index].priority) {
+      } else if (replaces(entry, this.#entries[index])) {
         // Later/full packs intentionally replace reduced versions while the
         // stable list position and user preferences remain intact.
         this.#entries[index] = entry;

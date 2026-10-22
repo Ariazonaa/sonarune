@@ -8,7 +8,7 @@ use crate::store::keys;
 use crate::AppState;
 use serde::Serialize;
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 const KEYRING_SERVICE: &str = "sonarune";
 
@@ -34,6 +34,110 @@ pub struct SessionInfo {
 pub enum ConnectResult {
     Connected { session: SessionInfo },
     CertUntrusted { fingerprint: String },
+}
+
+/// `session:ended` — the backend dropped a session that only a new sign-in
+/// brings back. The UI returns to the sign-in screen, filled in with the
+/// server and the account, and says why; without it the shell stayed signed
+/// in while every call failed with "not connected to a server".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEnded {
+    pub reason: SessionEndReason,
+    /// The address to sign in with: the stored one, or where it moved.
+    pub server_url: String,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionEndReason {
+    /// The server refused the stored credentials (a changed password, a
+    /// disabled account, a removed device), or there are none to renew the
+    /// rejected token with (a Quick Connect sign-in stores no password).
+    Rejected,
+    /// The stored address now redirects to `https://` on the same host.
+    Moved,
+}
+
+/// Sends `session:ended`, and remembers it until the next sign-in so it can be
+/// sent again: an event emitted while the window is hidden reaches a suspended
+/// WebView and is lost (see `webview_power.rs`), and `check_server` — which
+/// runs whenever the window gets the focus back — repeats it then.
+pub struct SessionNotice {
+    app: tauri::AppHandle,
+    last: std::sync::Mutex<Option<SessionEnded>>,
+}
+
+impl SessionNotice {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self {
+            app,
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn ended(&self, ended: SessionEnded) {
+        *self.last.lock().unwrap() = Some(ended.clone());
+        let _ = self.app.emit("session:ended", ended);
+    }
+
+    fn repeat(&self) {
+        let last = self.last.lock().unwrap().clone();
+        if let Some(ended) = last {
+            let _ = self.app.emit("session:ended", ended);
+        }
+    }
+
+    /// A sign-in starts or a session works again: nothing left to repeat.
+    fn clear(&self) {
+        *self.last.lock().unwrap() = None;
+    }
+}
+
+/// Drop a session the backend cannot continue, and tell the UI why. Only
+/// `stale` is dropped (or nothing, when no session is installed): one that
+/// replaced it in the meantime, a sign-in, stays — and then there is nothing
+/// to tell either.
+async fn end_session(state: &AppState, stale: Option<&Arc<JellyfinClient>>, ended: SessionEnded) {
+    end_session_of(state, stale, ended).await;
+}
+
+/// [`end_session`] for any [`SessionHost`].
+async fn end_session_of<H: SessionHost>(
+    host: &H,
+    stale: Option<&Arc<JellyfinClient>>,
+    ended: SessionEnded,
+) {
+    {
+        let mut session = host.session().write().await;
+        let still_stale = match (session.as_ref(), stale) {
+            (Some(current), Some(stale)) => Arc::ptr_eq(current, stale),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !still_stale {
+            return;
+        }
+        *session = None;
+    }
+    tracing::info!("session ended: {:?}", ended.reason);
+    host.announce_end(ended);
+}
+
+/// The server address the way it is stored and keyed by: trimmed, without a
+/// trailing slash — the form earlier versions saved too, so credentials and
+/// pinned certificates stay found. What is not an absolute `http(s)://` URL is
+/// refused with a message that says so; reqwest would report only a "builder
+/// error" for `localhost:8096`.
+pub(crate) fn server_address(raw: &str) -> AppResult<String> {
+    let address = raw.trim().trim_end_matches('/').to_string();
+    match reqwest::Url::parse(&address) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => Ok(address),
+        _ => Err(AppError::Other(
+            "enter the server address with http:// or https://".into(),
+        )),
+    }
 }
 
 /// Build a client that trusts the fingerprints already pinned for `server_url`.
@@ -72,31 +176,67 @@ fn pin_after_login(presented: Option<String>, confirmed: &str) -> Option<String>
     presented.filter(|presented| crate::tls::matches(presented, confirmed))
 }
 
-/// After an operation failed on an untrusted certificate: when `allow` is set
-/// (the "trust this server automatically" preference), pin the presented
-/// fingerprint and hand back a rebuilt, now-trusting client to retry with.
-/// Returns `None` when there is nothing to auto-trust.
+/// The certificate automatic trust may accept: the one a failed handshake
+/// presented, when the preference is on and nothing is pinned for the server.
 ///
 /// Trust on **first** use only: once anything is pinned for this server, a
 /// different certificate must go through explicit user confirmation
 /// (`ConnectResult::CertUntrusted`). Without that check the preference would
 /// silently pin whatever an active MITM presents on every later relogin —
 /// which is exactly what the pinning in `tls.rs` exists to prevent.
+fn autotrust_candidate(
+    allow: bool,
+    pinned: &[String],
+    presented: Option<String>,
+) -> Option<String> {
+    if !allow || !pinned.is_empty() {
+        return None;
+    }
+    presented
+}
+
+/// After an operation failed on an untrusted certificate: when `allow` is set
+/// (the "trust this server automatically" preference), a client that also
+/// accepts the presented certificate, and its fingerprint, to retry with.
+/// Returns `None` when there is nothing to auto-trust.
+///
+/// Like a confirmed fingerprint in `connect`, the certificate is trusted in
+/// memory for this attempt only: whoever uses it pins it with
+/// [`trust_after_login`] once the login went through on it. A login that
+/// fails, or a Quick Connect that is never approved, leaves nothing trusted.
 fn autotrust(
     store: &crate::store::Store,
     server_url: &str,
     device_id: &str,
     client: &JellyfinClient,
     allow: bool,
-) -> AppResult<Option<JellyfinClient>> {
-    if !allow || !store.trusted_fingerprints(server_url).is_empty() {
-        return Ok(None);
-    }
-    let Some(fingerprint) = client.untrusted_fingerprint() else {
+) -> AppResult<Option<(JellyfinClient, String)>> {
+    let pinned = store.trusted_fingerprints(server_url);
+    let Some(candidate) = autotrust_candidate(allow, &pinned, client.untrusted_fingerprint())
+    else {
         return Ok(None);
     };
-    store.pin_fingerprint(server_url, &fingerprint)?;
-    Ok(Some(new_client(store, server_url, device_id)?))
+    let trusting = client_trusting(store, server_url, device_id, &candidate)?;
+    Ok(Some((trusting, candidate)))
+}
+
+/// After a login went through on `client`, which also accepted `candidate`:
+/// pin the candidate if the server presented it ([`pin_after_login`]), and
+/// rebuild the client, session included, with exactly the stored pins — the
+/// candidate must not stay accepted in memory when it was not pinned.
+fn trust_after_login(
+    store: &crate::store::Store,
+    server_url: &str,
+    device_id: &str,
+    client: JellyfinClient,
+    candidate: &str,
+) -> AppResult<JellyfinClient> {
+    if let Some(pin) = pin_after_login(client.presented_fingerprint(), candidate) {
+        store.pin_fingerprint(server_url, &pin)?;
+    }
+    let token = client.token().unwrap_or_default().to_string();
+    let user_id = client.user_id()?.to_string();
+    Ok(new_client(store, server_url, device_id)?.with_session(token, user_id))
 }
 
 fn persist_can_delete(state: &AppState, can_delete: bool) -> AppResult<()> {
@@ -111,10 +251,51 @@ fn persist_can_edit(state: &AppState, can_edit: bool) -> AppResult<()> {
         .set(keys::CAN_EDIT, if can_edit { "true" } else { "false" })
 }
 
+/// The keyring service this build uses, set once by [`init_keyring_service`].
+static BUILD_KEYRING_SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Windows keys a credential by service and entry name, not by the app's
+/// identifier. A build under another identifier (the e2e suite's
+/// `io.sonarune.e2e`, the demo build) would otherwise read, overwrite and
+/// delete the installed app's tokens with its own sign-ins and sign-outs, so
+/// it gets a service of its own, named after that identifier. The real app
+/// keeps the one its credentials already live under.
+pub(crate) fn keyring_service_for(identifier: &str) -> &str {
+    if identifier == crate::legacy::IDENTIFIER {
+        KEYRING_SERVICE
+    } else {
+        identifier
+    }
+}
+
+/// Called from `run()` before anything can reach the keyring.
+pub(crate) fn init_keyring_service(identifier: &str) {
+    let _ = BUILD_KEYRING_SERVICE.set(keyring_service_for(identifier).to_owned());
+}
+
+fn keyring_service() -> &'static str {
+    BUILD_KEYRING_SERVICE
+        .get()
+        .map_or(KEYRING_SERVICE, String::as_str)
+}
+
+/// The names of the app's keyring entries (keyring's `user`; on Windows the
+/// credential is `<user>.<service>`). `credential_purge` recognises the app's
+/// entries by their shape, so a new or renamed one has to be added there too.
+pub(crate) fn token_entry_name(server_url: &str, username: &str) -> String {
+    format!("{server_url}::{username}")
+}
+
+pub(crate) fn password_entry_name(server_url: &str, username: &str) -> String {
+    format!("{server_url}::{username}::password")
+}
+
+pub(crate) const LISTENBRAINZ_ENTRY_NAME: &str = "listenbrainz";
+
 fn keyring_entry(server_url: &str, username: &str) -> AppResult<keyring::Entry> {
     Ok(keyring::Entry::new(
-        KEYRING_SERVICE,
-        &format!("{server_url}::{username}"),
+        keyring_service(),
+        &token_entry_name(server_url, username),
     )?)
 }
 
@@ -124,94 +305,453 @@ pub(crate) fn migrate_legacy_credentials(store: &crate::store::Store) {
     if let (Some(server_url), Some(username)) =
         (store.get(keys::SERVER_URL), store.get(keys::USERNAME))
     {
-        crate::legacy::migrate_credential(KEYRING_SERVICE, &format!("{server_url}::{username}"));
         crate::legacy::migrate_credential(
             KEYRING_SERVICE,
-            &format!("{server_url}::{username}::password"),
+            &token_entry_name(&server_url, &username),
+        );
+        crate::legacy::migrate_credential(
+            KEYRING_SERVICE,
+            &password_entry_name(&server_url, &username),
         );
     }
-    crate::legacy::migrate_credential(KEYRING_SERVICE, "listenbrainz");
+    crate::legacy::migrate_credential(KEYRING_SERVICE, LISTENBRAINZ_ENTRY_NAME);
 }
 
 /// The password is kept (Windows Credential Manager) so an expired token can
 /// be renewed without bothering the user.
 fn password_entry(server_url: &str, username: &str) -> AppResult<keyring::Entry> {
     Ok(keyring::Entry::new(
-        KEYRING_SERVICE,
-        &format!("{server_url}::{username}::password"),
+        keyring_service(),
+        &password_entry_name(server_url, username),
     )?)
 }
 
-async fn install_session(state: &AppState, client: JellyfinClient) -> Arc<JellyfinClient> {
+#[cfg(test)]
+mod keyring_tests {
+    use super::{keyring_service_for, KEYRING_SERVICE};
+
+    fn identifier(config: &str) -> String {
+        let config: serde_json::Value = serde_json::from_str(config).expect("config parses");
+        config["identifier"]
+            .as_str()
+            .expect("identifier")
+            .to_owned()
+    }
+
+    #[test]
+    fn the_installed_app_keeps_its_keyring_service() {
+        let app = identifier(include_str!("../tauri.conf.json"));
+        assert_eq!(app, crate::legacy::IDENTIFIER);
+        assert_eq!(keyring_service_for(&app), "sonarune");
+    }
+
+    #[test]
+    fn test_and_demo_builds_never_reach_the_installed_apps_credentials() {
+        let e2e = identifier(include_str!("../../e2e/tauri.e2e.conf.json"));
+        for other in [e2e.as_str(), "io.sonarune.demo"] {
+            assert_eq!(keyring_service_for(other), other);
+            assert_ne!(keyring_service_for(other), KEYRING_SERVICE);
+        }
+    }
+}
+
+/// How a session about to be installed came about, for [`identify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Identify {
+    /// A sign-in: the server just answered. One that does not say its id is
+    /// not taken for whichever server answered at its address before — a
+    /// sign-in is where a new server at an old address shows up.
+    SignIn,
+    /// The session the store holds, again: a re-login, a renewed
+    /// certificate, a restore the server validated. Asked all the same —
+    /// another server may answer at that address now —; if it does not
+    /// say, the id of the session it renews, else the one last seen there.
+    Renewal(Option<String>),
+    /// Restored while the server cannot be reached: not asked, the id last
+    /// seen at the address.
+    Offline,
+}
+
+/// How long the session waits for the server to say its id.
+const IDENTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Which server `client` talks to (`identity.rs`), found before the session
+/// is installed: the id it says, remembered at its address, or what `how`
+/// falls back on. `None`: the address is the server, as before ids were
+/// kept. The only network request on the way to a session — run it before
+/// taking a gate or checking that the session is still the one renewed.
+async fn identify(
+    store: &crate::store::Store,
+    client: &JellyfinClient,
+    how: Identify,
+) -> Option<String> {
+    let asked = match how {
+        Identify::Offline => None,
+        Identify::SignIn | Identify::Renewal(_) => {
+            tokio::time::timeout(IDENTIFY_TIMEOUT, client.public_server_id())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        }
+    };
+    if let Some(id) = asked {
+        if let Err(e) = store.record_server(client.base_url(), &id) {
+            tracing::warn!("cannot remember which server this is: {e}");
+        }
+        return Some(id);
+    }
+    match how {
+        Identify::Offline => store.server_id_at(client.base_url()),
+        // Not why: the error would name the address.
+        Identify::SignIn => {
+            tracing::info!("the server did not say its id");
+            None
+        }
+        Identify::Renewal(previous) => {
+            tracing::info!("the server did not say its id");
+            previous.or_else(|| store.server_id_at(client.base_url()))
+        }
+    }
+}
+
+/// Install `client` as the session, on the server `server_id`
+/// ([`identify`]). Nothing here waits on the network.
+async fn install_session(
+    state: &AppState,
+    mut client: JellyfinClient,
+    server_id: Option<String>,
+) -> Arc<JellyfinClient> {
+    client.set_server_id(server_id);
+    // What was stored for this server before its id was known, or under
+    // another of its addresses, is its own: settled before anything reads
+    // it for this session (the scan the poke below starts, the index).
+    if let Some(owner) = crate::identity::Owner::of(&client) {
+        let store = state.store.clone();
+        let settled =
+            tauri::async_runtime::spawn_blocking(move || crate::identity::settle(&store, &owner))
+                .await;
+        match settled {
+            Ok(Ok((0, 0))) => {}
+            Ok(Ok((analyses, plays))) => {
+                tracing::debug!("{analyses} analyses and {plays} plays settled for this server")
+            }
+            Ok(Err(e)) => tracing::warn!("cannot settle the stored analyses and plays: {e}"),
+            Err(e) => tracing::warn!("cannot settle the stored analyses and plays: {e}"),
+        }
+    }
     // The player worker streams and reports with the same shared session.
     let client = Arc::new(client);
     // A working session clears the "stop trying to re-login" latch.
     state
         .relogin_blocked
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    state.session_notice.clear();
     *state.session.write().await = Some(client.clone());
+    state.sonic_scan.poke();
     client
 }
 
+/// Whether a failed login means the server refused these credentials, as
+/// opposed to failing for a while: a 5xx from a restarting server or a 429
+/// from Jellyfin's own rate limiter fixes itself in seconds.
+fn credentials_rejected(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::Server {
+            status: 401 | 403,
+            ..
+        }
+    )
+}
+
+/// Whether the password itself was refused: a 401. Each one counts toward
+/// Jellyfin's lockout. A 403 refuses the account instead (disabled, or no
+/// remote access from where the client is), and the password may still be
+/// the right one for later.
+fn password_refused(err: &AppError) -> bool {
+    matches!(err, AppError::Server { status: 401, .. })
+}
+
+/// The account a re-login signs in with: what is stored for the session.
+pub(crate) struct StoredLogin {
+    pub server_url: String,
+    pub username: String,
+    /// `None`: no password is stored (a Quick Connect sign-in, or one the
+    /// server refused).
+    pub password: Option<String>,
+}
+
+/// One sign-in with the stored password ([`SessionHost::sign_in`]), next to
+/// how it went.
+pub(crate) struct SignIn {
+    /// The client it went out on; it carries the new session when it went
+    /// through.
+    pub client: JellyfinClient,
+    /// A certificate `client` accepted for this attempt only (automatic
+    /// trust on first use), pinned only once the login went through on it.
+    pub candidate: Option<String>,
+    /// The "trust automatically" preference the attempt was made under.
+    pub auto_trust: bool,
+    pub device_id: String,
+}
+
+/// Everything renewing a session touches besides the client itself: the
+/// shared session and the gate a re-login and a sign-out hold, the stored
+/// account (the store and the Credential Manager), the sign-in, and the UI.
+/// [`AppState`] is the real one. The tests bring one in memory, so the rules
+/// of [`relogin`] and [`renew_after_401`] run for real without a Credential
+/// Manager or a running app.
+pub(crate) trait SessionHost: Sync {
+    fn session(&self) -> &player::SharedSession;
+    /// Serializes re-logins, and a sign-out holds it too.
+    fn relogin_gate(&self) -> &tokio::sync::Mutex<()>;
+    /// Set once the server refused the stored credentials.
+    fn relogin_blocked(&self) -> &std::sync::atomic::AtomicBool;
+    /// Who is signed in, as stored: server address and user id.
+    fn signed_in(&self) -> Option<(String, String)>;
+    /// The stored account to sign in again with; `None` when signed out.
+    fn stored_login(&self) -> AppResult<Option<StoredLogin>>;
+    /// Sign in again with the stored password. Nothing is kept yet: that is
+    /// [`Self::keep_login`], once the session turned out to be unchanged.
+    fn sign_in(
+        &self,
+        login: &StoredLogin,
+        password: &str,
+    ) -> impl std::future::Future<Output = AppResult<(SignIn, AppResult<crate::api::types::UserDto>)>>
+           + Send;
+    /// Which server `client` talks to ([`identify`]): the one network
+    /// request between a login and the session it makes.
+    fn identify(
+        &self,
+        client: &JellyfinClient,
+        how: Identify,
+    ) -> impl std::future::Future<Output = Option<String>> + Send;
+    /// The server refused the stored password: forget it.
+    fn forget_password(&self, login: &StoredLogin);
+    /// Keep a login that went through — pin, store the new token and what the
+    /// account may do — and return the client to install.
+    fn keep_login(
+        &self,
+        login: &StoredLogin,
+        sign_in: SignIn,
+        user: &crate::api::types::UserDto,
+    ) -> AppResult<JellyfinClient>;
+    /// Install `client` as the session, on the server `server_id`
+    /// ([`install_session`]: nothing on the network).
+    fn install(
+        &self,
+        client: JellyfinClient,
+        server_id: Option<String>,
+    ) -> impl std::future::Future<Output = Arc<JellyfinClient>> + Send;
+    /// Tell the UI the session ended (`session:ended`).
+    fn announce_end(&self, ended: SessionEnded);
+}
+
+impl SessionHost for AppState {
+    fn session(&self) -> &player::SharedSession {
+        &self.session
+    }
+
+    fn relogin_gate(&self) -> &tokio::sync::Mutex<()> {
+        &self.relogin_gate
+    }
+
+    fn relogin_blocked(&self) -> &std::sync::atomic::AtomicBool {
+        &self.relogin_blocked
+    }
+
+    fn signed_in(&self) -> Option<(String, String)> {
+        self.store
+            .get(keys::SERVER_URL)
+            .zip(self.store.get(keys::USER_ID))
+    }
+
+    fn stored_login(&self) -> AppResult<Option<StoredLogin>> {
+        let (Some(server_url), Some(username)) = (
+            self.store.get(keys::SERVER_URL),
+            self.store.get(keys::USERNAME),
+        ) else {
+            return Ok(None);
+        };
+        let password = password_entry(&server_url, &username)?.get_password().ok();
+        Ok(Some(StoredLogin {
+            server_url,
+            username,
+            password,
+        }))
+    }
+
+    async fn sign_in(
+        &self,
+        login: &StoredLogin,
+        password: &str,
+    ) -> AppResult<(SignIn, AppResult<crate::api::types::UserDto>)> {
+        let StoredLogin {
+            server_url,
+            username,
+            ..
+        } = login;
+        let auto_trust = self.store.get(keys::ACCEPT_INVALID_CERTS).as_deref() == Some("true");
+        let device_id = self.store.device_id()?;
+        let mut client = new_client(&self.store, server_url, &device_id)?;
+        let mut candidate = None;
+        let result = match client.authenticate(username, password).await {
+            Err(AppError::Network(err)) => {
+                // A self-signed home server whose cert isn't pinned yet: trust
+                // it on first use when the server is configured for automatic
+                // trust, so installs from before certificate pinning keep
+                // working.
+                match autotrust(&self.store, server_url, &device_id, &client, auto_trust)? {
+                    Some((trusting, fingerprint)) => {
+                        client = trusting;
+                        candidate = Some(fingerprint);
+                        client.authenticate(username, password).await
+                    }
+                    None => Err(AppError::Network(err)),
+                }
+            }
+            other => other,
+        };
+        let sign_in = SignIn {
+            client,
+            candidate,
+            auto_trust,
+            device_id,
+        };
+        Ok((sign_in, result))
+    }
+
+    async fn identify(&self, client: &JellyfinClient, how: Identify) -> Option<String> {
+        identify(&self.store, client, how).await
+    }
+
+    fn forget_password(&self, login: &StoredLogin) {
+        if let Ok(entry) = password_entry(&login.server_url, &login.username) {
+            let _ = entry.delete_credential();
+        }
+    }
+
+    fn keep_login(
+        &self,
+        login: &StoredLogin,
+        sign_in: SignIn,
+        user: &crate::api::types::UserDto,
+    ) -> AppResult<JellyfinClient> {
+        let StoredLogin {
+            server_url,
+            username,
+            ..
+        } = login;
+        let SignIn {
+            mut client,
+            candidate,
+            auto_trust,
+            device_id,
+        } = sign_in;
+        if let Some(candidate) = candidate.as_deref() {
+            client = trust_after_login(&self.store, server_url, &device_id, client, candidate)?;
+        }
+        keyring_entry(server_url, username)?.set_password(client.token().unwrap_or_default())?;
+        self.store.set(keys::USER_ID, &user.id)?;
+        self.store.settle_auto_trust(server_url, auto_trust)?;
+        persist_can_delete(self, user.can_delete())?;
+        persist_can_edit(self, user.can_edit_metadata())?;
+        Ok(client)
+    }
+
+    async fn install(
+        &self,
+        client: JellyfinClient,
+        server_id: Option<String>,
+    ) -> Arc<JellyfinClient> {
+        install_session(self, client, server_id).await
+    }
+
+    fn announce_end(&self, ended: SessionEnded) {
+        self.session_notice.ended(ended);
+    }
+}
+
 /// Re-authenticate with the stored credentials and swap the shared session.
-/// Fails cleanly when no password is stored (pre-existing installs).
+/// When the session cannot come back this way — the server refuses the
+/// password, or none is stored (a Quick Connect sign-in) — it is ended and
+/// the UI asked for a sign-in (`session:ended`).
 ///
-/// Single-flight: `stale` is the client whose call returned 401. Callers queue
-/// on `relogin_gate`, and whoever finds the session already replaced simply
-/// takes over the fresh one instead of logging in again.
-async fn relogin(
-    state: &AppState,
+/// Single-flight: `stale` is the client whose call returned 401 at
+/// `unauthorized_at`. Callers queue on `relogin_gate`, and whoever finds the
+/// session already replaced simply takes over the fresh one instead of logging
+/// in again — and whoever finds that the attempt made for their 401 burst
+/// failed gets its error instead of trying once more.
+async fn relogin<H: SessionHost>(
+    host: &H,
     stale: Option<Arc<JellyfinClient>>,
+    unauthorized_at: Option<std::time::Instant>,
 ) -> AppResult<Arc<JellyfinClient>> {
     use std::sync::atomic::Ordering;
 
-    let _gate = state.relogin_gate.lock().await;
+    let _gate = host.relogin_gate().lock().await;
 
-    let current = { state.session.read().await.clone() };
+    let current = { host.session().read().await.clone() };
     match (&stale, current) {
         // Another task renewed while we waited for the gate.
         (Some(stale), Some(current)) if !Arc::ptr_eq(&current, stale) => return Ok(current),
         // No stale client (a window restoring its session) and one is already
         // installed, e.g. by the main window: use it.
         (None, Some(current)) => return Ok(current),
+        // The session this 401 belonged to is gone already: signed out while
+        // the request was out, or ended by the backend, which said so.
+        // Nothing to renew, and nothing to announce again.
+        (Some(_), None) => return Err(AppError::NotConnected),
         _ => {}
     }
-    if state.relogin_blocked.load(Ordering::Relaxed) {
+    if let (Some(stale), Some(at)) = (&stale, unauthorized_at) {
+        if let Some(err) = stale.failed_relogin_since(at) {
+            return Err(err);
+        }
+    }
+    if host.relogin_blocked().load(Ordering::Relaxed) {
         return Err(AppError::NotConnected);
     }
 
-    let (Some(server_url), Some(username)) = (
-        state.store.get(keys::SERVER_URL),
-        state.store.get(keys::USERNAME),
-    ) else {
+    let Some(login) = host.stored_login()? else {
         return Err(AppError::NotConnected);
     };
-    let password = password_entry(&server_url, &username)?
-        .get_password()
-        .map_err(|_| AppError::NotConnected)?;
-    let auto_trust = state.store.get(keys::ACCEPT_INVALID_CERTS).as_deref() == Some("true");
-    let device_id = state.store.device_id()?;
+    let Some(password) = login.password.clone() else {
+        // Nothing to renew the rejected token with. Left installed, the dead
+        // session would answer every call with a 401, a fresh probe and this
+        // same dead end.
+        end_session_of(
+            host,
+            stale.as_ref(),
+            SessionEnded {
+                reason: SessionEndReason::Rejected,
+                server_url: login.server_url,
+                username: login.username,
+            },
+        )
+        .await;
+        return Err(AppError::NotConnected);
+    };
 
-    let mut client = new_client(&state.store, &server_url, &device_id)?;
-    let attempt = match client.authenticate(&username, &password).await {
-        Err(AppError::Network(err)) => {
-            // A self-signed home server whose cert isn't pinned yet: trust it on
-            // first use when the server is configured for automatic trust, so
-            // installs from before certificate pinning keep working.
-            match autotrust(&state.store, &server_url, &device_id, &client, auto_trust)? {
-                Some(rebuilt) => {
-                    client = rebuilt;
-                    client.authenticate(&username, &password).await
-                }
-                None => Err(AppError::Network(err)),
-            }
+    let started = std::time::Instant::now();
+    let (sign_in, attempt) = host.sign_in(&login, &password).await?;
+    // Which server answered, before the check below: it is the last request
+    // on the wire. Should it not say, the server of the session it renews.
+    let server_id = match &attempt {
+        Ok(_) => {
+            let previous = stale
+                .as_ref()
+                .filter(|stale| stale.base_url() == sign_in.client.base_url())
+                .and_then(|stale| stale.server_id().map(str::to_string));
+            host.identify(&sign_in.client, Identify::Renewal(previous))
+                .await
         }
-        other => other,
+        Err(_) => None,
     };
     // A sign-in or account switch that went through while this login was on
     // the wire owns the session now: installing this result, or clearing the
     // session over a rejection, would undo it. (Sign-out holds the gate.)
-    let current = { state.session.read().await.clone() };
+    let current = { host.session().read().await.clone() };
     let unchanged = match (&current, &stale) {
         (Some(current), Some(stale)) => Arc::ptr_eq(current, stale),
         (None, None) => true,
@@ -219,45 +759,102 @@ async fn relogin(
     };
     if !unchanged {
         if attempt.is_ok() {
-            let _ = client.logout().await;
+            let _ = sign_in.client.logout().await;
         }
         return current.ok_or(AppError::NotConnected);
     }
     let user = match attempt {
         Ok(user) => user,
         Err(err) => {
-            // Latch only on an actual rejection of the credentials. A 5xx from
-            // a restarting server or a 429 from Jellyfin's own rate limiter is
-            // transient — latching on those would kill the session until the
-            // next manual sign-in for something that fixes itself in seconds.
-            if matches!(
-                err,
-                AppError::Server {
-                    status: 401 | 403,
-                    ..
-                }
-            ) {
+            // Latch only on an actual rejection of the credentials. Latching
+            // on a transient failure would kill the session until the next
+            // manual sign-in for something that fixes itself in seconds.
+            if credentials_rejected(&err) {
                 tracing::warn!("automatic re-login rejected, giving up until next sign-in");
-                state.relogin_blocked.store(true, Ordering::Relaxed);
-                *state.session.write().await = None;
+                host.relogin_blocked().store(true, Ordering::Relaxed);
+                // The latch lasts for this process only. Kept, a refused
+                // password would be tried again at every start, each time one
+                // more failed login on the server's count, which locks the
+                // account at its limit. The dead token stays: with it, the next
+                // start learns that a sign-in is needed without a login.
+                if password_refused(&err) {
+                    host.forget_password(&login);
+                }
+                end_session_of(
+                    host,
+                    stale.as_ref(),
+                    SessionEnded {
+                        reason: SessionEndReason::Rejected,
+                        server_url: login.server_url,
+                        username: login.username,
+                    },
+                )
+                .await;
+            } else if let Some(stale) = &stale {
+                stale.record_failed_relogin(started, &err);
             }
             return Err(err);
         }
     };
     tracing::info!("session renewed");
 
-    keyring_entry(&server_url, &username)?.set_password(client.token().unwrap_or_default())?;
-    state.store.set(keys::USER_ID, &user.id)?;
-    state.store.settle_auto_trust(&server_url, auto_trust)?;
-    persist_can_delete(state, user.can_delete())?;
-    persist_can_edit(state, user.can_edit_metadata())?;
-    Ok(install_session(state, client).await)
+    let client = host.keep_login(&login, sign_in, &user)?;
+    Ok(host.install(client, server_id).await)
+}
+
+/// Make a sign-in the session: `keep` forgets the previous login and stores
+/// this one (credentials, account, what it may do) and returns the client to
+/// install. Under `relogin_gate`, the gate a re-login keeps and installs
+/// under: a re-login on the wire meanwhile would otherwise write the
+/// previous account's token and user id over this sign-in's, or install its
+/// session over this one. The sign-in's own requests — the login and asking
+/// which server it is (`server_id`, [`identify`]) — stay outside the gate.
+async fn commit_sign_in<H: SessionHost>(
+    host: &H,
+    server_id: Option<String>,
+    keep: impl FnOnce() -> AppResult<JellyfinClient>,
+) -> AppResult<Arc<JellyfinClient>> {
+    let _gate = host.relogin_gate().lock().await;
+    let client = keep()?;
+    Ok(host.install(client, server_id).await)
+}
+
+/// Install a session a restore brought back — `keep` stores what goes with
+/// it and returns the client — only while the stored account is still the
+/// one the restore read (`account`: server address, user id) and the session
+/// is still what the restore found installed (`found`, usually none). Under
+/// `relogin_gate`, like a sign-in: a sign-in, a re-login or a sign-out that
+/// went through while the restore was validating owns the session, and the
+/// restore leaves it alone (`None`). `server_id` is found before, outside
+/// the gate ([`identify`]).
+async fn commit_restore<H: SessionHost>(
+    host: &H,
+    account: (&str, &str),
+    found: Option<&Arc<JellyfinClient>>,
+    server_id: Option<String>,
+    keep: impl FnOnce() -> AppResult<JellyfinClient>,
+) -> AppResult<Option<Arc<JellyfinClient>>> {
+    let _gate = host.relogin_gate().lock().await;
+    let still_stored = host
+        .signed_in()
+        .is_some_and(|(server_url, user_id)| (server_url.as_str(), user_id.as_str()) == account);
+    let current = { host.session().read().await.clone() };
+    let untouched = match (current.as_ref(), found) {
+        (None, None) => true,
+        (Some(current), Some(found)) => Arc::ptr_eq(current, found),
+        _ => false,
+    };
+    if !(still_stored && untouched) {
+        return Ok(None);
+    }
+    let client = keep()?;
+    Ok(Some(host.install(client, server_id).await))
 }
 
 /// Whether a 401 calls for a re-login, given what the token probe found.
 /// Only a token the server rejects does: a valid one means the 401 was a
 /// permission failure, and an unreachable server says nothing either way.
-fn relogin_after_401(validity: crate::api::SessionValidity) -> bool {
+fn relogin_after_401(validity: &crate::api::SessionValidity) -> bool {
     matches!(validity, crate::api::SessionValidity::Invalid)
 }
 
@@ -281,7 +878,8 @@ fn relogin_after_401(validity: crate::api::SessionValidity) -> bool {
 /// - `validate_after` is single-flight per client: calls whose 401 arrived
 ///   before the running probe started wait for it and share its answer.
 /// - `relogin` is single-flight on `relogin_gate` and hands everyone after the
-///   first the renewed session instead of logging in again.
+///   first the renewed session instead of logging in again — or, when that
+///   login failed, its error.
 ///
 /// The probe deliberately does not take `relogin_gate`. Sign-out holds that gate
 /// too, and permission 401s (which never log in) should not queue behind a login
@@ -305,19 +903,138 @@ where
         return call(current).await;
     }
 
-    let validity = client.validate_after(unauthorized_at).await;
-    if !relogin_after_401(validity) {
+    let client = renew_rejected(state, client, unauthorized_at, unauthorized).await?;
+    call(client).await
+}
+
+/// The probe and the re-login behind [`with_retry`] and [`renew_after_401`]:
+/// `stale` got `unauthorized` (a 401) at `unauthorized_at` and is still the
+/// session. Renews only when the probe finds the session rejected; otherwise
+/// the 401 is returned as it is.
+async fn renew_rejected<H: SessionHost>(
+    host: &H,
+    stale: Arc<JellyfinClient>,
+    unauthorized_at: std::time::Instant,
+    unauthorized: AppError,
+) -> AppResult<Arc<JellyfinClient>> {
+    let validity = stale.validate_after(unauthorized_at).await;
+    if !relogin_after_401(&validity) {
         // No "token" in the message: the diagnostics ring drops such lines.
         tracing::info!("got 401 but the session check found {validity:?}, not re-logging in");
         return Err(unauthorized);
     }
     tracing::info!("got 401 and the session was rejected, attempting automatic re-login");
-    let client = relogin(state, Some(client)).await?;
-    call(client).await
+    relogin(host, Some(stale), Some(unauthorized_at)).await
 }
+
+/// How long a failed automatic re-login answers the 401s of background work
+/// (see [`renew_after_401`]), not only those that came before it.
+const BACKGROUND_RELOGIN_PAUSE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether `a` and `b` are sessions of one account: the same server and user.
+fn same_account_session(a: &JellyfinClient, b: &JellyfinClient) -> bool {
+    a.base_url() == b.base_url() && matches!((a.user_id(), b.user_id()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// [`with_retry`]'s renewal for work that does not run through it — a player
+/// open, the library watch, the sonic scan, a download: `stale` got
+/// `unauthorized` (a 401) at `unauthorized_at`. Returns the session to retry
+/// the call on once, or the error to give up with. The same probe and the
+/// same single-flight re-login as `with_retry`, with the same certificate
+/// rules, and stricter about whom it renews for:
+/// - signed out meanwhile (or the session ended): nothing is renewed;
+/// - the session was replaced while the call was out: retried on it only when
+///   it is the same account — a session of another account (an account
+///   switch) is never handed to work started for this one, and neither is
+///   what a re-login racing a sign-in brought back;
+/// - an account no longer the one stored (`forget_previous_login` ran) is not
+///   renewed;
+/// - a failed re-login answers for [`BACKGROUND_RELOGIN_PAUSE`]: background
+///   work keeps going on its own (a batch of downloads, a poll every 30 s),
+///   and during an outage of the login each of its 401s would log in again.
+///
+/// A rejection of the stored password ends the session as everywhere else
+/// (`session:ended`), once.
+pub(crate) async fn renew_after_401<H: SessionHost>(
+    host: &H,
+    stale: &Arc<JellyfinClient>,
+    unauthorized_at: std::time::Instant,
+    unauthorized: AppError,
+) -> AppResult<Arc<JellyfinClient>> {
+    let current = { host.session().read().await.clone() };
+    match current {
+        None => return Err(AppError::NotConnected),
+        Some(current) if !Arc::ptr_eq(&current, stale) => {
+            return if same_account_session(&current, stale) {
+                Ok(current)
+            } else {
+                Err(AppError::NotConnected)
+            };
+        }
+        Some(_) => {}
+    }
+    let stored_for_stale = host.signed_in().is_some_and(|(server_url, user_id)| {
+        stale.base_url() == server_url && stale.user_id().ok() == Some(user_id.as_str())
+    });
+    if !stored_for_stale {
+        return Err(AppError::NotConnected);
+    }
+    let pause_from = unauthorized_at
+        .checked_sub(BACKGROUND_RELOGIN_PAUSE)
+        .unwrap_or(unauthorized_at);
+    if let Some(err) = stale.failed_relogin_since(pause_from) {
+        return Err(err);
+    }
+    let renewed = renew_rejected(host, stale.clone(), unauthorized_at, unauthorized).await?;
+    if same_account_session(&renewed, stale) {
+        Ok(renewed)
+    } else {
+        Err(AppError::NotConnected)
+    }
+}
+
+/// [`renew_after_401`] for work that holds an `AppHandle`. The renewal runs
+/// as a task of its own: a caller that gives up on it (a cancelled download,
+/// an open the player has moved on from) does not cut a re-login short
+/// halfway.
+pub(crate) async fn renew_session(
+    app: &tauri::AppHandle,
+    stale: &Arc<JellyfinClient>,
+    unauthorized_at: std::time::Instant,
+    unauthorized: AppError,
+) -> AppResult<Arc<JellyfinClient>> {
+    let fallback = unauthorized.replay();
+    let (app, stale) = (app.clone(), stale.clone());
+    let renewal = tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<AppState>() else {
+            return Err(unauthorized);
+        };
+        renew_after_401(state.inner(), &stale, unauthorized_at, unauthorized).await
+    });
+    renewal.await.unwrap_or(Err(fallback))
+}
+
+#[cfg(test)]
+mod renewal_tests;
 
 #[tauri::command]
 pub async fn restore_session(state: State<'_, AppState>) -> AppResult<Option<SessionInfo>> {
+    restore_stored_session(&state).await
+}
+
+/// Bring back the session stored on this device. Runs at startup from Rust
+/// (lib.rs), so the tray, the media keys, the library watch and the sonic
+/// scan have a session while the window is still hidden — with "start
+/// minimized" its WebView may be suspended before the page ever asks — and
+/// again for every window that restores it.
+///
+/// Single-flight on `restore_gate`, and a session already installed for the
+/// stored account is handed back as it is. Building a new one would swap the
+/// client that every window and background task shares (the projector
+/// restores on every open), dropping its scan caches and restarting the
+/// library analysis.
+pub(crate) async fn restore_stored_session(state: &AppState) -> AppResult<Option<SessionInfo>> {
+    let _restoring = state.restore_gate.lock().await;
     let (Some(server_url), Some(username), Some(user_id)) = (
         state.store.get(keys::SERVER_URL),
         state.store.get(keys::USERNAME),
@@ -325,10 +1042,20 @@ pub async fn restore_session(state: State<'_, AppState>) -> AppResult<Option<Ses
     ) else {
         return Ok(None);
     };
+    let installed = { state.session.read().await.clone() };
+    if installed.as_ref().is_some_and(|client| {
+        client.base_url() == server_url && client.user_id().ok() == Some(user_id.as_str())
+    }) {
+        return Ok(Some(stored_session_info(
+            state, server_url, username, user_id,
+        )));
+    }
     let auto_trust = state.store.get(keys::ACCEPT_INVALID_CERTS).as_deref() == Some("true");
 
     let Ok(token) = keyring_entry(&server_url, &username)?.get_password() else {
-        return Ok(None);
+        // Gone, maybe because a sign-in to another account forgot it since
+        // this restore read the store: the window gets what is installed.
+        return Ok(installed_session_info(state).await);
     };
 
     let device_id = state.store.device_id()?;
@@ -337,75 +1064,172 @@ pub async fn restore_session(state: State<'_, AppState>) -> AppResult<Option<Ses
 
     let mut validity = client.validate().await;
     // Trust-on-first-use migration: a self-signed server that predates pinning
-    // reads as Unreachable (its cert is rejected). Pin it and re-validate when
+    // reads as Untrusted (its cert is rejected). Trust it and re-validate when
     // automatic trust is enabled, rather than logging the user out.
-    if matches!(validity, crate::api::SessionValidity::Unreachable) {
-        if let Some(rebuilt) =
+    if matches!(validity, crate::api::SessionValidity::Untrusted(_)) {
+        if let Some((trusting, candidate)) =
             autotrust(&state.store, &server_url, &device_id, &client, auto_trust)?
         {
-            client = rebuilt.with_session(token.clone(), user_id.clone());
-            validity = client.validate().await;
+            let trusting = trusting.with_session(token.clone(), user_id.clone());
+            // Pinned only when the stored account itself answered over this
+            // certificate — this restore's login —, the test a certificate
+            // trusted inside a session passes: any 2xx would also take a
+            // portal that answers everything.
+            match check_confirmed_certificate(&trusting, &candidate).await {
+                Ok(CertificateCheck::Pin(_)) => {
+                    validity = crate::api::SessionValidity::Valid;
+                    client = trust_after_login(
+                        &state.store,
+                        &server_url,
+                        &device_id,
+                        trusting,
+                        &candidate,
+                    )?;
+                }
+                outcome => {
+                    if matches!(outcome, Ok(CertificateCheck::Rejected)) {
+                        validity = crate::api::SessionValidity::Invalid;
+                    }
+                    // Not pinned: whatever follows uses exactly the stored pins.
+                    client = new_client(&state.store, &server_url, &device_id)?
+                        .with_session(token.clone(), user_id.clone());
+                }
+            }
         }
     }
 
+    // The session this restore installed, to refresh its policy from.
     let refresh_policy = match validity {
         crate::api::SessionValidity::Valid => {
-            // Also retires the preference on installs that carry it for a
-            // server with a publicly valid certificate (see settle_auto_trust).
-            state.store.settle_auto_trust(&server_url, auto_trust)?;
-            install_session(&state, client).await;
-            true
+            let server_id = identify(&state.store, &client, Identify::Renewal(None)).await;
+            let restored = commit_restore(
+                state,
+                (&server_url, &user_id),
+                installed.as_ref(),
+                server_id,
+                || {
+                    // Also retires the preference on installs that carry it
+                    // for a server with a publicly valid certificate (see
+                    // settle_auto_trust).
+                    state.store.settle_auto_trust(&server_url, auto_trust)?;
+                    Ok(client)
+                },
+            )
+            .await?;
+            let Some(restored) = restored else {
+                // Someone else's session now: the window gets what is there.
+                return Ok(installed_session_info(state).await);
+            };
+            Some(restored)
         }
         crate::api::SessionValidity::Invalid => {
             // Token expired or revoked — try the stored password before
             // giving up.
             tracing::info!("stored session is no longer valid, trying re-login");
-            if relogin(&state, None).await.is_err() {
-                return Ok(None);
+            if relogin(state, None, None).await.is_err() {
+                return Ok(installed_session_info(state).await);
             }
             // relogin already persisted the policy returned by authenticate.
-            false
+            // It hands back a session another sign-in installed meanwhile as
+            // it is: the window gets whoever that is.
+            return Ok(installed_session_info(state).await);
         }
-        crate::api::SessionValidity::Unreachable => {
+        crate::api::SessionValidity::Moved(address) => {
+            // The server forces https now. The stored address never works
+            // again, so no offline grace: back to the sign-in screen, with
+            // the new address filled in.
+            end_session(
+                state,
+                None,
+                SessionEnded {
+                    reason: SessionEndReason::Moved,
+                    server_url: address,
+                    username,
+                },
+            )
+            .await;
+            // `end_session` left a session that is not this one alone.
+            return Ok(installed_session_info(state).await);
+        }
+        crate::api::SessionValidity::Unreachable | crate::api::SessionValidity::Untrusted(_) => {
             // Offline grace: keep the session so the restored queue and UI
             // work; requests recover (or re-login via 401 retry) once the
-            // server is back.
+            // server is back. A certificate that is not trusted keeps it too:
+            // a captive portal presents one and goes away again, and for a
+            // renewed one the shell offers the fingerprint (`check_server`).
             tracing::info!("server unreachable during restore, keeping session");
-            install_session(&state, client).await;
+            let server_id = identify(&state.store, &client, Identify::Offline).await;
+            let restored = commit_restore(
+                state,
+                (&server_url, &user_id),
+                installed.as_ref(),
+                server_id,
+                || Ok(client),
+            )
+            .await?;
+            if restored.is_none() {
+                return Ok(installed_session_info(state).await);
+            }
             // Do not immediately repeat the failed network round-trip below.
-            false
+            None
         }
     };
 
     // Refresh the delete permission from the live policy when reachable — a
     // session restored from before this feature (or a changed server-side
     // permission) would otherwise carry a stale/absent value.
-    if refresh_policy {
-        // Bind outside the `if let`: on edition 2021 the read guard produced by
-        // the scrutinee lives to the end of the block, so it would be held
-        // across the `me()` round-trip and stall the player thread.
-        let session = { state.session.read().await.clone() };
-        if let Some(client) = session {
-            if let Ok(user) = client.me().await {
-                let _ = persist_can_delete(&state, user.can_delete());
-                let _ = persist_can_edit(&state, user.can_edit_metadata());
+    if let Some(restored) = refresh_policy {
+        if let Ok(user) = restored.me().await {
+            // Only while it is still the session: a sign-in that went
+            // through during the round-trip has stored its own account's.
+            let _gate = state.relogin_gate.lock().await;
+            let current = { state.session.read().await.clone() };
+            if current.is_some_and(|current| Arc::ptr_eq(&current, &restored)) {
+                let _ = persist_can_delete(state, user.can_delete());
+                let _ = persist_can_edit(state, user.can_edit_metadata());
             }
         }
     }
-    let can_delete = state.store.get(keys::CAN_DELETE).as_deref() == Some("true");
-    let can_edit = state.store.get(keys::CAN_EDIT).as_deref() == Some("true");
-    Ok(Some(SessionInfo {
+    Ok(installed_session_info(state).await)
+}
+
+/// The stored account, when its session is the one installed — what a
+/// restore answers a window with when it found or left a session in place.
+async fn installed_session_info(state: &AppState) -> Option<SessionInfo> {
+    let (Some(server_url), Some(username), Some(user_id)) = (
+        state.store.get(keys::SERVER_URL),
+        state.store.get(keys::USERNAME),
+        state.store.get(keys::USER_ID),
+    ) else {
+        return None;
+    };
+    let installed = { state.session.read().await.clone() };
+    installed
+        .is_some_and(|client| {
+            client.base_url() == server_url && client.user_id().ok() == Some(user_id.as_str())
+        })
+        .then(|| stored_session_info(state, server_url, username, user_id))
+}
+
+fn stored_session_info(
+    state: &AppState,
+    server_url: String,
+    username: String,
+    user_id: String,
+) -> SessionInfo {
+    SessionInfo {
         server_url,
         username,
         user_id,
-        can_delete,
-        can_edit,
-    }))
+        can_delete: state.store.get(keys::CAN_DELETE).as_deref() == Some("true"),
+        can_edit: state.store.get(keys::CAN_EDIT).as_deref() == Some("true"),
+    }
 }
 
 #[tauri::command]
 pub async fn connect(
     state: State<'_, AppState>,
+    downloads: State<'_, crate::download::DownloadManager>,
     server_url: String,
     username: String,
     password: String,
@@ -417,8 +1241,11 @@ pub async fn connect(
     // failed login (wrong password, wrong server) must not leave it trusted.
     trust_fingerprint: Option<String>,
 ) -> AppResult<ConnectResult> {
-    let server_url = server_url.trim().trim_end_matches('/').to_string();
+    let server_url = server_address(&server_url)?;
     let device_id = state.store.device_id()?;
+    // The ended session this sign-in replaces: `check_server` must not tell
+    // the UI about it again while the new one is being made.
+    state.session_notice.clear();
 
     if let Some(fingerprint) = trust_fingerprint.as_deref() {
         if !crate::tls::is_valid_fingerprint(fingerprint) {
@@ -474,19 +1301,24 @@ pub async fn connect(
             new_client(&state.store, &server_url, &device_id)?.with_session(token, user.id.clone());
     }
 
-    forget_previous_login(&state, &server_url, &username);
-    keyring_entry(&server_url, &username)?.set_password(client.token().unwrap_or_default())?;
-    password_entry(&server_url, &username)?.set_password(&password)?;
-    state.store.set(keys::SERVER_URL, &server_url)?;
-    state.store.set(keys::USERNAME, &username)?;
-    state.store.set(keys::USER_ID, &user.id)?;
-    state
-        .store
-        .settle_auto_trust(&server_url, accept_invalid_certs)?;
+    let server_id = identify(&state.store, &client, Identify::SignIn).await;
     let can_delete = user.can_delete();
     let can_edit = user.can_edit_metadata();
-    persist_can_delete(&state, can_delete)?;
-    persist_can_edit(&state, can_edit)?;
+    commit_sign_in(&*state, server_id, || {
+        forget_previous_login(&state, &downloads, &server_url, &username, &user.id);
+        keyring_entry(&server_url, &username)?.set_password(client.token().unwrap_or_default())?;
+        password_entry(&server_url, &username)?.set_password(&password)?;
+        state.store.set(keys::SERVER_URL, &server_url)?;
+        state.store.set(keys::USERNAME, &username)?;
+        state.store.set(keys::USER_ID, &user.id)?;
+        state
+            .store
+            .settle_auto_trust(&server_url, accept_invalid_certs)?;
+        persist_can_delete(&state, can_delete)?;
+        persist_can_edit(&state, can_edit)?;
+        Ok(client)
+    })
+    .await?;
 
     let info = SessionInfo {
         server_url,
@@ -495,7 +1327,6 @@ pub async fn connect(
         can_delete,
         can_edit,
     };
-    install_session(&state, client).await;
     Ok(ConnectResult::Connected { session: info })
 }
 
@@ -506,6 +1337,28 @@ pub struct QuickConnectSession {
     pub code: String,
 }
 
+/// A certificate a Quick Connect handshake trusts on first use, from
+/// `quick_connect_start` to the sign-in that ends it. Only the one the start
+/// was shown is accepted by the polls, and it is pinned when the sign-in went
+/// through on it — never before. One handshake at a time, as on the setup
+/// screen: a new start replaces it.
+struct QuickConnectTrust {
+    server_url: String,
+    secret: String,
+    fingerprint: String,
+}
+
+impl QuickConnectTrust {
+    /// The certificate to accept for a poll of this very handshake.
+    fn for_poll(&self, server_url: &str, secret: &str, allow: bool) -> Option<String> {
+        (allow && self.server_url == server_url && self.secret == secret)
+            .then(|| self.fingerprint.clone())
+    }
+}
+
+static QUICK_CONNECT_TRUST: std::sync::Mutex<Option<QuickConnectTrust>> =
+    std::sync::Mutex::new(None);
+
 /// Start a Quick Connect handshake: returns the code the user confirms on
 /// another (already signed-in) Jellyfin device.
 #[tauri::command]
@@ -514,9 +1367,10 @@ pub async fn quick_connect_start(
     server_url: String,
     accept_invalid_certs: bool,
 ) -> AppResult<QuickConnectSession> {
-    let server_url = server_url.trim().trim_end_matches('/').to_string();
+    let server_url = server_address(&server_url)?;
     let device_id = state.store.device_id()?;
-    let mut client = new_client(&state.store, &server_url, &device_id)?;
+    let client = new_client(&state.store, &server_url, &device_id)?;
+    *QUICK_CONNECT_TRUST.lock().unwrap() = None;
     let result = match client.quick_connect_initiate().await {
         Err(AppError::Network(err)) => {
             // Quick Connect has no confirmation UI, so it can only reach a
@@ -528,9 +1382,14 @@ pub async fn quick_connect_start(
                 &client,
                 accept_invalid_certs,
             )? {
-                Some(rebuilt) => {
-                    client = rebuilt;
-                    client.quick_connect_initiate().await?
+                Some((trusting, fingerprint)) => {
+                    let result = trusting.quick_connect_initiate().await?;
+                    *QUICK_CONNECT_TRUST.lock().unwrap() = Some(QuickConnectTrust {
+                        server_url,
+                        secret: result.secret.clone(),
+                        fingerprint,
+                    });
+                    result
                 }
                 None => return Err(AppError::Network(err)),
             }
@@ -549,49 +1408,56 @@ pub async fn quick_connect_start(
 #[tauri::command]
 pub async fn quick_connect_poll(
     state: State<'_, AppState>,
+    downloads: State<'_, crate::download::DownloadManager>,
     server_url: String,
     accept_invalid_certs: bool,
     secret: String,
 ) -> AppResult<Option<SessionInfo>> {
-    let server_url = server_url.trim().trim_end_matches('/').to_string();
+    let server_url = server_address(&server_url)?;
     let device_id = state.store.device_id()?;
-    let mut client = new_client(&state.store, &server_url, &device_id)?;
-
-    let state_result = match client.quick_connect_state(&secret).await {
-        Err(AppError::Network(err)) => {
-            match autotrust(
-                &state.store,
-                &server_url,
-                &device_id,
-                &client,
-                accept_invalid_certs,
-            )? {
-                Some(rebuilt) => {
-                    client = rebuilt;
-                    client.quick_connect_state(&secret).await?
-                }
-                None => return Err(AppError::Network(err)),
-            }
-        }
-        other => other?,
+    // The certificate the start trusted, if it had to: a different one here
+    // is a change, and Quick Connect has no prompt to confirm it with.
+    let candidate = QUICK_CONNECT_TRUST
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|trust| trust.for_poll(&server_url, &secret, accept_invalid_certs));
+    let mut client = match candidate.as_deref() {
+        Some(fingerprint) => client_trusting(&state.store, &server_url, &device_id, fingerprint)?,
+        None => new_client(&state.store, &server_url, &device_id)?,
     };
+
+    let state_result = client.quick_connect_state(&secret).await?;
     if !state_result.authenticated {
         return Ok(None);
     }
+    // As in `connect`: the ended session is being replaced now.
+    state.session_notice.clear();
     let user = client.authenticate_with_quick_connect(&secret).await?;
+    if let Some(candidate) = candidate.as_deref() {
+        // Only now, with the sign-in through on this certificate, does it
+        // become trusted.
+        client = trust_after_login(&state.store, &server_url, &device_id, client, candidate)?;
+        *QUICK_CONNECT_TRUST.lock().unwrap() = None;
+    }
 
-    forget_previous_login(&state, &server_url, &user.name);
-    keyring_entry(&server_url, &user.name)?.set_password(client.token().unwrap_or_default())?;
-    state.store.set(keys::SERVER_URL, &server_url)?;
-    state.store.set(keys::USERNAME, &user.name)?;
-    state.store.set(keys::USER_ID, &user.id)?;
-    state
-        .store
-        .settle_auto_trust(&server_url, accept_invalid_certs)?;
+    let server_id = identify(&state.store, &client, Identify::SignIn).await;
     let can_delete = user.can_delete();
     let can_edit = user.can_edit_metadata();
-    persist_can_delete(&state, can_delete)?;
-    persist_can_edit(&state, can_edit)?;
+    commit_sign_in(&*state, server_id, || {
+        forget_previous_login(&state, &downloads, &server_url, &user.name, &user.id);
+        keyring_entry(&server_url, &user.name)?.set_password(client.token().unwrap_or_default())?;
+        state.store.set(keys::SERVER_URL, &server_url)?;
+        state.store.set(keys::USERNAME, &user.name)?;
+        state.store.set(keys::USER_ID, &user.id)?;
+        state
+            .store
+            .settle_auto_trust(&server_url, accept_invalid_certs)?;
+        persist_can_delete(&state, can_delete)?;
+        persist_can_edit(&state, can_edit)?;
+        Ok(client)
+    })
+    .await?;
 
     let info = SessionInfo {
         server_url,
@@ -600,15 +1466,21 @@ pub async fn quick_connect_poll(
         can_delete,
         can_edit,
     };
-    install_session(&state, client).await;
     Ok(Some(info))
 }
 
 #[tauri::command]
-pub async fn disconnect(state: State<'_, AppState>) -> AppResult<()> {
+pub async fn disconnect(
+    state: State<'_, AppState>,
+    downloads: State<'_, crate::download::DownloadManager>,
+) -> AppResult<()> {
     // No automatic re-login may straddle the sign-out: one finishing after it
     // would store a fresh token and put the session back.
     let _gate = state.relogin_gate.lock().await;
+    // The downloads belong to this account too: the queued ones would start
+    // under whoever signs in next, and the panel would list this account's
+    // tracks to them.
+    downloads.reset();
     // Tell the server the playback ended (and flush the ListenBrainz listen)
     // while the token still works — this blocks briefly, so keep it off the
     // async worker threads.
@@ -641,17 +1513,38 @@ pub async fn disconnect(state: State<'_, AppState>) -> AppResult<()> {
             let _ = entry.delete_credential();
         }
     }
-    state.store.delete(keys::USER_ID)?;
-    state.store.delete(keys::CAN_DELETE)?;
-    state.store.delete(keys::CAN_EDIT)?;
+    // After the stop report above, which flushed the last listen with it.
+    forget_listenbrainz_token(&state);
     // The queue must not outlive the session: its entries hold absolute stream
     // URLs for this server, and leaving them in place would both show the next
     // user what the previous one listened to and aim playback at the old host.
-    state.store.delete(keys::QUEUE)?;
-    state.store.delete(keys::QUEUE_INDEX)?;
+    //
+    // Best effort, like the credentials above: the token is revoked by now,
+    // and stopping at a failed delete would leave that dead session installed
+    // with the UI still signed in. A sign-out always ends the session.
+    delete_all(
+        &[
+            keys::USER_ID,
+            keys::CAN_DELETE,
+            keys::CAN_EDIT,
+            keys::QUEUE,
+            keys::QUEUE_INDEX,
+        ],
+        |key| state.store.delete(key),
+    );
     let _ = state.player.send(PlayerCommand::ResetQueue);
+    state.session_notice.clear();
     *state.session.write().await = None;
     Ok(())
+}
+
+/// Run `delete` for every key, on past a failure (logged).
+fn delete_all(keys: &[&str], mut delete: impl FnMut(&str) -> AppResult<()>) {
+    for key in keys {
+        if let Err(e) = delete(key) {
+            tracing::warn!("sign-out could not delete {key}: {e}");
+        }
+    }
 }
 
 /// Every pinned certificate across all servers, for the settings list.
@@ -671,29 +1564,189 @@ pub fn forget_trusted_certificate(
     server_url: String,
     fingerprint: String,
 ) -> AppResult<()> {
-    state.store.forget_fingerprint(&server_url, &fingerprint)?;
+    let forgot = state.store.forget_fingerprint(&server_url, &fingerprint)?;
+    // Automatic trust is kept only while the signed-in server has a pin
+    // (`Store::settle_auto_trust`). With its last one gone, a re-login in the
+    // moment before the UI signs out would pin whatever it meets.
+    if forgot && state.store.get(keys::SERVER_URL).as_deref() == Some(server_url.as_str()) {
+        let requested = state.store.get(keys::ACCEPT_INVALID_CERTS).as_deref() == Some("true");
+        state.store.settle_auto_trust(&server_url, requested)?;
+    }
     Ok(())
 }
 
+/// What the request through a certificate confirmed for the running session
+/// decides (see [`trust_session_certificate`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CertificateCheck {
+    /// The session's own account answered through it: pin this — `None` when
+    /// the server presented a certificate that needs no pin after all.
+    Pin(Option<String>),
+    /// The server refused the session's token through it.
+    Rejected,
+}
+
+/// Ask the server behind a confirmed certificate who this session is, through
+/// `trusting` — a client that accepts `confirmed` on top of the stored pins
+/// and carries the session's token — and decide what to pin.
+///
+/// Only an answer that is this session's own account stands in for the login
+/// a pin needs: a captive portal or an interception answers `200` with a page
+/// of its own just as well, and pinning on that would replace the real
+/// server's pin with the portal's. A confirmed sign-in clears the same bar —
+/// its answer has to be a real Jellyfin login.
+pub(crate) async fn check_confirmed_certificate(
+    trusting: &JellyfinClient,
+    confirmed: &str,
+) -> AppResult<CertificateCheck> {
+    let user_id = trusting.user_id()?.to_string();
+    match trusting.me().await {
+        Ok(user) if user.id == user_id => Ok(CertificateCheck::Pin(pin_after_login(
+            trusting.presented_fingerprint(),
+            confirmed,
+        ))),
+        Ok(_) => Err(AppError::Other(
+            "the server answered for another account".into(),
+        )),
+        Err(err) if credentials_rejected(&err) => Ok(CertificateCheck::Rejected),
+        Err(AppError::Network(_)) if trusting.untrusted_fingerprint().is_some() => Err(
+            AppError::Other("the server presents a different certificate now".into()),
+        ),
+        Err(AppError::Network(_)) => Err(AppError::Other("the server cannot be reached".into())),
+        Err(err) => Err(err),
+    }
+}
+
+/// Trust the certificate the running session's server presents now, after the
+/// user compared its fingerprint — the shell offers it when `check_server`
+/// reports a certificate that is not trusted (a pinned one renewed). No new
+/// sign-in, and the queue stays: the same rules as a confirmed sign-in, with
+/// the session's own token as the login. The certificate is accepted in memory
+/// for one authenticated request, pinned only when the session's own account
+/// answered it on exactly this certificate ([`check_confirmed_certificate`]) —
+/// replacing the server's earlier pin — and the session is then rebuilt with
+/// exactly the stored pins.
+#[tauri::command]
+pub async fn trust_session_certificate(
+    state: State<'_, AppState>,
+    fingerprint: String,
+) -> AppResult<()> {
+    if !crate::tls::is_valid_fingerprint(&fingerprint) {
+        return Err(AppError::Other(
+            "not a SHA-256 certificate fingerprint".into(),
+        ));
+    }
+    // No re-login or sign-out may swap the session underneath.
+    let _gate = state.relogin_gate.lock().await;
+    let current = client(&state).await?;
+    // Only what this session was shown: a certificate that changed again
+    // since the user looked has to be looked at again.
+    if !current
+        .untrusted_fingerprint()
+        .is_some_and(|presented| crate::tls::matches(&presented, &fingerprint))
+    {
+        return Err(AppError::Other(
+            "the server presents a different certificate now".into(),
+        ));
+    }
+    let (Some(token), Ok(user_id)) = (current.token(), current.user_id()) else {
+        return Err(AppError::NotConnected);
+    };
+    let (token, user_id) = (token.to_string(), user_id.to_string());
+    let server_url = current.base_url().to_string();
+    let device_id = state.store.device_id()?;
+
+    let trusting = client_trusting(&state.store, &server_url, &device_id, &fingerprint)?
+        .with_session(token.clone(), user_id.clone());
+    let pin = match check_confirmed_certificate(&trusting, &fingerprint).await? {
+        CertificateCheck::Pin(pin) => pin,
+        CertificateCheck::Rejected => {
+            // The token is gone as well, and a re-login cannot get past the
+            // old pin: a full sign-in, which asks for this certificate again.
+            end_session(
+                &state,
+                Some(&current),
+                SessionEnded {
+                    reason: SessionEndReason::Rejected,
+                    server_url,
+                    username: state.store.get(keys::USERNAME).unwrap_or_default(),
+                },
+            )
+            .await;
+            return Err(AppError::NotConnected);
+        }
+    };
+    // Which server answers through it, before the check below. A new
+    // certificate may be a new server; should it not say, the session's.
+    let server_id = identify(
+        &state.store,
+        &trusting,
+        Identify::Renewal(current.server_id().map(str::to_string)),
+    )
+    .await;
+    // A sign-in that went through meanwhile owns the session (and its pins).
+    let unchanged = {
+        let session = state.session.read().await;
+        session
+            .as_ref()
+            .is_some_and(|session| Arc::ptr_eq(session, &current))
+    };
+    if !unchanged {
+        return Ok(());
+    }
+    if let Some(pin) = pin {
+        state.store.pin_fingerprint(&server_url, &pin)?;
+    }
+    let auto_trust = state.store.get(keys::ACCEPT_INVALID_CERTS).as_deref() == Some("true");
+    state.store.settle_auto_trust(&server_url, auto_trust)?;
+    let rebuilt = new_client(&state.store, &server_url, &device_id)?.with_session(token, user_id);
+    tracing::info!("server certificate confirmed for the running session");
+    install_session(&state, rebuilt, server_id).await;
+    Ok(())
+}
+
+/// Whether a sign-in to `new` (server URL, user id) continues the account the
+/// stored `old` pair belongs to — the pair `load_persisted_queue` checks on
+/// startup. By user id, not by name: Jellyfin matches user names regardless of
+/// case, so "alice" and "Alice" are one account.
+fn same_account(old: (Option<&str>, Option<&str>), new: (&str, &str)) -> bool {
+    old == (Some(new.0), Some(new.1))
+}
+
 /// Clean up after the login that is being replaced. Call before storing the
-/// new `SERVER_URL`/`USERNAME`.
+/// new `SERVER_URL`/`USERNAME`/`USER_ID`.
 ///
 /// Two things would otherwise be left behind: the previous account's token and
 /// plaintext password stay in the Credential Manager forever (their key is
 /// derived from server+username, so `disconnect` can no longer address them),
 /// and the previous server's queue stays in SQLite with absolute stream URLs
-/// pointing at that host.
-fn forget_previous_login(state: &AppState, new_server_url: &str, new_username: &str) {
-    let (old_server, old_user) = (
+/// pointing at that host. The ListenBrainz token saved under that account goes
+/// too, or the new account's listens would land on its profile.
+fn forget_previous_login(
+    state: &AppState,
+    downloads: &crate::download::DownloadManager,
+    new_server_url: &str,
+    new_username: &str,
+    new_user_id: &str,
+) {
+    let (old_server, old_user, old_user_id) = (
         state.store.get(keys::SERVER_URL),
         state.store.get(keys::USERNAME),
+        state.store.get(keys::USER_ID),
     );
     // A different server OR a different account: neither may inherit the
-    // queue. `load_persisted_queue` checks the same pair on startup.
-    if old_server.as_deref() != Some(new_server_url) || old_user.as_deref() != Some(new_username) {
+    // queue.
+    if !same_account(
+        (old_server.as_deref(), old_user_id.as_deref()),
+        (new_server_url, new_user_id),
+    ) {
         let _ = state.store.delete(keys::QUEUE);
         let _ = state.store.delete(keys::QUEUE_INDEX);
         let _ = state.player.send(PlayerCommand::ResetQueue);
+        forget_listenbrainz_token(state);
+        // A session the backend ended skipped the sign-out (disconnect):
+        // its queued downloads would start under this account.
+        downloads.reset();
     }
     let (Some(old_server), Some(old_user)) = (old_server, old_user) else {
         return;
@@ -760,7 +1813,8 @@ pub async fn get_album(state: State<'_, AppState>, album_id: String) -> AppResul
     with_retry(&state, |c| {
         let album_id = album_id.clone();
         async move {
-            let (album, tracks) = tokio::try_join!(c.album(&album_id), c.album_tracks(&album_id))?;
+            let (album, tracks) =
+                crate::api::join_detail(c.album(&album_id), c.album_tracks(&album_id)).await?;
             Ok(AlbumDetail { album, tracks })
         }
     })
@@ -796,7 +1850,7 @@ pub async fn get_artist(state: State<'_, AppState>, artist_id: String) -> AppRes
         let artist_id = artist_id.clone();
         async move {
             let (artist, albums) =
-                tokio::try_join!(c.artist(&artist_id), c.artist_albums(&artist_id))?;
+                crate::api::join_detail(c.artist(&artist_id), c.artist_albums(&artist_id)).await?;
             // Appears-on and top-songs are decoration: a failure must not sink
             // the page.
             let (appears_on, top_songs) = tokio::join!(
@@ -834,10 +1888,12 @@ pub async fn get_track_info(
     .await
 }
 
-/// Replace characters not allowed in filenames on Windows.
+/// Replace characters not allowed in filenames on Windows, and drop the
+/// invisible ones that change how the rest of the name is drawn.
 pub(crate) fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
+        .filter(|&c| !is_bidi_control(c))
         .map(|c| {
             if c.is_control() || "/\\:*?\"<>|".contains(c) {
                 '_'
@@ -859,6 +1915,18 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Bidirectional formatting characters reorder what follows them on screen:
+/// the server-supplied "song\u{202E}calf.exe" shows as "songexe.flac" in
+/// Explorer. A file name has no use for them other than disguising what the
+/// file is; `char::is_control` does not cover them (they are format, not
+/// control characters).
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Longest path component the file systems we run on accept: 255 UTF-16 code
@@ -1001,6 +2069,18 @@ mod filename_tests {
     }
 
     #[test]
+    fn bidi_controls_cannot_disguise_the_extension() {
+        // Shown as "songexe.flac" with the override in place.
+        assert_eq!(sanitize_filename("song\u{202E}calf.exe"), "songcalf.exe");
+        assert_eq!(
+            sanitize_filename("\u{2067}a\u{2069}\u{200F}b\u{061C}.flac"),
+            "ab.flac"
+        );
+        // Right-to-left text itself stays.
+        assert_eq!(sanitize_filename("שיר.flac"), "שיר.flac");
+    }
+
+    #[test]
     fn names_are_bounded_in_file_system_units() {
         // Two UTF-16 units (four bytes) per emoji: 200 chars of these passed
         // the old char cap and still overran NTFS's 255 units.
@@ -1070,8 +2150,8 @@ pub fn queue_downloads(
 #[tauri::command]
 pub fn get_downloads(
     downloads: State<'_, crate::download::DownloadManager>,
-) -> Vec<crate::download::DownloadTask> {
-    downloads.list()
+) -> crate::download::DownloadSnapshot {
+    downloads.snapshot()
 }
 
 #[tauri::command]
@@ -1088,6 +2168,20 @@ pub fn retry_download(
     id: String,
 ) -> AppResult<()> {
     downloads.retry(&id)
+}
+
+/// Retry every failed and cancelled download; how many went back into the
+/// queue.
+#[tauri::command]
+pub fn retry_failed_downloads(downloads: State<'_, crate::download::DownloadManager>) -> usize {
+    downloads.retry_failed()
+}
+
+/// Cancel every queued and running download at once: the panel lists only
+/// the next few waiting, the rest could not be reached otherwise.
+#[tauri::command]
+pub fn cancel_all_downloads(downloads: State<'_, crate::download::DownloadManager>) {
+    downloads.cancel_all();
 }
 
 #[tauri::command]
@@ -1111,6 +2205,21 @@ pub async fn get_songs(
     with_retry(&state, |c| async move { c.songs(start_index, limit).await }).await
 }
 
+/// Tracks by id, in the order asked for; ids the server no longer has are left
+/// out. Lets a long list re-read the rows it just edited instead of reloading
+/// everything from the top.
+#[tauri::command]
+pub async fn get_tracks(
+    state: State<'_, AppState>,
+    track_ids: Vec<String>,
+) -> AppResult<Vec<TrackDto>> {
+    with_retry(&state, |c| {
+        let track_ids = track_ids.clone();
+        async move { c.tracks_by_ids(&track_ids).await }
+    })
+    .await
+}
+
 pub(crate) fn to_queue_tracks(
     client: &JellyfinClient,
     tracks: Vec<TrackDto>,
@@ -1128,6 +2237,7 @@ pub(crate) fn to_queue_tracks(
                 artist: t.artist,
                 album: t.album,
                 album_id: t.album_id,
+                album_artist: t.album_artist,
                 track_number: t.index_number,
                 disc_number: t.disc_number,
                 duration_ms: t.duration_ms,
@@ -1152,6 +2262,7 @@ pub async fn play_album(
     album_id: String,
     start_index: usize,
 ) -> AppResult<()> {
+    let ticket = state.player.play_ticket();
     let queue = with_retry(&state, |c| {
         let album_id = album_id.clone();
         async move {
@@ -1163,10 +2274,40 @@ pub async fn play_album(
     if queue.is_empty() {
         return Err(AppError::Other("album has no tracks".into()));
     }
-    state.player.send(PlayerCommand::PlayQueue {
-        tracks: queue,
-        start_index,
+    state.player.play_queue(ticket, queue, start_index).await
+}
+
+/// Play a track the way clicking it in a track list does: inside its album,
+/// from the track on — or on its own, without an album or when the album no
+/// longer lists it (retagged, moved). One command, so the ticket is taken
+/// before anything is fetched: the newest click wins (`PlayTicket`), which a
+/// lookup in the WebView ahead of `play_album` could not promise.
+#[tauri::command]
+pub async fn play_track_in_album(
+    state: State<'_, AppState>,
+    track_id: String,
+    album_id: Option<String>,
+) -> AppResult<()> {
+    let ticket = state.player.play_ticket();
+    let (queue, start) = with_retry(&state, |c| {
+        let track_id = track_id.clone();
+        let album_id = album_id.clone().filter(|id| !id.is_empty());
+        async move {
+            if let Some(album_id) = album_id {
+                let tracks = c.album_tracks(&album_id).await?;
+                if let Some(start) = tracks.iter().position(|t| t.id == track_id) {
+                    return Ok((to_queue_tracks(&c, tracks)?, start));
+                }
+            }
+            let tracks = c.tracks_by_ids(&[track_id]).await?;
+            Ok((to_queue_tracks(&c, tracks)?, 0))
+        }
     })
+    .await?;
+    if queue.is_empty() {
+        return Err(AppError::Other("the track is not on the server".into()));
+    }
+    state.player.play_queue(ticket, queue, start).await
 }
 
 /// Add a whole album to the queue: `next: true` = right after the current
@@ -1177,6 +2318,7 @@ pub async fn enqueue_album(
     album_id: String,
     next: bool,
 ) -> AppResult<()> {
+    let turn = state.player.enqueue_turn().await;
     let queue = with_retry(&state, |c| {
         let album_id = album_id.clone();
         async move {
@@ -1185,11 +2327,7 @@ pub async fn enqueue_album(
         }
     })
     .await?;
-    state.player.send(if next {
-        PlayerCommand::PlayNext(queue)
-    } else {
-        PlayerCommand::PlayLast(queue)
-    })
+    state.player.enqueue(turn, queue, next).await
 }
 
 /// Add individual tracks (by id) to the queue.
@@ -1199,6 +2337,7 @@ pub async fn enqueue_tracks(
     track_ids: Vec<String>,
     next: bool,
 ) -> AppResult<()> {
+    let turn = state.player.enqueue_turn().await;
     let queue = with_retry(&state, |c| {
         let track_ids = track_ids.clone();
         async move {
@@ -1207,11 +2346,7 @@ pub async fn enqueue_tracks(
         }
     })
     .await?;
-    state.player.send(if next {
-        PlayerCommand::PlayNext(queue)
-    } else {
-        PlayerCommand::PlayLast(queue)
-    })
+    state.player.enqueue(turn, queue, next).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1402,19 +2537,23 @@ pub fn get_queue(state: State<'_, AppState>) -> player::QueueSnapshot {
 }
 
 /// The visualizer opens a binary IPC channel; the player's PCM tap streams the
-/// audible signal, folded to stereo, into it while subscribed.
+/// audible signal, folded to stereo, into it while subscribed. `consumer`
+/// says what draws from it (a visualizer unless given), which decides whether
+/// its window may be suspended in the background (`tap::TapConsumer`).
 #[tauri::command]
 pub fn visualizer_subscribe(
     state: State<'_, AppState>,
     window: tauri::Window,
     channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    consumer: Option<player::tap::TapConsumer>,
 ) {
     // Remember which window this belongs to: closing the projector destroys
     // its WebView without the frontend getting to unsubscribe.
-    state
-        .player
-        .tap()
-        .subscribe(window.label().to_string(), channel);
+    state.player.tap().subscribe(
+        window.label().to_string(),
+        consumer.unwrap_or_default(),
+        channel,
+    );
 }
 
 #[tauri::command]
@@ -1425,6 +2564,7 @@ pub fn visualizer_unsubscribe(state: State<'_, AppState>, channel_id: u32) {
 /// Replace the queue with a server-generated mix seeded by any item.
 #[tauri::command]
 pub async fn play_instant_mix(state: State<'_, AppState>, item_id: String) -> AppResult<()> {
+    let ticket = state.player.play_ticket();
     let queue = with_retry(&state, |c| {
         let item_id = item_id.clone();
         async move {
@@ -1436,10 +2576,7 @@ pub async fn play_instant_mix(state: State<'_, AppState>, item_id: String) -> Ap
     if queue.is_empty() {
         return Err(AppError::Other("the server returned an empty mix".into()));
     }
-    state.player.send(PlayerCommand::PlayQueue {
-        tracks: queue,
-        start_index: 0,
-    })
+    state.player.play_queue(ticket, queue, 0).await
 }
 
 /// Playback speed, 0.5-2 (clamped); `preserve_pitch` keeps the pitch.
@@ -1472,21 +2609,30 @@ pub fn set_sleep_timer(
 }
 
 /// Arm "stop after this track" or "stop after this album" on one queue entry
-/// (`item_id`), or on whatever is playing when it is left out.
+/// (`entry_id`, which tells two copies of a track apart; `item_id` for a line
+/// from before entry ids), or on whatever is playing when both are left out.
 /// `StopAfter::Off` clears it.
 #[tauri::command]
 pub fn player_set_stop_after(
     state: State<'_, AppState>,
     mode: crate::player::StopAfter,
     item_id: Option<String>,
+    entry_id: Option<String>,
 ) -> AppResult<()> {
+    let entry = (item_id.is_some() || entry_id.is_some()).then(|| crate::player::EntryRef {
+        entry_id: entry_id.unwrap_or_default(),
+        item_id: item_id.unwrap_or_default(),
+    });
     state
         .player
-        .send(PlayerCommand::SetStopAfter { mode, item_id })
+        .send(PlayerCommand::SetStopAfter { mode, entry })
 }
 
 fn listenbrainz_entry() -> AppResult<keyring::Entry> {
-    Ok(keyring::Entry::new(KEYRING_SERVICE, "listenbrainz")?)
+    Ok(keyring::Entry::new(
+        keyring_service(),
+        LISTENBRAINZ_ENTRY_NAME,
+    )?)
 }
 
 /// The stored ListenBrainz token (Windows Credential Manager). Also used by
@@ -1499,6 +2645,39 @@ pub(crate) fn listenbrainz_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// The ListenBrainz token is a credential of the account it was saved under:
+/// on a sign-out, or a sign-in as someone else, it goes from the credential
+/// manager and from the player, which keeps its own copy and would scrobble
+/// the next account's plays to this profile.
+fn forget_listenbrainz_token(state: &AppState) {
+    if let Ok(entry) = listenbrainz_entry() {
+        let _ = entry.delete_credential();
+    }
+    let (settings, rewrite) = extras_without_token(state.store.get(keys::EXTRAS).as_deref());
+    if let Some(json) = rewrite {
+        let _ = state.store.set(keys::EXTRAS, &json);
+    }
+    let _ = state
+        .player
+        .send(PlayerCommand::SetExtrasSettings(settings));
+}
+
+/// The stored extras without a ListenBrainz token, and the JSON to store when
+/// there was one to drop: a build from before the credential manager kept it
+/// in the store, and reading the settings would move it over again. Read and
+/// written in the stored form, which keeps an Auto-DJ seed of "Sound"
+/// ([`player::ExtrasSettings::from_stored_json`]).
+fn extras_without_token(stored: Option<&str>) -> (player::ExtrasSettings, Option<String>) {
+    let mut settings = stored
+        .and_then(player::ExtrasSettings::from_stored_json)
+        .unwrap_or_default();
+    let rewrite = settings
+        .listenbrainz_token
+        .take()
+        .and_then(|_| settings.to_stored_json().ok());
+    (settings, rewrite)
+}
+
 /// The token itself never goes back to the WebView — the UI only learns
 /// whether one is configured.
 #[tauri::command]
@@ -1506,14 +2685,14 @@ pub fn get_extras_settings(state: State<'_, AppState>) -> player::ExtrasSettings
     let mut settings: player::ExtrasSettings = state
         .store
         .get(crate::store::keys::EXTRAS)
-        .and_then(|json| serde_json::from_str(&json).ok())
+        .and_then(|json| player::ExtrasSettings::from_stored_json(&json))
         .unwrap_or_default();
     // Migrate a token that a pre-keyring build left in the store.
     if let Some(token) = settings.listenbrainz_token.take() {
         if !token.is_empty() {
             if let Ok(entry) = listenbrainz_entry() {
                 if entry.set_password(&token).is_ok() {
-                    if let Ok(json) = serde_json::to_string(&settings) {
+                    if let Ok(json) = settings.to_stored_json() {
                         let _ = state.store.set(crate::store::keys::EXTRAS, &json);
                     }
                 }
@@ -1545,7 +2724,8 @@ pub fn set_extras_settings(
         }
         None => listenbrainz_token(),
     };
-    let json = serde_json::to_string(&settings)
+    let json = settings
+        .to_stored_json()
         .map_err(|e| AppError::Other(format!("cannot serialize settings: {e}")))?;
     state.store.set(crate::store::keys::EXTRAS, &json)?;
     // The worker gets the effective settings including the real token.
@@ -1560,8 +2740,7 @@ pub fn export_settings(state: State<'_, AppState>) -> AppResult<String> {
     state.store.export_settings()
 }
 
-/// Returns the list of imported keys; player settings apply after restart or
-/// the next settings change.
+/// Returns the list of imported keys; the player takes them over live.
 #[tauri::command]
 pub fn import_settings(
     state: State<'_, AppState>,
@@ -1569,16 +2748,18 @@ pub fn import_settings(
     json: String,
 ) -> AppResult<Vec<String>> {
     let imported = state.store.import_settings(&json)?;
+    let was_imported = |key: &str| imported.iter().any(|k| k == key);
     // Push the freshly imported player-relevant settings live.
     if let Some(raw) = state.store.get(crate::store::keys::PLAYBACK) {
         if let Ok(settings) = serde_json::from_str(&raw) {
-            let _ = state
-                .player
-                .send(PlayerCommand::SetPlaybackSettings(settings));
+            let _ = state.player.send(PlayerCommand::SetPlaybackSettings {
+                settings,
+                reply: None,
+            });
         }
     }
     if let Some(raw) = state.store.get(crate::store::keys::EXTRAS) {
-        if let Ok(mut settings) = serde_json::from_str::<player::ExtrasSettings>(&raw) {
+        if let Some(mut settings) = player::ExtrasSettings::from_stored_json(&raw) {
             // Imports never carry a token; keep the locally stored one.
             settings.listenbrainz_token = listenbrainz_token();
             let _ = state
@@ -1591,10 +2772,23 @@ pub fn import_settings(
             state.player.dsp().update(params);
         }
     }
-    if imported
+    // The imported sound settles on the device playing now, or with
+    // per-device profiles on its older profile would replace it at the next
+    // device open.
+    if [keys::VOLUME, keys::AUDIO_DSP, keys::AUDIO_PROFILES]
         .iter()
-        .any(|k| k == crate::store::keys::PLAYBACK_SPEED)
+        .any(|key| was_imported(key))
     {
+        let volume = was_imported(keys::VOLUME)
+            .then(|| state.store.get(keys::VOLUME))
+            .flatten()
+            .and_then(|raw| raw.parse::<f32>().ok());
+        let _ = state.player.send(PlayerCommand::SoundImported {
+            volume,
+            profiles: was_imported(keys::AUDIO_PROFILES),
+        });
+    }
+    if was_imported(crate::store::keys::PLAYBACK_SPEED) {
         let _ = state
             .player
             .send(PlayerCommand::SetSpeed(player::tempo::SpeedSetting::load(
@@ -1614,22 +2808,47 @@ pub fn get_playback_settings(state: State<'_, AppState>) -> player::PlaybackSett
         .unwrap_or_default()
 }
 
+/// How long a settings change may wait for the player to try an output
+/// device (opening a Bluetooth one can take a second or two).
+const OUTPUT_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Returns the settings that apply: an output device the player cannot open
+/// is refused and the previous one kept, and Settings has to show that.
 #[tauri::command]
-pub fn set_playback_settings(
+pub async fn set_playback_settings(
     state: State<'_, AppState>,
     settings: player::PlaybackSettings,
-) -> AppResult<()> {
+) -> AppResult<player::PlaybackSettings> {
     let json = serde_json::to_string(&settings)
         .map_err(|e| AppError::Other(format!("cannot serialize settings: {e}")))?;
     state.store.set(crate::store::keys::PLAYBACK, &json)?;
-    state
-        .player
-        .send(PlayerCommand::SetPlaybackSettings(settings))
+    // Opening a device blocks the player for a moment; wait off the runtime.
+    let player = state.player.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        player.set_playback_settings(settings, OUTPUT_SWITCH_TIMEOUT)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("playback settings task failed: {e}")))?
 }
 
 #[tauri::command]
 pub fn list_audio_devices() -> crate::audio_devices::AudioDeviceSnapshot {
     crate::audio_devices::snapshot()
+}
+
+/// Settings' "switch back" after a fallback: play through the configured
+/// output device again. Returns the device list as it stands afterwards.
+#[tauri::command]
+pub async fn restore_output_device(
+    state: State<'_, AppState>,
+) -> AppResult<crate::audio_devices::AudioDeviceSnapshot> {
+    let player = state.player.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        player.restore_output(OUTPUT_SWITCH_TIMEOUT)?;
+        Ok(crate::audio_devices::snapshot())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("output switch task failed: {e}")))?
 }
 
 #[tauri::command]
@@ -1727,7 +2946,7 @@ pub async fn export_diagnostics(
         // Device names stay out: Bluetooth endpoints often carry the owner's
         // name ("AirPods von …").
         "audio": {
-            "availableDeviceCount": player::output_device_names().len(),
+            "availableDeviceCount": player::output_devices().len(),
             "customDeviceSelected": playback.output_device.is_some(),
         },
         "playback": {
@@ -1829,11 +3048,7 @@ fn reveal_in_file_browser(downloads: &std::path::Path, path: &str) -> AppResult<
     };
 
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut c = std::process::Command::new("explorer");
-        c.arg(format!("/select,{path}"));
-        c
-    };
+    let mut command = reveal_in_explorer(&path);
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut c = std::process::Command::new("open");
@@ -1852,6 +3067,19 @@ fn reveal_in_file_browser(downloads: &std::path::Path, path: &str) -> AppResult<
         .spawn()
         .map_err(|e| AppError::Other(format!("cannot open file browser: {e}")))?;
     Ok(())
+}
+
+/// `explorer /select,"<path>"`, written out by hand. Passed as one argument,
+/// a path with a space — every export after the first is
+/// "sonarune-diagnostics (1).json" — gets the whole `/select,…` quoted, which
+/// explorer does not read as the switch, so it opens a default folder instead.
+/// A Windows path cannot contain `"`, so quoting it needs no escaping.
+#[cfg(target_os = "windows")]
+fn reveal_in_explorer(path: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = crate::download::explorer();
+    command.raw_arg(format!("/select,\"{path}\""));
+    command
 }
 
 #[cfg(test)]
@@ -1886,6 +3114,21 @@ mod reveal_tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn explorer_gets_the_select_switch_and_the_quoted_path_as_written() {
+        let path = r"C:\Users\Max Mustermann\Downloads\sonarune-diagnostics (1).json";
+        let command = super::reveal_in_explorer(path);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [std::ffi::OsStr::new(
+                r#"/select,"C:\Users\Max Mustermann\Downloads\sonarune-diagnostics (1).json""#
+            )]
+        );
+        assert!(Path::new(command.get_program()).is_absolute());
+    }
+
     #[cfg(unix)]
     #[test]
     fn only_paths_under_downloads_pass_before_the_file_system_is_touched() {
@@ -1910,12 +3153,15 @@ pub fn set_audio_settings(state: State<'_, AppState>, params: player::DspParams)
     let json = serde_json::to_string(&params)
         .map_err(|e| AppError::Other(format!("cannot serialize settings: {e}")))?;
     state.store.set(crate::store::keys::AUDIO_DSP, &json)?;
-    crate::audio_profiles::remember_dsp(&state.store, &params)
+    match crate::audio_devices::active_device() {
+        Some(device) => crate::audio_profiles::remember_dsp(&state.store, &device, &params),
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]
 pub fn get_audio_profiles(state: State<'_, AppState>) -> crate::audio_profiles::AudioProfilesInfo {
-    crate::audio_profiles::info(&state.store)
+    crate::audio_profiles::info(&state.store, crate::audio_devices::active_device())
 }
 
 #[tauri::command]
@@ -1924,39 +3170,96 @@ pub fn set_audio_profiles_enabled(
     enabled: bool,
 ) -> AppResult<crate::audio_profiles::AudioProfilesInfo> {
     let volume = state.player.state().volume;
+    let active = crate::audio_devices::active_device();
     crate::audio_profiles::set_enabled(
         &state.store,
         enabled,
+        active.as_ref(),
         &state.player.dsp().params(),
         volume,
     )?;
-    Ok(crate::audio_profiles::info(&state.store))
+    Ok(crate::audio_profiles::info(&state.store, active))
 }
 
+/// `device` is the id of the device whose profile goes.
 #[tauri::command]
 pub fn delete_audio_profile(
     state: State<'_, AppState>,
     device: String,
 ) -> AppResult<crate::audio_profiles::AudioProfilesInfo> {
     crate::audio_profiles::delete(&state.store, &device)?;
-    Ok(crate::audio_profiles::info(&state.store))
+    Ok(crate::audio_profiles::info(
+        &state.store,
+        crate::audio_devices::active_device(),
+    ))
 }
 
 /// Ask the library watcher to poll the server right now (fired when the
-/// window regains focus, so a change made while away shows up immediately).
+/// window regains focus, so a change made while away shows up immediately),
+/// and return how many changes it has found so far. One found while the
+/// window was hidden went out to a suspended WebView, and the watcher's
+/// baseline has moved on since: the UI compares the count instead.
 #[tauri::command]
-pub fn check_library_now(state: State<'_, AppState>) {
+pub fn check_library_now(state: State<'_, AppState>) -> u64 {
     state.library_watch.check_now();
+    state.library_watch.revision()
 }
 
-/// Whether the server is currently reachable (drives the offline banner).
-/// True when not connected — the setup screen handles that case.
+/// What the shell shows about the server: whether the session reaches it (the
+/// offline banner), and the certificate it presents when that is not trusted —
+/// a banner of its own, which leads to `trust_session_certificate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerCheck {
+    pub online: bool,
+    pub untrusted_certificate: Option<String>,
+}
+
+impl ServerCheck {
+    fn online(online: bool) -> Self {
+        Self {
+            online,
+            untrusted_certificate: None,
+        }
+    }
+}
+
+/// The server check behind the offline banner, run on window focus and after
+/// a failed action. Online when not signed in — the setup screen handles that
+/// case.
 #[tauri::command]
-pub async fn check_server(state: State<'_, AppState>) -> AppResult<bool> {
+pub async fn check_server(state: State<'_, AppState>) -> AppResult<ServerCheck> {
+    use crate::api::SessionValidity;
+
     let client = { state.session.read().await.clone() };
-    Ok(match client {
-        Some(c) => !matches!(c.validate().await, crate::api::SessionValidity::Unreachable),
-        None => true,
+    let Some(client) = client else {
+        // A session the backend ended while the window was hidden was never
+        // heard of: say it again now that the window is back.
+        state.session_notice.repeat();
+        return Ok(ServerCheck::online(true));
+    };
+    Ok(match client.validate().await {
+        SessionValidity::Valid | SessionValidity::Invalid => ServerCheck::online(true),
+        SessionValidity::Unreachable => ServerCheck::online(false),
+        SessionValidity::Untrusted(fingerprint) => ServerCheck {
+            online: false,
+            untrusted_certificate: Some(fingerprint),
+        },
+        SessionValidity::Moved(address) => {
+            // Forced https while the app runs: the session cannot go on at
+            // the stored address (see `restore_session`).
+            end_session(
+                &state,
+                Some(&client),
+                SessionEnded {
+                    reason: SessionEndReason::Moved,
+                    server_url: address,
+                    username: state.store.get(keys::USERNAME).unwrap_or_default(),
+                },
+            )
+            .await;
+            ServerCheck::online(true)
+        }
     })
 }
 
@@ -1969,11 +3272,22 @@ pub async fn get_lyrics(state: State<'_, AppState>, item_id: String) -> AppResul
     .await
 }
 
+/// Remove the entry at stored index `index` — only while that slot still
+/// holds this entry (`entry_id`; `item_id` for a line from before entry ids),
+/// so a stale index or a double click cannot take the line that slid into it,
+/// not even when that is another copy of the same track.
 #[tauri::command]
-pub fn queue_remove(state: State<'_, AppState>, index: usize, item_id: String) -> AppResult<()> {
-    state
-        .player
-        .send(PlayerCommand::RemoveAt { index, item_id })
+pub fn queue_remove(
+    state: State<'_, AppState>,
+    index: usize,
+    item_id: String,
+    entry_id: Option<String>,
+) -> AppResult<()> {
+    let entry = crate::player::EntryRef {
+        entry_id: entry_id.unwrap_or_default(),
+        item_id,
+    };
+    state.player.send(PlayerCommand::RemoveAt { index, entry })
 }
 
 #[tauri::command]
@@ -1991,20 +3305,306 @@ pub fn queue_move(state: State<'_, AppState>, from: usize, to: usize) -> AppResu
 
 #[cfg(test)]
 mod tests {
-    use super::{pin_after_login, relogin_after_401, sanitize_filename, write_unique};
+    use super::{
+        autotrust_candidate, credentials_rejected, delete_all, extras_without_token,
+        password_refused, pin_after_login, relogin_after_401, same_account, sanitize_filename,
+        server_address, write_unique, QuickConnectTrust, SessionEndReason, SessionEnded,
+    };
+    use crate::error::AppError;
+    use crate::player::{AutoDjSeedMode, ExtrasSettings};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
+
+    /// A stand-in server that answers every request with `body` (200, JSON)
+    /// and counts the requests. Returns its address.
+    fn answering(body: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, asked)
+    }
+
+    fn temp_store() -> (crate::store::Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sonarune-identify-{}", uuid::Uuid::new_v4()));
+        (crate::store::Store::open(&dir).expect("open store"), dir)
+    }
+
+    #[tokio::test]
+    async fn a_session_learns_its_server_and_remembers_it_at_the_address() {
+        use super::{identify, Identify};
+        use std::sync::atomic::Ordering::SeqCst;
+        let (store, dir) = temp_store();
+        let (url, asked) =
+            answering(r#"{"Version":"10.11.0","Id":"0123456789abcdef0123456789abcdef"}"#);
+        let id = "0123456789abcdef0123456789abcdef";
+        let client = crate::api::JellyfinClient::new(&url, "test", Vec::new()).unwrap();
+        assert_eq!(
+            identify(&store, &client, Identify::SignIn).await.as_deref(),
+            Some(id)
+        );
+        assert_eq!(store.server_id_at(&url).as_deref(), Some(id));
+        // Started while the server was away: not asked, the id seen last at
+        // the address.
+        let before = asked.load(SeqCst);
+        assert_eq!(
+            identify(&store, &client, Identify::Offline)
+                .await
+                .as_deref(),
+            Some(id)
+        );
+        assert_eq!(asked.load(SeqCst), before);
+        // A re-login is asked again: another server may answer there now.
+        let renewed = identify(&store, &client, Identify::Renewal(Some("carried".into()))).await;
+        assert_eq!(renewed.as_deref(), Some(id));
+        assert_eq!(asked.load(SeqCst), before + 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_say_its_id_is_known_by_its_address() {
+        use super::{identify, Identify};
+        let (store, dir) = temp_store();
+        let (url, _) = answering(r#"{"Version":"10.11.0"}"#);
+        let client = crate::api::JellyfinClient::new(&url, "test", Vec::new()).unwrap();
+        assert_eq!(identify(&store, &client, Identify::SignIn).await, None);
+        assert_eq!(store.server_id_at(&url), None);
+        // Another server answered at this address before. A sign-in does not
+        // take this one for it — that is where a new server shows up —, the
+        // session the store holds does.
+        store.record_server(&url, "earlier").unwrap();
+        assert_eq!(identify(&store, &client, Identify::SignIn).await, None);
+        assert_eq!(
+            identify(&store, &client, Identify::Renewal(None))
+                .await
+                .as_deref(),
+            Some("earlier")
+        );
+        assert_eq!(
+            identify(&store, &client, Identify::Offline)
+                .await
+                .as_deref(),
+            Some("earlier")
+        );
+        // A re-login keeps the id of the session it renews.
+        assert_eq!(
+            identify(&store, &client, Identify::Renewal(Some("renewed".into())))
+                .await
+                .as_deref(),
+            Some("renewed")
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_the_listenbrainz_token_keeps_an_auto_dj_seed_of_sound() {
+        // Sign-out and an account change go through here: the extras they
+        // hand the player must still say "Sound".
+        let stored = ExtrasSettings {
+            auto_dj_seed_mode: AutoDjSeedMode::Sonic,
+            listenbrainz_token: Some("left over by a pre-keyring build".into()),
+            ..ExtrasSettings::default()
+        }
+        .to_stored_json()
+        .unwrap();
+        let (settings, rewrite) = extras_without_token(Some(&stored));
+        assert_eq!(settings.auto_dj_seed_mode, AutoDjSeedMode::Sonic);
+        assert!(settings.listenbrainz_token.is_none());
+        let rewritten = ExtrasSettings::from_stored_json(&rewrite.expect("token dropped")).unwrap();
+        assert_eq!(rewritten.auto_dj_seed_mode, AutoDjSeedMode::Sonic);
+        assert!(rewritten.listenbrainz_token.is_none());
+
+        // Nothing to drop: nothing to write.
+        let clean = ExtrasSettings {
+            auto_dj_seed_mode: AutoDjSeedMode::Sonic,
+            ..ExtrasSettings::default()
+        }
+        .to_stored_json()
+        .unwrap();
+        let (settings, rewrite) = extras_without_token(Some(&clean));
+        assert_eq!(settings.auto_dj_seed_mode, AutoDjSeedMode::Sonic);
+        assert!(rewrite.is_none());
+        assert_eq!(
+            extras_without_token(None).0.auto_dj_seed_mode,
+            AutoDjSeedMode::default()
+        );
+    }
+
+    #[test]
+    fn automatic_trust_takes_only_a_first_certificate() {
+        let presented = crate::tls::fingerprint(b"presented");
+        let pinned = vec![crate::tls::fingerprint(b"pinned")];
+        assert_eq!(
+            autotrust_candidate(true, &[], Some(presented.clone())),
+            Some(presented.clone())
+        );
+        // Preference off, or a pin already there: a changed certificate has to
+        // be confirmed by the user.
+        assert_eq!(
+            autotrust_candidate(false, &[], Some(presented.clone())),
+            None
+        );
+        assert_eq!(autotrust_candidate(true, &pinned, Some(presented)), None);
+        // The failure was not about a certificate.
+        assert_eq!(autotrust_candidate(true, &[], None), None);
+    }
+
+    #[test]
+    fn quick_connect_trusts_only_the_certificate_its_start_was_shown() {
+        let trust = QuickConnectTrust {
+            server_url: "https://music.home".into(),
+            secret: "secret".into(),
+            fingerprint: crate::tls::fingerprint(b"start"),
+        };
+        assert_eq!(
+            trust.for_poll("https://music.home", "secret", true),
+            Some(crate::tls::fingerprint(b"start"))
+        );
+        // Another handshake, another server, or the preference off.
+        assert_eq!(trust.for_poll("https://music.home", "other", true), None);
+        assert_eq!(trust.for_poll("https://other.home", "secret", true), None);
+        assert_eq!(trust.for_poll("https://music.home", "secret", false), None);
+    }
+
+    #[test]
+    fn a_server_address_needs_its_scheme() {
+        assert_eq!(
+            server_address(" https://music.example.com/ ").unwrap(),
+            "https://music.example.com"
+        );
+        assert_eq!(
+            server_address("http://10.0.0.5:8096").unwrap(),
+            "http://10.0.0.5:8096"
+        );
+        // Kept as typed: credentials and pins are keyed by this exact string.
+        assert_eq!(
+            server_address("http://NAS:8096/jellyfin/").unwrap(),
+            "http://NAS:8096/jellyfin"
+        );
+        for bad in [
+            "localhost:8096",
+            "10.0.0.5:8096",
+            "nas.local",
+            "ftp://nas.local",
+            "http://",
+            "",
+        ] {
+            assert!(server_address(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn only_a_rejected_token_turns_a_401_into_a_relogin() {
         use crate::api::SessionValidity;
         // Still valid: the 401 was a permission failure, and a re-login would
         // only rotate the device token under a running stream.
-        assert!(!relogin_after_401(SessionValidity::Valid));
-        assert!(relogin_after_401(SessionValidity::Invalid));
+        assert!(!relogin_after_401(&SessionValidity::Valid));
+        assert!(relogin_after_401(&SessionValidity::Invalid));
         // The probe did not get through: no evidence the token is gone.
-        assert!(!relogin_after_401(SessionValidity::Unreachable));
+        assert!(!relogin_after_401(&SessionValidity::Unreachable));
+        assert!(!relogin_after_401(&SessionValidity::Untrusted("AB".into())));
+        assert!(!relogin_after_401(&SessionValidity::Moved(
+            "https://music.home".into()
+        )));
+    }
+
+    #[test]
+    fn only_a_refused_password_counts_as_rejected_credentials() {
+        let server = |status| AppError::Server {
+            status,
+            message: String::new(),
+        };
+        assert!(credentials_rejected(&server(401)));
+        assert!(credentials_rejected(&server(403)));
+        // A restarting server and Jellyfin's rate limiter fix themselves.
+        for status in [429, 500, 502, 503] {
+            assert!(!credentials_rejected(&server(status)), "{status}");
+        }
+        assert!(!credentials_rejected(&AppError::NotConnected));
+        assert!(!credentials_rejected(&AppError::Other("timeout".into())));
+
+        // Only a refused password is dropped from the credential store; a
+        // 403 (account disabled, no remote access from here) may pass later.
+        assert!(password_refused(&server(401)));
+        assert!(!password_refused(&server(403)));
+        assert!(!password_refused(&server(503)));
+    }
+
+    #[test]
+    fn the_queue_stays_with_the_same_account_whatever_the_name_is_spelled() {
+        let stored = (Some("https://music.home"), Some("user-1"));
+        // "alice" typed now, "Alice" before: same user id, same account.
+        assert!(same_account(stored, ("https://music.home", "user-1")));
+        assert!(!same_account(stored, ("https://music.home", "user-2")));
+        assert!(!same_account(stored, ("https://other.home", "user-1")));
+        // Signed out before (the user id is gone) or never signed in.
+        assert!(!same_account(
+            (Some("https://music.home"), None),
+            ("https://music.home", "user-1")
+        ));
+        assert!(!same_account(
+            (None, None),
+            ("https://music.home", "user-1")
+        ));
+    }
+
+    #[test]
+    fn a_sign_out_deletes_every_key_past_a_failure() {
+        let mut attempted = Vec::new();
+        delete_all(&["a", "b", "c"], |key| {
+            attempted.push(key.to_string());
+            if key == "a" {
+                Err(AppError::Other("disk full".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(attempted, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn session_ended_reaches_the_ui_in_camel_case() {
+        let ended = SessionEnded {
+            reason: SessionEndReason::Moved,
+            server_url: "https://music.home".into(),
+            username: "alice".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&ended).unwrap(),
+            serde_json::json!({
+                "reason": "moved",
+                "serverUrl": "https://music.home",
+                "username": "alice",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SessionEndReason::Rejected).unwrap(),
+            "rejected"
+        );
     }
 
     #[test]

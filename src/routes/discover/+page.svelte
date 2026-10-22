@@ -8,13 +8,14 @@
     type DiscoverRow,
     type SimilarArtistsRow,
   } from "#lib/api/discovery.js";
+  import { errorCause, errorReport } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import LibraryAlbumCard from "#lib/components/LibraryAlbumCard.svelte";
   import EmptyState from "#lib/components/EmptyState.svelte";
   import DiscoveryArtistCard from "#lib/components/DiscoveryArtistCard.svelte";
   import DiscoveryTrackCard from "#lib/components/DiscoveryTrackCard.svelte";
   import CardSkeleton from "#lib/components/CardSkeleton.svelte";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
   import type { AlbumDto, GenreDto, TrackDto } from "#lib/types.js";
@@ -38,6 +39,9 @@
     swrGet<DiscoverRow<AlbumDto>>("discover:long-not-heard") ?? null,
   );
   let generation = 0;
+  let longNotHeardGeneration = 0;
+  /** Cards in the "long not heard" row. */
+  const LONG_NOT_HEARD_ROW = 12;
 
   function preserveStale<T>(current: DiscoverRow<T> | null, incoming: DiscoverRow<T>): DiscoverRow<T> {
     return incoming.error && current?.items.length ? { items: current.items, error: incoming.error } : incoming;
@@ -60,6 +64,7 @@
   }
 
   async function load() {
+    void loadLongNotHeard();
     const seq = ++generation;
     try {
       const data: DiscoverData = await apiDiscovery.getDiscover();
@@ -69,33 +74,44 @@
       mixSeeds = preserveStale(mixSeeds, data.instantMixSeeds);
       similarArtists = preserveSimilar(similarArtists, data.similarArtists);
       decades = preserveStale(decades, data.decades);
-      longNotHeard = preserveStale(longNotHeard, data.longNotHeard);
       saveRow("discover:random", randomAlbums);
       saveRow("discover:genres", genres);
       saveRow("discover:mix-seeds", mixSeeds);
       saveRow("discover:similar-artists", similarArtists);
       saveRow("discover:decades", decades);
-      saveRow("discover:long-not-heard", longNotHeard);
     } catch (cause) {
       if (seq !== generation) return;
-      const message = String(cause);
-      randomAlbums = { items: randomAlbums?.items ?? [], error: message };
-      genres = { items: genres?.items ?? [], error: message };
-      mixSeeds = { items: mixSeeds?.items ?? [], error: message };
+      const error = errorReport(cause);
+      randomAlbums = { items: randomAlbums?.items ?? [], error };
+      genres = { items: genres?.items ?? [], error };
+      mixSeeds = { items: mixSeeds?.items ?? [], error };
       similarArtists = {
         seed: similarArtists?.seed ?? null,
         items: similarArtists?.items ?? [],
-        error: message,
+        error,
       };
-      decades = { items: decades?.items ?? [], error: message };
-      longNotHeard = { items: longNotHeard?.items ?? [], error: message };
+      decades = { items: decades?.items ?? [], error };
+    }
+  }
+
+  // Ranking what was heard longest ago scans the whole play history, so this
+  // row loads on its own and the others do not wait for it — and takes a
+  // ranking from the last few minutes rather than scanning on every visit.
+  async function loadLongNotHeard() {
+    const seq = ++longNotHeardGeneration;
+    try {
+      const result = await apiDiscovery.getLongNotHeard(0, LONG_NOT_HEARD_ROW, true);
+      if (seq !== longNotHeardGeneration) return;
+      longNotHeard = { items: result.items, error: null };
+      saveRow("discover:long-not-heard", longNotHeard);
+    } catch (cause) {
+      if (seq !== longNotHeardGeneration) return;
+      longNotHeard = { items: longNotHeard?.items ?? [], error: errorReport(cause) };
     }
   }
 
   onMount(load);
-  $effect(() => {
-    if (library.revision > 0) load();
-  });
+  onLibraryChange(load);
 
   function rowAlbums(row: DiscoverRow<AlbumDto> | null, shuffle: boolean) {
     const ids = row?.items.map((album) => album.id) ?? [];
@@ -121,6 +137,14 @@
     const seed = similarArtists?.seed;
     if (seed) player.run(api.playInstantMix(seed.id));
   }
+
+  // "See all" names the row's seed. Without one the page asks for a random
+  // artist and lists artists the row never showed.
+  const similarAllHref = $derived(
+    similarArtists?.seed
+      ? `/discover/artists?seed=${encodeURIComponent(similarArtists.seed.id)}`
+      : "/discover/artists",
+  );
 
   function hue(value: string): number {
     let result = 0;
@@ -166,7 +190,7 @@
 {#snippet rowState(row: DiscoverRow<unknown> | null)}
   {#if row?.error}
     <div class="mb-3 flex items-center gap-3 rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
-      <span>{m.discover_section_error({ message: row.error })}</span>
+      <span>{m.discover_section_error({ message: errorCause(row.error) })}</span>
       <button class="ml-auto shrink-0 font-bold underline" onclick={load}>{m.discover_retry()}</button>
     </div>
   {/if}
@@ -258,7 +282,7 @@
       similarArtists?.seed
         ? m.discover_similar_to({ name: similarArtists.seed.name })
         : m.discover_similar_artists(),
-      "/discover/artists",
+      similarAllHref,
       Boolean(similarArtists?.seed),
       similarMix,
       similarMix,
@@ -292,7 +316,7 @@
             class="relative flex h-28 w-44 shrink-0 items-end overflow-hidden rounded-lg p-3 shadow-lg transition-transform hover:scale-[1.02]"
             style="background: linear-gradient(135deg, hsl({(decade.startYear * 7) % 360} 58% 43%), hsl({(decade.startYear * 7 + 55) % 360} 62% 25%));"
           >
-            <span class="text-xl font-black text-white drop-shadow">{decade.label}</span>
+            <span class="text-xl font-black text-white drop-shadow">{m.discover_decade_label({ year: decade.startYear })}</span>
           </a>
         {/each}
       </div>

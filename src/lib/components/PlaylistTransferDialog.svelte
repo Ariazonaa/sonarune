@@ -1,9 +1,13 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { Virtualizer } from "virtua/svelte";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorCause, type AppErrorReport } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { isLongList, offsetIn } from "#lib/longList.js";
+  import { entryRowKeys, filterRows, searchTexts, type PlaylistRow } from "#lib/playlistEntries.js";
   import { portal } from "#lib/portal.js";
-  import type { PlaylistDto, PlaylistTrackDto } from "#lib/types.js";
+  import type { PlaylistDto, PlaylistTrackDto, PlaylistTransfer } from "#lib/types.js";
 
   let {
     sourcePlaylistId,
@@ -18,7 +22,12 @@
       movedEntryIds: string[];
       targetId: string;
       targetName: string;
+      /** The entries left the source (a move whose removal went through). */
       moved: boolean;
+      /** Tracks the target gained; null when unknown. */
+      added: number | null;
+      /** A move that copied but could not remove from the source. */
+      removeError: AppErrorReport | null;
     }) => void;
   } = $props();
 
@@ -39,14 +48,29 @@
   let previousFocus: HTMLElement | null = null;
   let observedSource: string | null = null;
 
-  const normalizedQuery = $derived(query.trim().toLocaleLowerCase());
-  const visibleTracks = $derived.by(() => {
-    if (!normalizedQuery) return tracks;
-    return tracks.filter(({ track }) =>
-      [track.name, track.artist, track.album].some((value) =>
-        value.toLocaleLowerCase().includes(normalizedQuery),
-      ),
-    );
+  // Row keys from the whole list, so they stay put while the filter changes.
+  const rowKeys = $derived(entryRowKeys(tracks));
+  const haystacks = $derived(searchTexts(tracks));
+  const visibleTracks = $derived(filterRows(tracks, rowKeys, haystacks, query));
+
+  // A long playlist lists only the rows in view, as its page does.
+  const virtual = $derived(isLongList(tracks.length));
+  let listBox = $state<HTMLElement | null>(null);
+  let listPad = $state<HTMLElement | null>(null);
+  /** Where the long list starts in its box: below the box's padding. */
+  let listStart = $state(0);
+  /** The row whose checkbox has focus: the long list keeps it mounted, so
+   *  focus and Tab go on from there wherever the list is scrolled. */
+  let focusedKey = $state<string | null>(null);
+  const pinned = $derived.by(() => {
+    if (!virtual || focusedKey === null) return [];
+    const at = visibleTracks.findIndex((row) => row.key === focusedKey);
+    return at < 0 ? [] : [at];
+  });
+
+  $effect(() => {
+    if (!listBox || !listPad) return;
+    listStart = offsetIn(listPad, listBox) + (parseFloat(getComputedStyle(listPad).paddingTop) || 0);
   });
   const selectedCount = $derived(selectedEntryIds.size);
   const canSubmit = $derived(
@@ -82,7 +106,7 @@
       .catch((cause) => {
         if (closing || request !== targetRequest || source !== sourcePlaylistId) return;
         targets = [];
-        error = String(cause);
+        error = errorCause(cause);
       })
       .finally(() => {
         if (!closing && request === targetRequest && source === sourcePlaylistId) {
@@ -131,14 +155,14 @@
   function selectVisible() {
     if (busy) return;
     const next = new Set(selectedEntryIds);
-    for (const entry of visibleTracks) next.add(entry.entryId);
+    for (const { entry } of visibleTracks) next.add(entry.entryId);
     selectedEntryIds = next;
   }
 
   function clearVisible() {
     if (busy) return;
     const next = new Set(selectedEntryIds);
-    for (const entry of visibleTracks) next.delete(entry.entryId);
+    for (const { entry } of visibleTracks) next.delete(entry.entryId);
     selectedEntryIds = next;
   }
 
@@ -189,11 +213,14 @@
     const target = targets?.find((playlist) => playlist.id === targetId);
     if (!target) return;
 
-    // Filter the source array instead of iterating the Set so duplicate tracks
-    // remain independently addressable and their original order is preserved.
-    const entryIds = tracks
-      .filter((entry) => selectedEntryIds.has(entry.entryId))
-      .map((entry) => entry.entryId);
+    // In source order. A track that is in the playlist twice shares one entry
+    // id on Jellyfin 10.11 (its rows are selected together), so it is sent
+    // once — and moving it takes every copy out of the source.
+    const entryIds = [
+      ...new Set(
+        tracks.filter((entry) => selectedEntryIds.has(entry.entryId)).map((entry) => entry.entryId),
+      ),
+    ];
     if (entryIds.length === 0) return;
 
     const source = sourcePlaylistId;
@@ -204,11 +231,12 @@
     busy = true;
     error = null;
 
+    let result: PlaylistTransfer;
     try {
-      await apiLibrary.transferPlaylistEntries(source, destination, entryIds, moved);
+      result = await apiLibrary.transferPlaylistEntries(source, destination, entryIds, moved);
     } catch (cause) {
       if (!closing && request === transferRequest && source === sourcePlaylistId) {
-        error = String(cause);
+        error = errorCause(cause);
         busy = false;
       }
       return;
@@ -217,11 +245,44 @@
     if (closing || request !== transferRequest || source !== sourcePlaylistId) return;
     busy = false;
     closing = true;
-    oncomplete({ movedEntryIds: entryIds, targetId: destination, targetName, moved });
+    // A move that could not remove from the source still copied: it completes
+    // as a copy, and running it again would not undo anything.
+    oncomplete({
+      movedEntryIds: entryIds,
+      targetId: destination,
+      targetName,
+      moved: moved && result.removeError === null,
+      added: result.added,
+      removeError: result.removeError,
+    });
   }
 </script>
 
 <svelte:window onkeydown={onKeydown} />
+
+{#snippet choice({ entry }: PlaylistRow)}
+  <label
+    class="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 transition-colors hover:bg-panel-2 has-[:focus-visible]:bg-panel-2 {busy
+      ? 'cursor-not-allowed opacity-50'
+      : ''}"
+  >
+    <input
+      class="h-4 w-4 shrink-0 accent-(--color-accent)"
+      type="checkbox"
+      checked={selectedEntryIds.has(entry.entryId)}
+      disabled={busy}
+      onchange={() => toggleEntry(entry.entryId)}
+    />
+    <span class="min-w-0 flex-1">
+      <span class="block truncate text-sm font-medium text-ink">
+        {entry.track.name}
+      </span>
+      <span class="block truncate text-xs text-ink-muted">
+        {entry.track.artist}{entry.track.album ? " · " + entry.track.album : ""}
+      </span>
+    </span>
+  </label>
+{/snippet}
 
 <!-- The wrapper stays in place; the overlay moves to <body> (see portal.ts). -->
 <div class="contents">
@@ -330,39 +391,46 @@
           </span>
         </div>
 
-        <div class="min-h-40 flex-1 overflow-y-auto rounded-lg border border-edge bg-panel">
+        <div
+          bind:this={listBox}
+          class="min-h-40 flex-1 overflow-y-auto rounded-lg border border-edge bg-panel"
+        >
           {#if visibleTracks.length === 0}
             <p class="px-4 py-8 text-center text-sm text-ink-muted">
               {m.playlist_transfer_no_matches()}
             </p>
+          {:else if virtual}
+            <div
+              bind:this={listPad}
+              class="p-1.5"
+              role="list"
+              onfocusin={(event) => {
+                const row = (event.target as HTMLElement).closest<HTMLElement>("[data-row-key]");
+                focusedKey = row?.dataset.rowKey ?? null;
+              }}
+              onfocusout={(event) => {
+                const next = event.relatedTarget;
+                if (!(next instanceof Node) || !listPad?.contains(next)) focusedKey = null;
+              }}
+            >
+              {#if listBox}
+                <Virtualizer
+                  data={visibleTracks}
+                  getKey={(row) => row.key}
+                  scrollRef={listBox}
+                  startMargin={listStart}
+                  keepMounted={pinned}
+                >
+                  {#snippet children(row)}
+                    <div role="listitem" data-row-key={row.key}>{@render choice(row)}</div>
+                  {/snippet}
+                </Virtualizer>
+              {/if}
+            </div>
           {:else}
             <ul class="p-1.5">
-              {#each visibleTracks as entry (entry.entryId)}
-                <li>
-                  <label
-                    class="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 transition-colors hover:bg-panel-2 has-[:focus-visible]:bg-panel-2 {busy
-                      ? 'cursor-not-allowed opacity-50'
-                      : ''}"
-                  >
-                    <input
-                      class="h-4 w-4 shrink-0 accent-(--color-accent)"
-                      type="checkbox"
-                      checked={selectedEntryIds.has(entry.entryId)}
-                      disabled={busy}
-                      onchange={() => toggleEntry(entry.entryId)}
-                    />
-                    <span class="min-w-0 flex-1">
-                      <span class="block truncate text-sm font-medium text-ink">
-                        {entry.track.name}
-                      </span>
-                      <span class="block truncate text-xs text-ink-muted">
-                        {entry.track.artist}{entry.track.album
-                          ? " · " + entry.track.album
-                          : ""}
-                      </span>
-                    </span>
-                  </label>
-                </li>
+              {#each visibleTracks as row (row.key)}
+                <li>{@render choice(row)}</li>
               {/each}
             </ul>
           {/if}

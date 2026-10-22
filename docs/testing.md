@@ -12,15 +12,31 @@ unit tests → `cargo fmt --check` → `clippy --all-targets -D warnings` →
 on PATH (the `opus` crate builds bundled libopus); the frontend gates need
 `npm install` first.
 
-CI runs the same gates on every push/PR via `.github/workflows/ci.yml` on a
-**Windows** runner labelled `windows-latest`. The workflow installs Node, Rust (plain `rustup` in
-PowerShell) and cmake itself and avoids bash — also inside composite actions,
-because on the runner `bash` resolves to WSL's launcher, which fails there — and
-the actions/cache backend, so the runner only needs: the
-`windows-latest` label, the **MSVC C++ build tools + Windows SDK** (for the Rust
-msvc linker), and outbound internet (the actions are fetched from github.com).
-The workflow sets `CARGO_TARGET_DIR`, which overrides any local target-dir
-redirect in `src-tauri/.cargo/config.toml` (see `config.toml.example`).
+CI runs the same gates on every push/PR via `.github/workflows/ci.yml` on
+GitHub's hosted **Windows** image, `windows-latest`. It relies on what that
+image ships: rustup, the **MSVC C++ build tools + Windows SDK**, **cmake** (the
+`opus` crate builds libopus with it) and **LLVM/libclang** (`signalsmith-stretch`
+generates its bindings with it). The workflow itself only installs Node 22,
+updates Rust to the current stable, and caches npm (`setup-node`) and the cargo
+registry and build (`Swatinem/rust-cache`) through the actions cache. There is
+no vcvars step: cargo finds the MSVC linker and cmake finds Visual Studio
+through the registry. A self-hosted runner for this workflow therefore needs
+all of that installed and the actions cache reachable. The workflow sets
+`CARGO_TARGET_DIR`, which overrides any local target-dir redirect in
+`src-tauri/.cargo/config.toml` (see `config.toml.example`).
+
+The release workflow, `.github/workflows/release.yml`, does not run the tests.
+It builds from the tag with a read-only token and no secrets, runs
+`svelte-check` first (a failed message compile only shows there), signs the
+installer in a separate job whose key step runs nothing but the Tauri CLI's
+signer, checks that signature against the public key in `tauri.conf.json`
+(`scripts/verify-update-signature.mjs`), and drafts the release from a third
+job. A tag pushed without the signing key fails instead of drafting a release
+without `latest.json`. A manual run (`workflow_dispatch`) goes through build,
+signing and the check and drafts nothing; only the unsigned installer and zip
+stay on the run, for a day. The signature never shows in a log, and on a tag
+run the artifact that carries it to the third job is deleted once the draft
+holds it.
 
 ## Automated tests
 
@@ -34,7 +50,9 @@ stereo visualizer tap (mono/stereo/5.1 folding, frame layout, audio passes
 through untouched, a feed that starts mid-frame keeps left left), cert
 fingerprint/normalize/format validation, certificate pinning in the store
 (replace on change, forget, legacy entries, pin only the presented certificate
-after login), and download part-file naming. Queue-index invariants also have **property tests**
+after login), download part-file naming, and the keyring service per app
+identifier (an e2e or demo build never reaches the installed app's
+credentials). Queue-index invariants also have **property tests**
 (`proptest`): a shuffle order is always a `0..len` permutation with the current
 track first; `remap_move` is a bijection; removals keep the order a valid
 permutation of the survivors and preserve their relative play order.
@@ -72,6 +90,15 @@ permutation of the survivors and preserve their relative play order.
 - `lib/visualizer/presets.test.ts` — the online-preset opt-in: a remote preset
   is never downloaded without it, rotation leaves remote entries out until
   they are enabled.
+- `scripts/*.test.ts` — the release and asset scripts: the update notes
+  `changelog-section.mjs` writes carry no markdown markers (checked against
+  every section of the real `CHANGELOG.md`, code spans aside), the release's
+  signature check accepts what the Tauri signer writes and rejects another
+  key, a changed file or an edited trusted comment, the inlang project loads
+  its plugins only from `node_modules` and pinned exactly (no CDN module in
+  the build), the generated logo stores straight alpha at its antialiased
+  corners (the PNGs and every size of `icon.ico`), and the Weekly pin script
+  records the files the bucket lost.
 
 ## Live server contract (`#[ignore]` smoke test)
 

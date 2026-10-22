@@ -139,6 +139,47 @@ describe("ConfirmDialog", () => {
     expect(dialog()).toBeNull();
   });
 
+  it("names its body as the description", () => {
+    render();
+    askDestructive();
+    const body = document.getElementById(dialog()!.getAttribute("aria-describedby")!);
+    expect(body?.textContent).toBe("This removes it from the server.");
+  });
+
+  it("keeps Tab between its buttons", () => {
+    render();
+    askDestructive();
+    const [cancel, danger] = dialogButtons();
+    const tab = (shiftKey = false) => {
+      const event = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+      document.activeElement!.dispatchEvent(event);
+      return event;
+    };
+    // Shift+Tab from Cancel would land on the page behind the backdrop.
+    expect(tab(true).defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(danger);
+    expect(tab().defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(cancel);
+    // Focus lost to <body> (a click on the text) comes back in on Tab.
+    (document.activeElement as HTMLElement).blur();
+    tab();
+    expect(document.activeElement).toBe(cancel);
+  });
+
+  it("hands focus back to where it was when it closes", async () => {
+    // The delete flow: the menu has just put focus back on the row.
+    const row = document.createElement("button");
+    document.body.appendChild(row);
+    row.focus();
+    render();
+    const p = askDestructive();
+    expect(document.activeElement).not.toBe(row);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    flushSync();
+    await expect(p).resolves.toBe(false);
+    expect(document.activeElement).toBe(row);
+  });
+
   it("a second request cancels the first as declined", async () => {
     render();
     const first = confirm.ask({ title: "A", body: "a", confirmLabel: "ok" });

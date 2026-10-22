@@ -3,9 +3,11 @@
   import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { availableMonitors, type Monitor } from "@tauri-apps/api/window";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import {
     PROJECTOR_SETTINGS_EVENT,
+    PROJECTOR_SETTINGS_KEY,
     PROJECTOR_WINDOW_LABEL,
     loadProjectorSettings,
     monitorKey,
@@ -25,6 +27,26 @@
   let projectorOpen = $state(false);
   let opening = $state(false);
   let error = $state<string | null>(null);
+  let disposed = false;
+  let unwatchProjector: UnlistenFn | undefined;
+
+  /**
+   * Follow the projector until it is gone — also one an earlier panel opened:
+   * the panel unmounts with the preset browser and the route, and the
+   * projector closes itself (its own ✕, Alt+F4) without telling anyone.
+   */
+  function watchProjector(projector: WebviewWindow) {
+    unwatchProjector?.();
+    unwatchProjector = undefined;
+    void projector
+      .once("tauri://destroyed", () => {
+        projectorOpen = false;
+      })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else unwatchProjector = unlisten;
+      });
+  }
 
   const overlayLabel = (kind: VisualizerOverlayKind) => {
     switch (kind) {
@@ -67,13 +89,15 @@
       const target = selectedMonitor(monitors, settings.monitorKey);
       const window = await WebviewWindow.getByLabel(PROJECTOR_WINDOW_LABEL);
       if (!target || !window) return;
+      // A minimized window ignores placement and focus: bring it back first.
+      await window.unminimize();
       await window.setFullscreen(false);
       await window.setPosition(target.workArea.position);
       await window.setSize(target.workArea.size);
       await window.setFullscreen(settings.fullscreen);
       await window.setFocus();
     } catch (cause) {
-      error = String(cause);
+      error = errorCause(cause);
     }
   }
 
@@ -88,6 +112,7 @@
       const existing = await WebviewWindow.getByLabel(PROJECTOR_WINDOW_LABEL);
       if (existing) {
         projectorOpen = true;
+        watchProjector(existing);
         await applyPlacement();
         return;
       }
@@ -108,6 +133,8 @@
         height: size.height,
         decorations: false,
         resizable: true,
+        // See src-tauri/src/webview_drop.rs.
+        dragDropEnabled: false,
         fullscreen: settings.fullscreen,
         backgroundColor: "#000000",
         focus: true,
@@ -121,12 +148,10 @@
         projectorOpen = false;
         error = String(event.payload);
       });
-      void projector.once("tauri://destroyed", () => {
-        projectorOpen = false;
-      });
+      watchProjector(projector);
     } catch (cause) {
       opening = false;
-      error = String(cause);
+      error = errorCause(cause);
     }
   }
 
@@ -136,13 +161,19 @@
       await projector?.close();
       projectorOpen = false;
     } catch (cause) {
-      error = String(cause);
+      error = errorCause(cause);
     }
   }
 
   onMount(() => {
     let cancelled = false;
     let unlistenSettings: UnlistenFn | undefined;
+    // What the projector changes (lock, overlays) comes as a storage event:
+    // it may not emit app events.
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === PROJECTOR_SETTINGS_KEY) settings = loadProjectorSettings();
+    };
+    window.addEventListener("storage", onStorage);
     void availableMonitors()
       .then((available) => {
         if (cancelled) return;
@@ -151,10 +182,12 @@
           persist({ ...settings, monitorKey: monitorKey(available[0]) });
         }
       })
-      .catch((cause) => (error = String(cause)));
+      .catch((cause) => (error = errorCause(cause)));
     void WebviewWindow.getByLabel(PROJECTOR_WINDOW_LABEL)
       .then((window) => {
-        if (!cancelled) projectorOpen = window !== null;
+        if (cancelled) return;
+        projectorOpen = window !== null;
+        if (window) watchProjector(window);
       });
     void listen<VisualizerProjectorSettings>(PROJECTOR_SETTINGS_EVENT, (event) => {
       if (!cancelled) settings = normalizeProjectorSettings(event.payload);
@@ -164,7 +197,10 @@
     });
     return () => {
       cancelled = true;
+      disposed = true;
+      window.removeEventListener("storage", onStorage);
       unlistenSettings?.();
+      unwatchProjector?.();
     };
   });
 </script>

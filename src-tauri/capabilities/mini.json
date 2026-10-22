@@ -1,12 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "mini",
-  "description": "The mini player window: player state and transport, dragging and closing itself.",
+  "description": "The mini player window: player state and transport, dragging and closing itself. Core permissions are listed one by one instead of core:default, which would also hand it the tray, menus and emitting events; internal-toggle-devtools exists in debug builds only.",
   "windows": ["mini"],
   "permissions": [
-    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
     "core:window:allow-close",
+    "core:webview:allow-internal-toggle-devtools",
     "mini-window"
   ]
 }

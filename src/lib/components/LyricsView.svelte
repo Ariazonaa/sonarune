@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { api } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
+  import { getLocale } from "#lib/paraglide/runtime.js";
   import EmptyState from "./EmptyState.svelte";
   import { lyrics as lyricsStore } from "#lib/state/lyrics.svelte.js";
   import { player } from "#lib/state/player.svelte.js";
@@ -20,6 +21,16 @@
   // lyrics store, so the panel and now playing always show the same value.
   const manualOffsetMs = $derived(lyricsStore.manualOffsetMs);
   const effectiveOffsetMs = $derived(offsetMs + manualOffsetMs);
+  // In seconds, signed, with the UI language's decimal mark ("+0,25 s").
+  const offsetLabel = $derived(
+    m.lyrics_sync_offset({
+      offset: new Intl.NumberFormat(getLocale(), {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+        signDisplay: "exceptZero",
+      }).format(manualOffsetMs / 1000),
+    }),
+  );
 
   // Line-level sync: LRC convention — a positive offset shifts lyrics earlier.
   const activeIndex = $derived.by(() => {
@@ -60,12 +71,20 @@
   });
 
   // New track: back to the top, forget any suspension (the store loads its
-  // saved nudge).
+  // saved nudge). Only on a real change of track: a view that mounts, or whose
+  // scroller is created anew, starts at the top anyway, and resetting it then
+  // threw away the centering that had just run — paused, with no position
+  // tick to center again, the active line stayed off-screen. It stays after
+  // the centering: in the flush a track change reaches both, the position is
+  // still the old track's, and the top is right until the new one arrives.
+  let shownTrackId = lyricsStore.forTrackId;
   $effect(() => {
-    void lyricsStore.forTrackId;
+    const id = lyricsStore.forTrackId;
+    if (id === shownTrackId) return;
+    shownTrackId = id;
     suspendUntil = 0;
     lastCentered = -1;
-    scroller?.scrollTo({ top: 0 });
+    untrack(() => scroller)?.scrollTo({ top: 0 });
   });
 
   function seekTo(line: LyricLineDto) {
@@ -169,11 +188,7 @@
         >
           −
         </button>
-        <span class="min-w-14 text-center tabular-nums">
-          {manualOffsetMs === 0
-            ? "0.00s"
-            : `${manualOffsetMs > 0 ? "+" : ""}${(manualOffsetMs / 1000).toFixed(2)}s`}
-        </span>
+        <span class="min-w-14 text-center tabular-nums">{offsetLabel}</span>
         <button
           class="rounded px-1.5 py-0.5 font-bold transition-colors hover:bg-ink/10 hover:text-ink"
           onclick={() => lyricsStore.nudgeOffset(250)}

@@ -92,6 +92,9 @@ impl WaveformRequest {
 pub struct WaveformJob {
     pub item_id: String,
     pub duration_ms: u64,
+    /// The server the track is streamed from, fixed when the job is armed:
+    /// the download can end after a sign-in to another one.
+    pub server: crate::identity::Server,
     pub request: WaveformRequest,
     /// A second handle on the stream's temp file, opened when the file was
     /// created — the download task's own handles are not reachable.
@@ -117,6 +120,7 @@ impl WaveformJob {
         let WaveformJob {
             item_id,
             duration_ms,
+            server,
             request,
             ..
         } = self;
@@ -138,7 +142,7 @@ impl WaveformJob {
                             (Some(Arc::new(peaks)), Some(analysis))
                         });
                     if let Some(analysis) = analysis {
-                        let analysis = request.analyses.put(&item_id, analysis);
+                        let analysis = request.analyses.put(Some(&server), &item_id, analysis);
                         (request.analysis_notify)(&item_id, &analysis);
                     }
                     // Cache first: a UI that asks right after the event
@@ -163,7 +167,7 @@ fn analyse(mut file: File, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)>
     file.seek(SeekFrom::Start(0)).ok()?;
     let len = file.metadata().ok()?.len();
     let reader = BufReader::new(file);
-    match super::opus::probe(reader, true) {
+    let (peaks, analysis) = match super::opus::probe(reader, true) {
         Ok(opus) => fold(opus, duration_ms),
         Err((reader, _)) => {
             let decoder = rodio::Decoder::builder()
@@ -174,7 +178,51 @@ fn analyse(mut file: File, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)>
                 .ok()?;
             fold(decoder, duration_ms)
         }
+    }?;
+    Some((peaks, made_for(analysis, duration_ms)))
+}
+
+/// Remember the length the server gave the track, which is what tells a
+/// replaced file later ([`TrackAnalysis::fits`]).
+fn made_for(mut analysis: TrackAnalysis, duration_ms: u64) -> TrackAnalysis {
+    analysis.server_duration_ms = (duration_ms > 0).then_some(duration_ms);
+    analysis
+}
+
+/// Only the tempo/key/sound analysis of a track held in memory (the library
+/// scan), without peaks.
+pub fn analyse_bytes(bytes: Vec<u8>, duration_ms: u64) -> Option<TrackAnalysis> {
+    let len = bytes.len() as u64;
+    let reader = std::io::Cursor::new(bytes);
+    match super::opus::probe(reader, true) {
+        Ok(opus) => analysis_only(opus),
+        Err((reader, _)) => {
+            let decoder = rodio::Decoder::builder()
+                .with_data(reader)
+                .with_byte_len(len)
+                .with_gapless(true)
+                .build()
+                .ok()?;
+            analysis_only(decoder)
+        }
     }
+    .filter(|analysis| {
+        // A transcode that came back much shorter than the track is a
+        // broken download, not the track. Longer, or a few seconds short, is
+        // the decode being right where the server only estimated.
+        duration_ms == 0 || analysis.duration_ms + 5_000.0 >= duration_ms as f64
+    })
+    .map(|analysis| made_for(analysis, duration_ms))
+}
+
+fn analysis_only<S: Source>(source: S) -> Option<TrackAnalysis> {
+    let channels = usize::from(source.channels().get());
+    let rate = source.sample_rate().get();
+    let mut analyzer = Analyzer::new(rate, channels);
+    for sample in source {
+        analyzer.push(sample);
+    }
+    Some(analyzer.finish())
 }
 
 fn fold<S: Source>(source: S, duration_ms: u64) -> Option<(Vec<u8>, TrackAnalysis)> {
@@ -277,6 +325,11 @@ mod tests {
             (analysis.audible_start_ms - 500.0).abs() < 30.0,
             "{analysis:?}"
         );
+        assert_eq!(
+            analysis.server_duration_ms,
+            Some(1000),
+            "what it was made for"
+        );
         assert_eq!(p.len(), BUCKETS);
         assert!(p[..BUCKETS / 2 - 2].iter().all(|v| *v == 0), "silent half");
         assert!(p[BUCKETS / 2 + 2..].iter().all(|v| *v > 250), "loud half");
@@ -291,6 +344,10 @@ mod tests {
         let job = WaveformJob {
             item_id: "track".into(),
             duration_ms: 1000,
+            server: crate::identity::Server {
+                address: "https://music.home".into(),
+                id: None,
+            },
             request: WaveformRequest {
                 cache: cache.clone(),
                 notify: Arc::new(move |id: &str, peaks: &[u8]| {
@@ -306,6 +363,50 @@ mod tests {
         let (id, len, cached) = rx.recv_timeout(Duration::from_secs(20)).expect("notified");
         let _ = std::fs::remove_file(&path);
         assert_eq!((id.as_str(), len, cached), ("track", BUCKETS, true));
+    }
+
+    #[test]
+    fn an_analysis_made_while_playing_is_filed_under_the_server_the_track_came_from() {
+        // The download of a track from server A ends after a sign-in to B:
+        // the job was armed for A, and A's it stays.
+        let dir =
+            std::env::temp_dir().join(format!("sonarune-wave-store-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(crate::store::Store::open(&dir).expect("open store"));
+        store.record_server("http://a.home", "aaaa").unwrap();
+        store
+            .set(crate::store::keys::SERVER_URL, "https://b.home")
+            .unwrap();
+        let path = temp_wav();
+        let (tx, rx) = mpsc::channel();
+        let job = WaveformJob {
+            item_id: "track".into(),
+            duration_ms: 1000,
+            server: crate::identity::Server {
+                address: "http://a.home".into(),
+                id: Some("aaaa".into()),
+            },
+            request: WaveformRequest {
+                cache: Arc::new(WaveformCache::default()),
+                notify: Arc::new(|_: &str, _: &[u8]| {}),
+                analyses: Arc::new(AnalysisCache::new(Some(store.clone()))),
+                analysis_notify: Arc::new(
+                    move |id: &str, _: &crate::player::analysis::TrackAnalysis| {
+                        tx.send(id.to_string()).unwrap();
+                    },
+                ),
+            },
+            file: Arc::new(Mutex::new(Some(File::open(&path).expect("open test wav")))),
+        };
+        job.start();
+        let id = rx.recv_timeout(Duration::from_secs(20)).expect("analysed");
+        let _ = std::fs::remove_file(&path);
+        let row = store.analysis_row(&id).expect("stored");
+        assert_eq!(
+            (row.server_url.as_deref(), row.server_id.as_deref()),
+            (Some("http://a.home"), Some("aaaa"))
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

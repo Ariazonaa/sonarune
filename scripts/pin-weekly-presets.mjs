@@ -23,23 +23,30 @@
 // Re-run it when
 //   - `butterchurn-presets-weekly` is added or updated (the drift check in
 //     `src/lib/visualizer/presets.test.ts` fails until every listed URL is
-//     pinned again), or
+//     pinned again, or recorded as gone -- see below), or
 //   - the app reports that a Weekly preset "changed on the server" and you
 //     decide to accept the new content.
 // Pinning trusts whatever the server delivers at that moment: look at what
-// changed (`git diff src-tauri/src/weekly_presets.json` names the files)
+// changed (`git diff src-tauri/src/weekly_presets*.json` names the files)
 // before committing, because the new bytes run as code inside the app.
 //
 // `--allow-missing` writes the manifest without files that answer HTTP 403/404
-// (gone from the bucket) instead of failing. Any other failure leaves the
-// existing manifest untouched and exits non-zero.
+// (gone from the bucket) instead of failing, and lists them in
+// `src-tauri/src/weekly_presets_missing.json`: the package still names them, so
+// the drift check needs to tell a file the bucket lost from one nobody pinned.
+// The app treats them like any unpinned entry (`preset:not-listed`). A run
+// that pins everything removes that list again. Any other failure leaves both
+// files untouched and exits non-zero.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const WEEKS_DIR = path.join(ROOT, "node_modules", "butterchurn-presets-weekly", "weeks");
 const OUT = path.join(ROOT, "src-tauri", "src", "weekly_presets.json");
+// Read by the drift check in presets.test.ts; Rust does not compile it in.
+const MISSING_OUT = path.join(ROOT, "src-tauri", "src", "weekly_presets_missing.json");
 // Must match ORIGIN in commands_visualizer.rs and WEEKLY_ORIGIN in presets.ts.
 const ORIGIN = "https://s3-us-east-2.amazonaws.com/butterchurn-presets/";
 const FILE_NAME = /^[a-f0-9]{32}\.json$/;
@@ -148,6 +155,22 @@ async function pin(file) {
   }
 }
 
+/**
+ * What a run writes: the pins (`"<32hex>.json"` -> SHA-256, sorted) and the
+ * sorted list of files left out as gone from the bucket -- `null` when there
+ * are none, which removes the list.
+ *
+ * @param {Map<string, string>} pins
+ * @param {string[]} gone
+ */
+export function manifestTexts(pins, gone) {
+  const manifest = Object.fromEntries([...pins.keys()].sort().map((file) => [file, pins.get(file)]));
+  return {
+    manifest: `${JSON.stringify(manifest, null, 2)}\n`,
+    missing: gone.length > 0 ? `${JSON.stringify([...gone].sort(), null, 2)}\n` : null,
+  };
+}
+
 async function main() {
   const files = listFiles();
   console.log(`Pinning ${files.length} Weekly presets from ${ORIGIN}`);
@@ -164,7 +187,7 @@ async function main() {
         pins.set(file, await pin(file));
       } catch (error) {
         const gone = error instanceof PermanentError && (error.status === 403 || error.status === 404);
-        if (allowMissing && gone) missing.push(`${file}: ${describe(error)}`);
+        if (allowMissing && gone) missing.push({ file, why: describe(error) });
         else failures.push(`${file}: ${describe(error)}`);
       }
       done += 1;
@@ -180,16 +203,24 @@ async function main() {
     return;
   }
 
-  const manifest = Object.fromEntries([...pins.keys()].sort().map((file) => [file, pins.get(file)]));
-  fs.writeFileSync(OUT, `${JSON.stringify(manifest, null, 2)}\n`);
+  const texts = manifestTexts(pins, missing.map((entry) => entry.file));
+  fs.writeFileSync(OUT, texts.manifest);
   console.log(`\nWrote ${pins.size} pins to ${path.relative(ROOT, OUT)}`);
-  if (missing.length > 0) {
-    console.warn(`Left out ${missing.length} missing preset(s) (--allow-missing):`);
-    for (const entry of missing.sort()) console.warn(`  ${entry}`);
+  if (texts.missing) {
+    fs.writeFileSync(MISSING_OUT, texts.missing);
+    console.warn(
+      `Left out ${missing.length} missing preset(s) (--allow-missing), listed in ${path.relative(ROOT, MISSING_OUT)}:`,
+    );
+    for (const entry of missing.map(({ file, why }) => `${file}: ${why}`).sort()) console.warn(`  ${entry}`);
+  } else {
+    fs.rmSync(MISSING_OUT, { force: true });
   }
 }
 
-main().catch((error) => {
-  console.error(describe(error));
-  process.exit(1);
-});
+// Run as a script (not when imported by a test).
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((error) => {
+    console.error(describe(error));
+    process.exit(1);
+  });
+}

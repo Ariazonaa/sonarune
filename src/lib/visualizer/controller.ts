@@ -55,12 +55,26 @@ export function loadCycleSetting(): CycleSetting {
   return raw !== null && Number.isFinite(parsed) ? parsed : DEFAULT_CYCLE;
 }
 
+/** Stores the choice, also while no controller runs — the next one starts from it. */
+export function saveCycleSetting(cycle: CycleSetting) {
+  localStorage.setItem(STORAGE_KEY, String(cycle));
+}
+
 /** Preset transition time in seconds (0 = hard cut). */
 export function loadBlendSetting(): number {
   const raw = localStorage.getItem(BLEND_KEY);
   if (raw === null) return DEFAULT_BLEND;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_BLEND;
+}
+
+/** See `saveCycleSetting`. */
+export function saveBlendSetting(seconds: number) {
+  localStorage.setItem(BLEND_KEY, String(Math.max(0, seconds)));
+}
+
+function loadFavoritesOnlySetting(): boolean {
+  return localStorage.getItem(FAVORITES_ONLY_KEY) === "true";
 }
 
 export function loadSensitivitySetting(): number {
@@ -102,7 +116,13 @@ function loadNameSet(key: string): Set<string> {
 }
 
 interface ControllerCallbacks {
+  /** The visuals cannot go on (the graphics context is gone, rendering failed). */
   onError: (message: string) => void;
+  /**
+   * Something failed and the visualizer carried on: a preset was skipped,
+   * online presets are unavailable for now. Goes to `onError` if not given.
+   */
+  onNotice?: (message: string) => void;
   onPreset: (name: string) => void;
   onCatalog?: (entries: PresetEntry[], progress: PresetCatalogProgress) => void;
   isCancelled: () => boolean;
@@ -122,8 +142,13 @@ export class VisualizerController {
   #locked = false;
   #level: EnergyLevel = "medium";
   #sinceSwitchS = 0;
+  /** Auto mode's one-second bookkeeping tick. */
   #timer: ReturnType<typeof setInterval> | undefined;
+  /** Fixed cycle: the next switch, due `cycle` seconds after the last one. */
+  #cycleTimer: ReturnType<typeof setTimeout> | undefined;
   #destroyed = false;
+  /** A preset made it onto the screen since create. */
+  #hasPreset = false;
   // Preset preferences / quality (persisted; see the *_KEY constants).
   #favorites = new Set<string>();
   #blocked = new Set<string>();
@@ -141,6 +166,12 @@ export class VisualizerController {
   #loadAbort: AbortController | undefined;
   #loadTimeout: ReturnType<typeof setTimeout> | undefined;
   #timedOutGeneration = 0;
+  /**
+   * A switch is under way (#beginLoad until its #finishLoad). Automatic
+   * switching waits for it: a new load would abort this one, and an online
+   * preset can take seconds to download.
+   */
+  #loading = false;
 
   private constructor(
     engine: VisualizerEngine,
@@ -177,7 +208,7 @@ export class VisualizerController {
       created.#favorites = loadNameSet(FAVORITES_KEY);
       created.#blocked = loadNameSet(BLOCKED_KEY);
       created.#quarantined = loadNameSet(QUARANTINED_KEY);
-      created.#favoritesOnly = localStorage.getItem(FAVORITES_ONLY_KEY) === "true";
+      created.#favoritesOnly = loadFavoritesOnlySetting();
       created.#remoteOptIn = loadRemotePresetsSetting();
       rotation.setFavorites(created.#favorites);
       rotation.setBlocked(created.#blocked);
@@ -200,6 +231,11 @@ export class VisualizerController {
         if (created.#destroyed || callbacks.isCancelled()) return;
         rotation.addEntries(pack.entries);
         callbacks.onCatalog?.(rotation.entries(), progress);
+        // The first pick only saw the base pack. With favorites-only and no
+        // favorite in it (or every base preset blocked) it found nothing,
+        // and nothing would try again before the next switch — up to a dwell
+        // time, a whole cycle, or the next track. Try with what just arrived.
+        if (!created.#hasPreset && !created.#loading) created.nextPreset(0);
       });
       return created;
     } catch (error) {
@@ -222,7 +258,7 @@ export class VisualizerController {
   /// consumers (the now-playing backdrop) that must not overwrite it.
   setBlend(seconds: number, persist = true) {
     this.#blendSeconds = Math.max(0, seconds);
-    if (persist) localStorage.setItem(BLEND_KEY, String(this.#blendSeconds));
+    if (persist) saveBlendSetting(this.#blendSeconds);
   }
 
   get locked(): boolean {
@@ -265,12 +301,16 @@ export class VisualizerController {
 
   /** Load a specific preset by name (from the browser). */
   selectPreset(name: string) {
+    if (this.#halted()) return;
     const entry = this.#rotation.entryByName(name);
     if (!entry || (entry.sourceUrl && !this.#remoteAllowed())) return;
     void this.#selectEntry(entry);
   }
 
   async #selectEntry(entry: PresetEntry) {
+    // The user's pick replaces a switch that was waiting for a beat.
+    this.#pendingSwitch = false;
+    this.#pendingWaitS = 0;
     const load = this.#beginLoad();
     try {
       const result = await this.#loadEntry(entry, this.#blendSeconds, load);
@@ -300,6 +340,36 @@ export class VisualizerController {
     this.#rotation.setFavoritesOnly(on);
   }
 
+  /**
+   * Take over the preset preferences another window stored — the main
+   * window's preset browser, while this controller runs the projector, which
+   * has no browser of its own. `key` is the storage event's key; null (storage
+   * cleared) re-reads all of them. Nothing is written back.
+   */
+  syncStoredPreferences(key: string | null) {
+    const changed = (stored: string) => key === null || key === stored;
+    if (changed(FAVORITES_KEY)) {
+      this.#favorites = loadNameSet(FAVORITES_KEY);
+      this.#rotation.setFavorites(this.#favorites);
+    }
+    if (changed(BLOCKED_KEY)) {
+      this.#blocked = loadNameSet(BLOCKED_KEY);
+      this.#rotation.setBlocked(this.#blocked);
+    }
+    if (changed(QUARANTINED_KEY)) {
+      this.#quarantined = loadNameSet(QUARANTINED_KEY);
+      this.#rotation.setQuarantined(this.#quarantined);
+    }
+    if (changed(FAVORITES_ONLY_KEY)) {
+      this.#favoritesOnly = loadFavoritesOnlySetting();
+      this.#rotation.setFavoritesOnly(this.#favoritesOnly);
+    }
+    if (changed(SENSITIVITY_KEY)) this.setSensitivity(loadSensitivitySetting(), false);
+    if (changed(QUALITY_KEY)) this.setQuality(loadQualitySetting(), false);
+    if (changed(BLEND_KEY)) this.setBlend(loadBlendSetting(), false);
+    if (changed(STORAGE_KEY)) this.setCycle(loadCycleSetting(), false);
+  }
+
   get remotePresetsEnabled(): boolean {
     return this.#remoteOptIn;
   }
@@ -324,12 +394,12 @@ export class VisualizerController {
    * in, and a blank preset as the last resort.
    */
   #leaveRemotePreset() {
-    if (this.#destroyed) return;
+    if (this.#halted()) return;
     this.#pendingSwitch = false;
     this.#pendingWaitS = 0;
     const load = this.#beginLoad();
     const superseded = () =>
-      !this.#currentRemote || load.generation !== this.#loadGeneration || this.#destroyed;
+      !this.#currentRemote || load.generation !== this.#loadGeneration || this.#halted();
     void (async () => {
       await this.#pickNext(this.#blendSeconds, load);
       // Bounded like #pickNext: a failing entry is quarantined, so the next
@@ -344,6 +414,7 @@ export class VisualizerController {
       try {
         this.#engine.loadPreset(blankPreset(), 0);
         this.#currentRemote = false;
+        this.#hasPreset = true;
         this.#sinceSwitchS = 0;
         this.#callbacks.onPreset("");
       } catch (error) {
@@ -398,8 +469,12 @@ export class VisualizerController {
       }
       return new Set((field as string[]).filter((name) => name.length <= 500));
     };
-    this.#favorites = readNames(backup.favorites);
-    this.#blocked = readNames(backup.blocked);
+    // Both lists first: a backup rejected halfway must leave the current
+    // favorites alone, or the next star would save the rejected ones.
+    const favorites = readNames(backup.favorites);
+    const blocked = readNames(backup.blocked);
+    this.#favorites = favorites;
+    this.#blocked = blocked;
     localStorage.setItem(FAVORITES_KEY, JSON.stringify([...this.#favorites]));
     localStorage.setItem(BLOCKED_KEY, JSON.stringify([...this.#blocked]));
     this.#rotation.setFavorites(this.#favorites);
@@ -444,14 +519,19 @@ export class VisualizerController {
     this.#cycle = cycle;
     this.#pendingSwitch = false;
     this.#pendingWaitS = 0;
-    if (persist) localStorage.setItem(STORAGE_KEY, String(cycle));
+    if (persist) saveCycleSetting(cycle);
     clearInterval(this.#timer);
+    this.#timer = undefined;
+    clearTimeout(this.#cycleTimer);
+    this.#cycleTimer = undefined;
     if (cycle === "auto") {
       // Fallback tick: enforces MAX_DWELL even while paused (no PCM frames),
-      // and flushes a beat-aligned switch if no onset arrives in time.
+      // and flushes a beat-aligned switch if no onset arrives in time. A load
+      // in flight is a switch already under way: asking for another would
+      // abort it (see #loading).
       this.#timer = setInterval(() => {
         this.#sinceSwitchS += 1;
-        if (this.#locked) return;
+        if (this.#locked || this.#loading || this.#halted()) return;
         if (this.#pendingSwitch) {
           this.#pendingWaitS += 1;
           if (this.#pendingWaitS >= BEAT_ALIGN_WAIT_S) this.nextPreset();
@@ -459,14 +539,33 @@ export class VisualizerController {
         if (this.#sinceSwitchS >= MAX_DWELL_S) this.#requestSwitch();
       }, 1000);
     } else if (cycle > 0) {
-      this.#timer = setInterval(() => {
-        if (!this.#locked) this.nextPreset();
-      }, cycle * 1000);
+      this.#scheduleCycle();
     }
   }
 
+  /**
+   * Fixed cycle: the next switch comes `cycle` seconds after the last one,
+   * re-armed by every load, so a preset picked by hand (or for a new track)
+   * gets its full time instead of what was left of a free-running interval.
+   */
+  #scheduleCycle() {
+    clearTimeout(this.#cycleTimer);
+    this.#cycleTimer = undefined;
+    const cycle = this.#cycle;
+    if (cycle === "auto" || cycle <= 0 || this.#halted()) return;
+    this.#cycleTimer = setTimeout(() => {
+      this.#scheduleCycle();
+      if (!this.#locked && !this.#loading) this.nextPreset();
+    }, cycle * 1000);
+  }
+
+  /** Destroyed, or the graphics context is gone: nothing loads any more. */
+  #halted(): boolean {
+    return this.#destroyed || this.#engine.contextLost;
+  }
+
   nextPreset(blendSeconds = this.#blendSeconds) {
-    if (this.#destroyed) return;
+    if (this.#halted()) return;
     this.#pendingSwitch = false;
     this.#pendingWaitS = 0;
     const load = this.#beginLoad();
@@ -493,6 +592,7 @@ export class VisualizerController {
 
   #beginLoad() {
     this.#loadGeneration += 1;
+    this.#loading = true;
     this.#loadAbort?.abort();
     clearTimeout(this.#loadTimeout);
     this.#loadAbort = new AbortController();
@@ -508,6 +608,7 @@ export class VisualizerController {
 
   #finishLoad(generation: number) {
     if (generation !== this.#loadGeneration) return;
+    this.#loading = false;
     clearTimeout(this.#loadTimeout);
     this.#loadTimeout = undefined;
     if (this.#timedOutGeneration === generation) this.#timedOutGeneration = 0;
@@ -526,22 +627,27 @@ export class VisualizerController {
         allowRemote: this.#remoteOptIn,
         signal: load.signal,
       });
-      if (load.generation !== this.#loadGeneration || this.#destroyed) return "stale";
+      if (load.generation !== this.#loadGeneration || this.#halted()) return "stale";
       if (entry.sourceUrl && !this.#remoteAllowed()) return "retry";
       this.#engine.loadPreset(preset, blendSeconds);
       this.#currentRemote = Boolean(entry.sourceUrl);
+      this.#hasPreset = true;
       this.#sinceSwitchS = 0;
       this.#pendingSwitch = false;
+      this.#scheduleCycle();
       this.#callbacks.onPreset(entry.name);
       return "loaded";
     } catch (error) {
-      if (load.generation !== this.#loadGeneration || this.#destroyed) {
+      // A lost graphics context fails every load — butterchurn hands WebGL
+      // the null shaders it gets back — which says nothing about the preset:
+      // quarantining for it would empty the whole catalog for good.
+      if (load.generation !== this.#loadGeneration || this.#halted()) {
         return "stale";
       }
       if (load.signal.aborted) {
         if (this.#timedOutGeneration !== load.generation) return "stale";
         this.#rotation.setRemoteEnabled(false);
-        this.#callbacks.onError(m.visualizer_error_weekly_timeout());
+        this.#notice(m.visualizer_error_weekly_timeout());
         return "retry";
       }
       console.warn(`preset ${entry.name} failed to load`, error);
@@ -549,13 +655,11 @@ export class VisualizerController {
         // A network outage must not permanently blacklist hundreds of remote
         // entries. Disable them for this session and continue with local packs.
         this.#rotation.setRemoteEnabled(false);
-        this.#callbacks.onError(m.visualizer_error_weekly_offline());
+        this.#notice(m.visualizer_error_weekly_offline());
         return "retry";
       }
-      this.#quarantined.add(entry.name);
-      localStorage.setItem(QUARANTINED_KEY, JSON.stringify([...this.#quarantined]));
-      this.#rotation.setQuarantined(this.#quarantined);
-      this.#callbacks.onError(
+      this.#quarantine(entry.name);
+      this.#notice(
         m.visualizer_error_preset_skipped({
           name: entry.name,
           message: error instanceof Error ? error.message : String(error),
@@ -565,12 +669,31 @@ export class VisualizerController {
     }
   }
 
+  /**
+   * Exclude a broken preset for good. Other windows (the projector, the
+   * now-playing backdrop) keep their own set: merge with what is stored
+   * instead of overwriting their additions, and drop what a reset elsewhere
+   * removed.
+   */
+  #quarantine(name: string) {
+    const merged = loadNameSet(QUARANTINED_KEY);
+    merged.add(name);
+    this.#quarantined = merged;
+    localStorage.setItem(QUARANTINED_KEY, JSON.stringify([...merged]));
+    this.#rotation.setQuarantined(merged);
+  }
+
+  #notice(message: string) {
+    (this.#callbacks.onNotice ?? this.#callbacks.onError)(message);
+  }
+
   /** Decide to switch, but let #onEnergy land it on the next beat. */
   #requestSwitch() {
     // Do not restart the fallback countdown on every timer tick once a
     // switch is already pending; otherwise a track with no detected beats can
-    // remain on the same preset forever after MAX_DWELL_S.
-    if (this.#locked || this.#destroyed || this.#pendingSwitch) return;
+    // remain on the same preset forever after MAX_DWELL_S. A load in flight
+    // is the switch itself.
+    if (this.#locked || this.#destroyed || this.#pendingSwitch || this.#loading) return;
     this.#pendingSwitch = true;
     this.#pendingWaitS = 0;
   }
@@ -587,7 +710,8 @@ export class VisualizerController {
 
   #onEnergy(state: EnergyState) {
     this.#level = state.level;
-    if (this.#cycle !== "auto" || this.#locked) return;
+    // A load in flight is a switch already under way (see #loading).
+    if (this.#cycle !== "auto" || this.#locked || this.#loading) return;
     // A musical break past the min dwell decides a switch...
     if (state.breakDetected && this.#sinceSwitchS >= MIN_DWELL_S) {
       this.#requestSwitch();
@@ -601,9 +725,11 @@ export class VisualizerController {
   async destroy() {
     this.#destroyed = true;
     this.#loadGeneration += 1;
+    this.#loading = false;
     this.#loadAbort?.abort();
     clearTimeout(this.#loadTimeout);
     clearInterval(this.#timer);
+    clearTimeout(this.#cycleTimer);
     await this.#engine.destroy();
   }
 }

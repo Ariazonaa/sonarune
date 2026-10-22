@@ -7,10 +7,12 @@
 //! makes it feel immediate after adding music on the server.
 
 use crate::api::LibrarySignature;
+use crate::error::AppError;
 use crate::player::SharedSession;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 
 /// Background poll cadence: short enough to feel automatic, cheap enough to
@@ -35,6 +37,12 @@ fn library_changed(
 #[derive(Clone)]
 pub struct LibraryWatchHandle {
     notify: Arc<Notify>,
+    /// How many changes were found since start, sent with every
+    /// `library:changed`. The watcher keeps polling while the window is
+    /// hidden and its WebView suspended, and the event sent then may never
+    /// arrive while the baseline moves on regardless — so the UI also reads
+    /// this back when it returns, and catches up on a count it has not seen.
+    revision: Arc<AtomicU64>,
 }
 
 impl LibraryWatchHandle {
@@ -42,12 +50,19 @@ impl LibraryWatchHandle {
     pub fn check_now(&self) {
         self.notify.notify_one();
     }
+
+    /// Changes found so far.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
 }
 
 pub fn spawn(app: AppHandle, session: SharedSession) -> LibraryWatchHandle {
     let notify = Arc::new(Notify::new());
+    let revision = Arc::new(AtomicU64::new(0));
     let handle = LibraryWatchHandle {
         notify: notify.clone(),
+        revision: revision.clone(),
     };
     tauri::async_runtime::spawn(async move {
         // Baseline is keyed by server URL and user id so a switch to a
@@ -73,11 +88,36 @@ pub fn spawn(app: AppHandle, session: SharedSession) -> LibraryWatchHandle {
             // the frontend's spinner debounce elapses, so it stays invisible
             // for the routine 30 s ticks and only shows on a slow/manual check.
             let _ = app.emit("library:sync", "checking");
-            match client.library_signature().await {
+            let signature = match client.library_signature().await {
+                // A revoked session: renewed the way every caller renews it,
+                // and asked once more. The renewed one is the same account,
+                // so the baseline still applies.
+                Err(unauthorized @ AppError::Server { status: 401, .. }) => {
+                    match crate::commands::renew_session(
+                        &app,
+                        &client,
+                        Instant::now(),
+                        unauthorized,
+                    )
+                    .await
+                    {
+                        Ok(renewed) => renewed.library_signature().await,
+                        Err(e) => Err(e),
+                    }
+                }
+                other => other,
+            };
+            match signature {
                 Ok(sig) => {
                     if library_changed(last.as_ref(), &identity, &sig) {
                         tracing::debug!("library changed on server");
-                        let _ = app.emit("library:changed", ());
+                        let count = revision.fetch_add(1, Ordering::Relaxed) + 1;
+                        let _ = app.emit("library:changed", count);
+                        // New music is what the sonic scan waits for, and
+                        // removed music what it releases.
+                        if let Some(state) = app.try_state::<crate::AppState>() {
+                            state.sonic_scan.poke();
+                        }
                     }
                     last = Some((identity, sig));
                     let _ = app.emit("library:sync", "idle");

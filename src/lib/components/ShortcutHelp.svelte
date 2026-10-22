@@ -1,5 +1,6 @@
 <script lang="ts">
   import { m } from "#lib/paraglide/messages.js";
+  import { modalFocus } from "#lib/modal.js";
   import { help } from "#lib/state/help.svelte.js";
   import {
     formatShortcutBinding,
@@ -27,18 +28,24 @@
 
 <svelte:window onkeydown={onKeydown} />
 
+<!-- Opened with "?" from wherever focus was: the dialog takes focus itself
+     (it is a list to read), so Space or Enter cannot press the button behind
+     the backdrop, and gives it back on close. -->
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
+  {@attach modalFocus}
   class="fixed inset-0 z-40 flex justify-center bg-black/75 p-4 pt-[10vh]"
   onclick={(event) => {
     if (event.target === event.currentTarget) help.close();
   }}
 >
   <div
-    class="overlay flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-overlay"
+    class="overlay flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-overlay outline-none"
     role="dialog"
     aria-modal="true"
     aria-label={m.shortcuts_title()}
+    tabindex="-1"
+    data-autofocus
   >
     <div class="flex items-center justify-between border-b border-edge px-5 py-3.5">
       <h2 class="text-sm font-bold tracking-tight">{m.shortcuts_title()}</h2>

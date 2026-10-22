@@ -6,13 +6,18 @@ import type {
   BulkMetadataResult,
   EditableMetadata,
   FavoritesData,
+  HistoryEntry,
+  HistoryYears,
   HomeData,
   MetadataEdits,
   Page,
+  PlaylistCleanup,
   PlaylistDetail,
   PlaylistDto,
+  PlaylistTransfer,
   StatsData,
   TrackDto,
+  YearReview,
 } from "#lib/types.js";
 
 /** Library-slice commands (src-tauri/src/commands_library.rs). */
@@ -24,13 +29,20 @@ export const apiLibrary = {
   deletePlaylist: (playlistId: string) => invoke<void>("delete_playlist", { playlistId }),
   renamePlaylist: (playlistId: string, name: string) =>
     invoke<void>("rename_playlist", { playlistId, name }),
+  /** Resolves with how many tracks the playlist gained (null: unknown) —
+   *  Jellyfin skips the ones it already holds. */
   playlistAdd: (playlistId: string, trackIds: string[]) =>
-    invoke<void>("playlist_add", { playlistId, trackIds }),
+    invoke<number | null>("playlist_add", { playlistId, trackIds }),
   /** `entryIds` are playlist entry ids (PlaylistTrackDto.entryId), not item ids. */
   playlistRemove: (playlistId: string, entryIds: string[]) =>
     invoke<void>("playlist_remove", { playlistId, entryIds }),
   playlistMove: (playlistId: string, entryId: string, newIndex: number) =>
     invoke<void>("playlist_move", { playlistId, entryId, newIndex }),
+  /** Keep the first entry of every track, drop the later ones — unless the
+   *  playlist holds entries the user cannot see (`hidden`), which the rewrite
+   *  would delete; then nothing is changed. */
+  removePlaylistDuplicates: (playlistId: string) =>
+    invoke<PlaylistCleanup>("remove_playlist_duplicates", { playlistId }),
   duplicatePlaylist: (playlistId: string, name: string) =>
     invoke<string>("duplicate_playlist", { playlistId, name }),
   transferPlaylistEntries: (
@@ -39,7 +51,7 @@ export const apiLibrary = {
     entryIds: string[],
     moveEntries: boolean,
   ) =>
-    invoke<void>("transfer_playlist_entries", {
+    invoke<PlaylistTransfer>("transfer_playlist_entries", {
       sourcePlaylistId,
       targetPlaylistId,
       entryIds,
@@ -63,6 +75,15 @@ export const apiLibrary = {
     invoke<BulkMetadataResult>("update_items_metadata", { itemIds, edits }),
   getHome: () => invoke<HomeData>("get_home"),
   getStats: () => invoke<StatsData>("get_stats"),
+  /** The local play history, newest first: `limit` listens older than the
+   *  row `before` (from the top when null). */
+  historyPage: (before: number | null, limit: number) =>
+    invoke<HistoryEntry[]>("history_page", { before, limit }),
+  historyYears: () => invoke<HistoryYears>("history_years"),
+  historyYear: (year: number) => invoke<YearReview>("history_year", { year }),
+  historyDelete: (id: number) => invoke<boolean>("history_delete", { id }),
+  /** Forget the history of the signed-in account; resolves with the rows gone. */
+  historyClear: () => invoke<number>("history_clear"),
   /** First page of every favorites section, each with its total. */
   getFavorites: () => invoke<FavoritesData>("get_favorites"),
   /** Later pages of one favorites section (by name; limit 1–200). */

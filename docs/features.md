@@ -21,21 +21,26 @@ the current build does.
 - **Smart crossfade** (opt-in): overlaps two tracks with gain ramps instead,
   and leaves a continuous album alone.
 - **10-band equalizer** with presets and your own saved presets, **volume
-  normalization**, and a clamp against clipping. Changes apply to the running
-  track, no restart.
+  normalization**, and a limiter that turns peaks down instead of clipping
+  them. Changes apply to the running track, no restart.
 - **Normalization per track or per album.** Album mode plays every track of an
   album at one gain, so the quiet piece stays quieter than the loud one — what
   the album was mixed for. Jellyfin sends an album value only from 10.11;
   without one the gain is the median of the album's tracks in the queue.
 - **Click-free pause and resume** through a sample-accurate fade stage — the
   same one that fades a sleep timer out.
-- **Seeking inside a live transcode**: a server transcode restarts at the new
-  position, a direct-play file is positioned before it reaches the audio graph.
-  Native seeks wait until the file is fully downloaded, because a decoder
-  waiting on an undownloaded range would stall the audio callback.
+- **Decoding ahead of the speakers**: every track decodes on its own thread, a
+  second and a half ahead, so a slow or broken connection silences only that
+  track — the other one of a crossfade plays on — and Next, Stop and a device
+  switch act at once.
+- **Seeking**, downloaded or not: in a direct-play file a seek goes straight
+  to the new position, even while the file is still downloading, and plays as
+  soon as that part has arrived; a server transcode restarts there. A device
+  switch carries on without downloading the track again.
 - **Output device** is selectable, and survives hotplug: if the chosen device
   disappears, playback falls back to the default one and resumes at the same
-  position.
+  position. After five minutes without sound the device is released, so
+  Windows can sleep; Play opens it again (that needs the server).
 - **Sleep timer**, by minutes or at the end of the current track, with an
   optional fade-out.
 - **Stop after this track, or after this album**, from a queue entry's context
@@ -70,6 +75,12 @@ the current build does.
 - **A statistics dashboard**: how much the library holds and how much of it has
   been played at least once, plus the most played artists and the albums per
   decade as bars you can walk into.
+- **Play history and year in review**: every track you listen to (half of it
+  or four minutes, the ListenBrainz rule) is recorded on this computer, per
+  server (known by its Jellyfin id, so a new address keeps it) and account — a
+  timeline by day, and a review per year with plays,
+  listening time, the most played artists, albums and tracks, and plays per
+  month. Entries can be removed, recording switched off.
 - **Deleting** items on the server, when the account is allowed to.
 - **Library watch**: the server is polled for changes (and on window focus), so
   music added while the app is open shows up without a manual refresh.
@@ -100,10 +111,16 @@ UI shows it, it never computes it.
 
 - Create, rename, duplicate and delete playlists.
 - Reorder entries by drag-and-drop, remove entries, remove duplicates.
+- **Long playlists**: above 300 entries only the rows in view are drawn, so a
+  playlist with thousands of tracks opens, filters and reorders at once. Back
+  and Forward return to the same spot and filter.
 - **Transfer entries between playlists.**
 - Add anything to a playlist from its context menu, including multi-selections.
-- Reorders and removals use the playlist's *entry id* rather than the track id,
-  so a playlist that contains the same track twice behaves.
+- **A track in a playlist twice**: Jellyfin 10.11 tells playlist entries
+  apart by their track only, so such a playlist shows both rows, reordering
+  waits until the duplicates are cleaned up, a removal that would take every
+  copy asks first, and *Clean up duplicates* rewrites the playlist with each
+  track once.
 - **In the sidebar**, and tracks and albums can be dragged onto them from any
   list or grid.
 
@@ -114,14 +131,30 @@ UI shows it, it never computes it.
 
 - **Discover hub** with random albums, mixes, long-not-heard, artists.
 - **By decade**: decade rows and a page per decade.
-- **Smart views**: build a query from server-side filters (genre, year, rating,
-  added-since and so on), save it locally, and materialize it into a static
-  playlist when you want it to stop moving.
+- **Smart views**: build a query from server-side filters (genres, a year
+  range, played or not, favorites only, a minimum play count, added since),
+  save it locally, and materialize it into a static playlist when you want it
+  to stop moving.
 - **Collections** — Jellyfin BoxSets, read-only.
 - **Auto-DJ**: pick a seed (track, artist, genre, album or playlist) and when
   the queue is about to run dry, Sonarune appends a fresh instant mix. It
   resumes playback if the queue ran out before the mix arrived, and holds off
-  while a sleep timer is about to end the session.
+  while a sleep timer is about to end the session. The **sound** seed uses
+  Sonarune's own sonic similarity instead of the server's mix: what sounds like
+  the last few tracks, ordered so each follows on from the one before.
+- **Sonic similarity** (`src-tauri/src/sonic.rs`): the analysis that already
+  finds tempo, beats and key also measures timbre (12 mel-cepstral
+  coefficients and their spread), brightness, noisiness, attack, bass share,
+  level and dynamic range (`player/timbre.rs`). Every track you play gets it;
+  Settings → Sonic similarity analyses the rest of the library in the
+  background, two tracks at a time, each fetched as a 96 kbit/s transcode
+  (lossy originals as they are). Distances weigh sound, tempo (half and double
+  time count as the same groove; how much depends on how sure the tempo is)
+  and key (Camelot). A **sonic radio** picks the 39 tracks closest to the seed
+  and orders them to flow; a **sonic path** aims each of its ten steps at the
+  point that far between start and destination, in sound and tempo, and keeps
+  each step close to the one before. No server plugin, nothing leaves the
+  machine.
 
 </details>
 
@@ -175,9 +208,13 @@ UI shows it, it never computes it.
   Settings. The download is verified against the project's signing key before
   the installer is opened, and an update never runs while a track is playing —
   the installer closes the app. The portable build says so instead of
-  installing anything.
+  installing anything. Betas are opt-in: on the beta channel Sonarune offers
+  them as soon as they are out, and the stable release after them.
 - **Downloads**: export original files, two at a time, with progress, cancel
-  and retry. This is an export, not an offline cache.
+  and retry, or *Retry all* for every failed one. Batches of thousands stay
+  light: the panel lists the running ones, the next 50 waiting, the failed and
+  cancelled ones and the last 50 completed. This is an export, not an offline
+  cache.
 
 </details>
 
@@ -202,7 +239,7 @@ UI shows it, it never computes it.
   stays readable against black, with a fixed accent as the fallback for grey
   artwork — or pick one of eight presets or your own color.
 - **View density and layout presets**: compact or comfortable lists, grid card
-  size, sidebar width, remembered per view.
+  size, sidebar width, one layout for the whole app.
 - **Skeletons, empty states and an offline banner**, plus a
   stale-while-revalidate cache, so navigation is instant and the UI never
   pretends to know something it does not.
@@ -239,7 +276,8 @@ UI shows it, it never computes it.
   certificate only after you confirmed its fingerprint. There is no blanket
   "accept invalid certificates".
 - **Tokens live in the OS credential store**, not in the database and not in an
-  export — the ListenBrainz token included.
+  export — the ListenBrainz token included. Uninstalling with *Delete the
+  application data* ticked removes them as well.
 - **A Content-Security-Policy** limits the WebView to the app's own resources,
   the IPC channel and the cover-art protocol.
 - **Remote visualizer presets are treated as code**: opt-in, downloaded in

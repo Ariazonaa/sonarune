@@ -106,7 +106,9 @@
   });
 
   function onkeydown(event: KeyboardEvent) {
-    if (inactive) return;
+    // A chord is never a slider key: Ctrl+←/→ are previous/next. A click
+    // leaves the bar focused, so taking them here would seek instead.
+    if (inactive || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
     const target = positionForKey(event.key, positionMs, durationMs);
     if (target === null) return;
     // The global ←/→ shortcuts would otherwise seek a second time.

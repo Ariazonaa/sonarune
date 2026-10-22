@@ -1,6 +1,8 @@
 // Decoding and shaping of the PCM frames the Rust tap sends
 // (src-tauri/src/player/tap.rs): u32-le sample rate, u32-le channel count,
-// then f32-le samples interleaved L, R, L, R, …
+// then f32-le samples interleaved L, R, L, R, … The rate is the frames' pace
+// on the clock: at a playback speed other than 1 it is the track's own rate
+// times the speed (`wire_rate`), so the feed can be paced by it as it is.
 
 const HEADER_BYTES = 8;
 /** Anything above this is not a frame from our tap. */

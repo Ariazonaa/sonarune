@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api } from "#lib/api.js";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import EmptyState from "#lib/components/EmptyState.svelte";
-  import { library } from "#lib/state/library.svelte.js";
+  import { onLibraryChange } from "#lib/state/library.svelte.js";
   import { swrGet, swrSet } from "#lib/swr.js";
   import type { GenreDto } from "#lib/types.js";
 
@@ -19,14 +20,12 @@
         error = null;
       })
       .catch((e) => {
-        if (!genres) error = String(e);
+        if (!genres) error = errorCause(e);
       });
   }
 
   onMount(load);
-  $effect(() => {
-    if (library.revision > 0) load();
-  });
+  onLibraryChange(load);
 
   // Deterministic hue from the genre name so cards are varied but stable.
   function hue(name: string): number {

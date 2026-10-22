@@ -2,7 +2,9 @@
   import { onMount } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
   import { ACCENT_CHANGED } from "#lib/theme.js";
+  import { player } from "#lib/state/player.svelte.js";
   import { decodeFrame, toMono } from "#lib/visualizer/pcm.js";
+  import { SpectrumAnalyzer } from "#lib/visualizer/spectrum.js";
 
   // A lightweight spectrum analyzer. Subscribes to the same Rust PCM tap the
   // visualizer uses (multi-subscriber, so both can run) and draws a log-spaced
@@ -10,99 +12,29 @@
   // channel. Zero cost server-side when nothing plays.
   let { class: cls = "h-16 w-full" }: { class?: string } = $props();
 
-  const FFT_SIZE = 2048;
   const BARS = 56;
 
   let canvas = $state<HTMLCanvasElement | null>(null);
 
-  // Hann window + log-spaced bin ranges, precomputed once.
-  const window_ = new Float32Array(FFT_SIZE);
-  for (let i = 0; i < FFT_SIZE; i++) {
-    window_[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1)));
-  }
-  const binEdges = new Int32Array(BARS + 1);
-  {
-    const minBin = 1;
-    const maxBin = FFT_SIZE / 2;
-    for (let b = 0; b <= BARS; b++) {
-      binEdges[b] = Math.round(minBin * Math.pow(maxBin / minBin, b / BARS));
-    }
-  }
-
-  // Reusable FFT scratch + smoothed bar values.
-  const re = new Float32Array(FFT_SIZE);
-  const im = new Float32Array(FFT_SIZE);
+  const analyzer = new SpectrumAnalyzer(BARS);
+  // Smoothed bar values and the levels they move toward.
   const targets = new Float32Array(BARS);
   const values = new Float32Array(BARS);
 
-  /** In-place iterative radix-2 FFT (Cooley–Tukey). */
-  function fft(reArr: Float32Array, imArr: Float32Array) {
-    const n = reArr.length;
-    for (let i = 1, j = 0; i < n; i++) {
-      let bit = n >> 1;
-      for (; j & bit; bit >>= 1) j ^= bit;
-      j ^= bit;
-      if (i < j) {
-        [reArr[i], reArr[j]] = [reArr[j], reArr[i]];
-        [imArr[i], imArr[j]] = [imArr[j], imArr[i]];
-      }
-    }
-    for (let len = 2; len <= n; len <<= 1) {
-      const ang = (-2 * Math.PI) / len;
-      const wRe = Math.cos(ang);
-      const wIm = Math.sin(ang);
-      for (let i = 0; i < n; i += len) {
-        let curRe = 1;
-        let curIm = 0;
-        for (let k = 0; k < len >> 1; k++) {
-          const p = i + k;
-          const q = p + (len >> 1);
-          const bRe = reArr[q] * curRe - imArr[q] * curIm;
-          const bIm = reArr[q] * curIm + imArr[q] * curRe;
-          reArr[q] = reArr[p] - bRe;
-          imArr[q] = imArr[p] - bIm;
-          reArr[p] += bRe;
-          imArr[p] += bIm;
-          const nextRe = curRe * wRe - curIm * wIm;
-          curIm = curRe * wIm + curIm * wRe;
-          curRe = nextRe;
-        }
-      }
-    }
-  }
-
-  function onFrame(frame: ArrayBuffer) {
-    const pcm = decodeFrame(frame);
-    if (!pcm) return;
-    // One spectrum for the whole signal: the stereo feed's mid channel.
-    const samples = toMono(pcm.samples, pcm.channels);
-    const n = Math.min(samples.length, FFT_SIZE);
-    for (let i = 0; i < n; i++) re[i] = samples[i] * window_[i];
-    for (let i = n; i < FFT_SIZE; i++) re[i] = 0;
-    im.fill(0);
-    fft(re, im);
-    const norm = FFT_SIZE / 2;
-    for (let b = 0; b < BARS; b++) {
-      let peak = 0;
-      const end = Math.max(binEdges[b] + 1, binEdges[b + 1]);
-      for (let bin = binEdges[b]; bin < end; bin++) {
-        const mag = Math.hypot(re[bin], im[bin]) / norm;
-        if (mag > peak) peak = mag;
-      }
-      // dBFS -54..0 → 0..1.
-      const db = 20 * Math.log10(peak + 1e-6);
-      targets[b] = Math.min(1, Math.max(0, (db + 54) / 54));
-    }
-  }
-
   onMount(() => {
     const channel = new Channel<ArrayBuffer>();
-    // Keep only the newest frame; the FFT runs once per animation frame on it,
-    // dropping any backlog so latency can't accumulate when the main thread is
-    // busy (e.g. Butterchurn also rendering).
-    let latestFrame: ArrayBuffer | null = null;
+    // Every frame goes into the analyzer's window; the FFT runs once per
+    // animation frame on the newest samples, so a backlog (the main thread
+    // busy, e.g. Butterchurn also rendering) can't turn into latency.
     channel.onmessage = (frame) => {
-      latestFrame = frame;
+      const pcm = decodeFrame(frame);
+      if (!pcm) return;
+      // The frame's rate is its pace on the clock, the track's rate times the
+      // playback speed; with the pitch kept, the music still sounds at the
+      // track's own rate.
+      const { speed, preservePitch } = player.state;
+      const pitchRate = preservePitch && speed > 0 ? pcm.sampleRate / speed : pcm.sampleRate;
+      analyzer.push(toMono(pcm.samples, pcm.channels), pcm.sampleRate, performance.now(), pitchRate);
     };
     let raf = 0;
     let disposed = false;
@@ -115,15 +47,16 @@
     const onAccentChanged = () => (accent = readAccent());
     window.addEventListener(ACCENT_CHANGED, onAccentChanged);
 
-    invoke("visualizer_subscribe", { channel }).catch(() => {});
+    // A spectrum, not a visualizer: it may sleep with its window, which then
+    // simply sends it nothing (src-tauri/src/player/tap.rs, `TapConsumer`).
+    invoke("visualizer_subscribe", { channel, consumer: "spectrum" }).catch(() => {});
 
-    const draw = () => {
+    const draw = (now: number) => {
       if (disposed) return;
       raf = requestAnimationFrame(draw);
-      if (latestFrame) {
-        onFrame(latestFrame);
-        latestFrame = null;
-      }
+      // The tap sends nothing while playback is paused or stopped: let the
+      // bars fall instead of freezing on the last spectrum.
+      if (!analyzer.analyze(targets) && analyzer.isStale(now)) targets.fill(0);
       const el = canvas;
       const ctx = el?.getContext("2d");
       if (!el || !ctx) return;

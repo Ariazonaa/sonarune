@@ -22,6 +22,14 @@ class PlaylistsStore {
       })
       .catch(() => {});
   }
+
+  /** On sign-out. The list belongs to the account, so here it does not stand
+   *  until the next account's first load succeeds; a load still on its way
+   *  is dropped. */
+  reset() {
+    this.#pending++;
+    this.items = [];
+  }
 }
 
 export const playlists = new PlaylistsStore();

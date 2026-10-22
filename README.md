@@ -53,8 +53,7 @@ is self-contained, the interface is embedded in it.
 
 It is not code-signed, so SmartScreen calls the publisher unknown. **More info →
 Run anyway.** That is a reputation problem rather than a technical one, and it
-is on the list. Every release carries a `SHA256SUMS.txt`, and the builds are
-produced by [the release workflow](.github/workflows/release.yml) from the
+is on the list. The builds are produced by [the release workflow](.github/workflows/release.yml) from the
 tagged commit rather than on someone's machine.
 
 From 0.2.0 on, the installed app keeps itself current: it asks once per start
@@ -104,6 +103,9 @@ Folded up by area; the full list, with the reasoning, is in
 - Search 2.0 with history; instant mix and similar-artists; a **statistics
   dashboard** with the library's numbers, the most played artists and the
   albums per decade.
+- **Its own play history** as a timeline, and a **year in review** built from
+  it. Jellyfin only knows each track's last play; Sonarune records every one
+  itself, on your computer only, and you can switch it off.
 - **Tag editing for a whole selection** — album artist, genres or year across
   many tracks at once.
 - The **queue is a single source of truth in Rust** — shuffle / repeat /
@@ -120,6 +122,10 @@ Folded up by area; the full list, with the reasoning, is in
 
 - A Discover hub, **dynamic smart views** (server-side filters you can save and
   materialize to a static playlist), decade rows, read-only Collections/BoxSets.
+- **Sonic similarity without a server plugin**: Sonarune analyses how a track
+  sounds (timbre, brightness, attack, dynamics, tempo, key) itself, the whole
+  library in the background if you like. From that, a **sonic radio** from any
+  track and a **sonic path** that walks from one track to another in ten steps.
 - **Auto-DJ** that keeps the music going from a track / artist / genre / album /
   playlist seed.
 
@@ -384,9 +390,10 @@ WebView2 (WebdriverIO → `tauri-driver`). Details and the manual live-test matr
 are in [`docs/testing.md`](docs/testing.md) and [`e2e/README.md`](e2e/README.md).
 
 CI runs the same gates on every push and pull request
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on a Windows runner.
-The workflow installs Node, Rust and cmake itself and sets up the MSVC
-environment, so it needs nothing beyond the image's C++ build tools.
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on GitHub's hosted
+Windows image. It relies on what that image ships — rustup, the MSVC build
+tools, cmake and LLVM — and only adds Node 22, the current stable Rust and
+caching.
 
 ## Project layout
 

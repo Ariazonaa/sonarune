@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api } from "#lib/api.js";
+  import { errorCause, errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { getLocale, setLocale } from "#lib/paraglide/runtime.js";
   import { player } from "#lib/state/player.svelte.js";
+  import { sonic } from "#lib/state/sonic.svelte.js";
   import { session } from "#lib/state/session.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { confirm } from "#lib/state/confirm.svelte.js";
@@ -23,6 +25,13 @@
   import LayoutSettings from "#lib/components/LayoutSettings.svelte";
   import TrustedCertSettings from "#lib/components/TrustedCertSettings.svelte";
   import UpdateSettings from "#lib/components/UpdateSettings.svelte";
+  import {
+    configuredOutput,
+    configuredOutputMissing,
+    configuredOutputName,
+    outputFallbackActive,
+    pickOutput,
+  } from "#lib/outputDevices.js";
   import {
     ACCENTS,
     applyTheme,
@@ -116,12 +125,29 @@
   // Full path of the last diagnostics export, so the user can see/open it.
   let diagnosticsPath = $state<string | null>(null);
 
-  const selectedOutputMissing = $derived(
-    playback?.outputDevice != null && !audioDevices.devices.includes(playback.outputDevice),
-  );
-  const outputFallbackActive = $derived(
-    playback?.outputDevice != null && audioDevices.fallbackDevice === playback.outputDevice,
-  );
+  // The listed device the output setting means, also under a new id.
+  const selectedOutput = $derived(configuredOutput(playback, audioDevices.devices));
+  const selectedOutputMissing = $derived(configuredOutputMissing(playback, audioDevices.devices));
+  const playingOnFallback = $derived(outputFallbackActive(playback, audioDevices));
+  const selectedOutputName = $derived(playback ? (configuredOutputName(playback) ?? "") : "");
+  let restoringOutput = $state(false);
+
+  // The device playing as of the last device list; undefined before the
+  // first one.
+  let knownActiveDevice: string | null | undefined;
+
+  function showDevices(snapshot: AudioDeviceSnapshot) {
+    const active = snapshot.activeDevice?.id ?? null;
+    // Another device took over: its profile may have replaced the sound
+    // settings (see reloadSound), and the configured device may now be
+    // stored under the new id it was found under.
+    if (knownActiveDevice !== undefined && active !== knownActiveDevice) {
+      void reloadSound();
+      void reloadOutputChoice();
+    }
+    knownActiveDevice = active;
+    audioDevices = snapshot;
+  }
 
   onMount(() => {
     let disposed = false;
@@ -132,13 +158,22 @@
       refreshingDevices = true;
       try {
         const snapshot = await api.listAudioDevices();
-        if (!disposed) audioDevices = snapshot;
+        if (!disposed) showDevices(snapshot);
       } catch (e) {
-        if (reportError && !disposed) player.error = String(e);
+        if (reportError && !disposed) player.error = errorMessage(e);
       } finally {
         refreshingDevices = false;
       }
     }
+
+    // Events sent while the window was hidden never arrive (the WebView is
+    // suspended): look again once it shows.
+    function onVisibilityChange() {
+      if (document.visibilityState !== "visible" || disposed) return;
+      void reloadSound();
+      void refreshAudioDevices();
+    }
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     async function initialize() {
       try {
@@ -161,7 +196,7 @@
         cacheInfo = nextCache;
         await refreshAudioDevices(true);
       } catch (e) {
-        if (!disposed) player.error = String(e);
+        if (!disposed) player.error = errorMessage(e);
       }
     }
 
@@ -170,6 +205,7 @@
     return () => {
       disposed = true;
       clearInterval(pollTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   });
 
@@ -178,40 +214,99 @@
   }
 
   // A device's profile replaced EQ/normalization while this page was open:
-  // show it, or the next control change would write the old values back.
+  // show it, or the next control change would write the old values back —
+  // into the profile of the device playing now.
+  async function reloadSound() {
+    try {
+      settings = await api.getAudioSettings();
+      audioProfiles = await api.getAudioProfiles();
+    } catch (e) {
+      player.error = errorMessage(e);
+    }
+  }
+
   let seenProfileRevision = player.audioProfileRevision;
   $effect(() => {
     const revision = player.audioProfileRevision;
     if (revision === seenProfileRevision) return;
     seenProfileRevision = revision;
-    void (async () => {
-      try {
-        settings = await api.getAudioSettings();
-        audioProfiles = await api.getAudioProfiles();
-      } catch (e) {
-        player.error = String(e);
-      }
-    })();
+    void reloadSound();
   });
 
   async function setAudioProfilesEnabled(enabled: boolean) {
     try {
       audioProfiles = await api.setAudioProfilesEnabled(enabled);
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
-  async function deleteAudioProfile(device: string) {
+  async function deleteAudioProfile(deviceId: string) {
     try {
-      audioProfiles = await api.deleteAudioProfile(device);
+      audioProfiles = await api.deleteAudioProfile(deviceId);
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
-  function savePlayback() {
-    if (playback) player.run(api.setPlaybackSettings($state.snapshot(playback)));
+  // Only the newest save's answer counts; an older one would undo what was
+  // picked since.
+  let playbackSave = 0;
+  let playbackSavesPending = 0;
+  async function savePlayback() {
+    if (!playback) return;
+    const request = ++playbackSave;
+    playbackSavesPending++;
+    try {
+      const applied = await api.setPlaybackSettings($state.snapshot(playback));
+      // The player keeps the previous output when the new one does not open
+      // (and names a device by its id once it opened): show what plays, or
+      // the next save would ask for the refused device again.
+      if (request === playbackSave && playback) {
+        playback.outputDevice = applied.outputDevice;
+        playback.outputDeviceName = applied.outputDeviceName;
+      }
+    } catch (e) {
+      player.error = errorMessage(e);
+    } finally {
+      playbackSavesPending--;
+    }
+  }
+
+  // The output setting as the player stored it last — unless a save of this
+  // page overlaps the reload: its answer is the newer one.
+  async function reloadOutputChoice() {
+    if (playbackSavesPending > 0) return;
+    const request = playbackSave;
+    try {
+      const stored = await api.getPlaybackSettings();
+      if (request === playbackSave && playbackSavesPending === 0 && playback) {
+        playback.outputDevice = stored.outputDevice;
+        playback.outputDeviceName = stored.outputDeviceName;
+      }
+    } catch {
+      // The next device change looks again.
+    }
+  }
+
+  function selectOutput(id: string) {
+    if (!playback) return;
+    Object.assign(playback, pickOutput(id, audioDevices.devices));
+    void savePlayback();
+  }
+
+  async function restoreOutput() {
+    restoringOutput = true;
+    try {
+      showDevices(await api.restoreOutputDevice());
+      // Newer than any save still under way.
+      playbackSave++;
+      playback = await api.getPlaybackSettings();
+    } catch (e) {
+      player.error = errorMessage(e);
+    } finally {
+      restoringOutput = false;
+    }
   }
 
   function changeLocale(locale: "en" | "de") {
@@ -225,7 +320,7 @@
       desktop = await api.setDesktopSettings($state.snapshot(desktop));
       cacheInfo = await api.getCacheInfo();
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 
@@ -251,7 +346,7 @@
       cacheInfo = await api.clearCoverCache();
       maintenanceMessage = m.settings_cache_cleared();
     } catch (e) {
-      maintenanceError = String(e);
+      maintenanceError = errorCause(e);
     } finally {
       maintenanceBusy = false;
     }
@@ -268,7 +363,7 @@
         name: path.split(/[\\/]/).pop() ?? path,
       });
     } catch (e) {
-      maintenanceError = String(e);
+      maintenanceError = errorCause(e);
     } finally {
       maintenanceBusy = false;
     }
@@ -276,7 +371,7 @@
 
   function revealDiagnostics() {
     if (diagnosticsPath) {
-      void api.revealPath(diagnosticsPath).catch((e) => (maintenanceError = String(e)));
+      void api.revealPath(diagnosticsPath).catch((e) => (maintenanceError = errorCause(e)));
     }
   }
 
@@ -331,11 +426,16 @@
     }
   }
 
+  /** A sign-out waits for the stop report and the server's token revoke —
+   *  seconds against a stalled server, which must not look like nothing. */
+  let signingOut = $state(false);
+
   // Until now the only way out was forgetting the active server's pinned
   // certificate — with a publicly trusted certificate there was none at all.
   // Rust (`commands::disconnect`) revokes the token and drops credentials and
   // queue; the settings and the pinned certificates stay.
   async function signOut() {
+    if (signingOut) return;
     const ok = await confirm.ask({
       title: m.settings_sign_out_title(),
       body: m.settings_sign_out_confirm(),
@@ -343,10 +443,13 @@
       danger: true,
     });
     if (!ok) return;
+    signingOut = true;
     try {
       await session.disconnect();
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
+    } finally {
+      signingOut = false;
     }
   }
 
@@ -419,9 +522,9 @@
   }
 
   /** Backend semantics for `listenbrainzToken`: a value stores the token, ""
-   *  clears it, null keeps the stored one. Only `saveToken` passes one — a
-   *  draft typed into the token field must not ride along (untrimmed, never
-   *  confirmed) with an Auto-DJ toggle. */
+   *  clears it, null keeps the stored one. Only `saveToken` and `removeToken`
+   *  pass one — a draft typed into the token field must not ride along
+   *  (untrimmed, never confirmed) with an Auto-DJ toggle. */
   function persistExtras(current: ExtrasSettings, listenbrainzToken: string | null = null): Promise<void> {
     // `bind:value` on a number input yields null when emptied and keeps
     // decimals; the backend deserializes u32, so either would fail this save
@@ -445,12 +548,34 @@
     if (!extras) return;
     const current = extras;
     const token = current.listenbrainzToken?.trim() ?? "";
+    // An empty field never deletes: it is empty after every save on purpose,
+    // so a second click, or Save to "confirm" the stored token, would quietly
+    // stop scrobbling. Removing is its own, confirmed action.
+    if (!token) return;
     const saved = persistExtras(current, token);
     // The token never lingers in the DOM.
     current.listenbrainzToken = null;
     player.run(
       saved.then(() => {
-        current.listenbrainzConfigured = token !== "";
+        current.listenbrainzConfigured = true;
+      }),
+    );
+  }
+
+  async function removeToken() {
+    if (!extras) return;
+    const current = extras;
+    const ok = await confirm.ask({
+      title: m.settings_listenbrainz_remove_title(),
+      body: m.settings_listenbrainz_remove_confirm(),
+      confirmLabel: m.settings_listenbrainz_remove(),
+      danger: true,
+    });
+    if (!ok) return;
+    current.listenbrainzToken = null;
+    player.run(
+      persistExtras(current, "").then(() => {
+        current.listenbrainzConfigured = false;
       }),
     );
   }
@@ -467,7 +592,7 @@
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
-      backupError = String(e);
+      backupError = errorCause(e);
     }
   }
 
@@ -486,8 +611,9 @@
       rememberAutoDj(nextExtras);
       desktop = await api.getDesktopSettings();
       cacheInfo = await api.getCacheInfo();
+      audioProfiles = await api.getAudioProfiles();
     } catch (e) {
-      backupError = String(e);
+      backupError = errorCause(e);
     }
   }
 </script>
@@ -726,37 +852,49 @@
           />
         </label>
 
-        <label class="mt-6 block">
-          <span class="mb-1 block text-sm font-medium">{m.settings_output_device()}</span>
-          <select
-            class="w-full rounded-md border border-edge bg-base px-3 py-2 text-sm outline-none focus:border-accent"
-            value={playback.outputDevice ?? ""}
-            onchange={(e) => {
-              if (playback) {
-                playback.outputDevice = e.currentTarget.value || null;
-                savePlayback();
-              }
-            }}
-          >
-            <option value="">{m.settings_output_default()}</option>
-            {#if selectedOutputMissing && playback.outputDevice}
-              <option value={playback.outputDevice} disabled>
-                {m.settings_output_unavailable({ device: playback.outputDevice })}
-              </option>
-            {/if}
-            <!-- keyed by index: duplicate device names are possible -->
-            {#each audioDevices.devices as device, i (i)}
-              <option value={device}>{device}</option>
-            {/each}
-          </select>
-          {#if outputFallbackActive && playback.outputDevice}
-            <span class="mt-1.5 block max-w-lg text-xs text-ink-muted">
-              {selectedOutputMissing
-                ? m.settings_output_fallback_missing({ device: playback.outputDevice })
-                : m.settings_output_fallback_returned({ device: playback.outputDevice })}
-            </span>
+        <div class="mt-6">
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium">{m.settings_output_device()}</span>
+            <select
+              class="w-full rounded-md border border-edge bg-base px-3 py-2 text-sm outline-none focus:border-accent"
+              value={selectedOutput?.id ?? playback.outputDevice ?? ""}
+              onchange={(e) => selectOutput(e.currentTarget.value)}
+            >
+              <option value="">{m.settings_output_default()}</option>
+              {#if selectedOutputMissing && playback.outputDevice}
+                <option value={playback.outputDevice} disabled>
+                  {m.settings_output_unavailable({ device: selectedOutputName })}
+                </option>
+              {/if}
+              <!-- by id: two devices can share a name ("Speakers") -->
+              {#each audioDevices.devices as device (device.id)}
+                <option value={device.id}>{device.name}</option>
+              {/each}
+            </select>
+          </label>
+          {#if playingOnFallback && playback.outputDevice}
+            <div
+              class="mt-1.5 flex max-w-lg flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-ink-muted"
+            >
+              <span>
+                {selectedOutputMissing
+                  ? m.settings_output_fallback_missing({ device: selectedOutputName })
+                  : m.settings_output_fallback_returned({ device: selectedOutputName })}
+              </span>
+              <!-- The select already shows this device, so picking it there
+                   changes nothing: going back needs its own button. -->
+              {#if !selectedOutputMissing}
+                <button
+                  class="rounded-full border border-edge px-3 py-1 text-xs text-ink transition-colors hover:border-ink-muted disabled:opacity-40"
+                  disabled={restoringOutput}
+                  onclick={() => void restoreOutput()}
+                >
+                  {m.settings_output_switch_back({ device: selectedOutputName })}
+                </button>
+              {/if}
+            </div>
           {/if}
-        </label>
+        </div>
       {/if}
 
       {#if audioProfiles}
@@ -767,7 +905,7 @@
             <p class="mt-0.5 max-w-md text-xs text-ink-muted">{m.settings_audio_profiles_hint()}</p>
             {#if audioProfiles.enabled && activeDevice}
               <p class="mt-1 max-w-md text-xs text-ink-muted">
-                {m.settings_audio_profiles_active({ device: activeDevice })}
+                {m.settings_audio_profiles_active({ device: activeDevice.name })}
               </p>
             {/if}
           </div>
@@ -782,23 +920,20 @@
           <div class="mt-3">
             <p class="mb-1.5 text-xs text-ink-muted">{m.settings_audio_profiles_saved()}</p>
             <ul class="flex flex-wrap gap-2">
-              {#each audioProfiles.devices as device (device)}
+              {#each audioProfiles.devices as device (device.id)}
+                {@const current = device.id === activeDevice?.id}
                 <li
                   class="inline-flex max-w-full items-center rounded-full border text-xs
-                    {device === activeDevice
-                    ? 'border-accent bg-accent/10 text-ink'
-                    : 'border-edge text-ink-muted'}"
+                    {current ? 'border-accent bg-accent/10 text-ink' : 'border-edge text-ink-muted'}"
                 >
-                  <span class="min-w-0 truncate py-1 pr-1 pl-3" title={device}>
-                    {device}{device === activeDevice
-                      ? ` · ${m.settings_audio_profiles_current()}`
-                      : ""}
+                  <span class="min-w-0 truncate py-1 pr-1 pl-3" title={device.name}>
+                    {device.name}{current ? ` · ${m.settings_audio_profiles_current()}` : ""}
                   </span>
                   <button
                     class="shrink-0 rounded-full py-1 pr-2 pl-1 text-ink-muted transition-colors hover:text-red-400"
-                    aria-label={m.settings_audio_profiles_delete({ device })}
-                    title={m.settings_audio_profiles_delete({ device })}
-                    onclick={() => void deleteAudioProfile(device)}
+                    aria-label={m.settings_audio_profiles_delete({ device: device.name })}
+                    title={m.settings_audio_profiles_delete({ device: device.name })}
+                    onclick={() => void deleteAudioProfile(device.id)}
                   >
                     <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
                       <path
@@ -961,14 +1096,79 @@
             }}
           />
           <button
-            class="shrink-0 rounded-full bg-accent px-4 py-1.5 text-sm font-bold text-(--color-on-accent) transition-colors hover:bg-accent-hover"
+            class="shrink-0 rounded-full bg-accent px-4 py-1.5 text-sm font-bold text-(--color-on-accent) transition-colors hover:bg-accent-hover disabled:opacity-50"
+            disabled={!extras.listenbrainzToken?.trim()}
             onclick={saveToken}
           >
             {m.settings_save()}
           </button>
+          {#if extras.listenbrainzConfigured}
+            <button
+              class="shrink-0 rounded-full border border-edge px-4 py-1.5 text-sm font-bold text-ink-muted transition-colors hover:border-red-400 hover:text-red-400"
+              onclick={removeToken}
+            >
+              {m.settings_listenbrainz_remove()}
+            </button>
+          {/if}
         </div>
         <p class="mt-1.5 text-xs text-ink-muted">{m.settings_listenbrainz_hint()}</p>
       </label>
+    </section>
+
+    <section class="mb-8 rounded-lg bg-card p-5">
+      <h2 class="mb-4 text-sm font-semibold uppercase tracking-wider text-ink-muted">
+        {m.settings_sonic()}
+      </h2>
+      <label class="flex items-center justify-between gap-4">
+        <div>
+          <p class="text-sm font-medium">{m.settings_sonic_scan()}</p>
+          <p class="mt-0.5 max-w-md text-xs text-ink-muted">{m.settings_sonic_scan_hint()}</p>
+        </div>
+        <input
+          type="checkbox"
+          class="h-4 w-4 accent-(--color-accent)"
+          checked={sonic.status?.enabled ?? false}
+          onchange={(e) => player.run(sonic.setScan(e.currentTarget.checked))}
+        />
+      </label>
+      {#if sonic.status}
+        {@const status = sonic.status}
+        <p class="mt-3 text-xs text-ink-muted tabular-nums">
+          {#if status.total !== null}
+            {m.settings_sonic_progress({ analysed: status.analysed, total: status.total })}
+          {:else}
+            {m.settings_sonic_not_listed()}
+          {/if}
+          {#if status.running && status.current}
+            · {m.settings_sonic_current({ name: status.current })}
+          {/if}
+        </p>
+        {#if status.lastError}
+          <p class="mt-1 text-xs text-red-300">{m.error_generic({ message: status.lastError })}</p>
+        {/if}
+      {/if}
+      <p class="mt-3 max-w-md text-xs text-ink-muted">{m.settings_sonic_usage()}</p>
+    </section>
+
+    <section class="mb-8 rounded-lg bg-card p-5">
+      <h2 class="mb-4 text-sm font-semibold uppercase tracking-wider text-ink-muted">
+        {m.settings_history()}
+      </h2>
+      <label class="flex items-center justify-between gap-4">
+        <div>
+          <p class="text-sm font-medium">{m.settings_history_record()}</p>
+          <p class="mt-0.5 max-w-md text-xs text-ink-muted">{m.settings_history_record_hint()}</p>
+        </div>
+        <input
+          type="checkbox"
+          class="h-4 w-4 accent-(--color-accent)"
+          bind:checked={extras.recordHistory}
+          onchange={saveExtras}
+        />
+      </label>
+      <a href="/history" class="mt-3 inline-block text-xs font-semibold text-ink-muted underline hover:text-ink">
+        {m.settings_history_open()}
+      </a>
     </section>
 
     <section class="mb-8 rounded-lg bg-card p-5">
@@ -1001,6 +1201,7 @@
               <option value="genre">{m.settings_autodj_seed_genre()}</option>
               <option value="album">{m.settings_autodj_seed_album()}</option>
               <option value="playlist">{m.settings_autodj_seed_playlist()}</option>
+              <option value="sonic">{m.settings_autodj_seed_sonic()}</option>
             </select>
           </label>
           <label class="block">
@@ -1041,10 +1242,11 @@
           <span class="block break-all text-xs text-ink-muted">{session.info.serverUrl}</span>
         </p>
         <button
-          class="shrink-0 rounded-full border border-edge px-4 py-1.5 text-sm font-bold text-ink-muted transition-colors hover:border-red-400 hover:text-red-400"
+          class="shrink-0 rounded-full border border-edge px-4 py-1.5 text-sm font-bold text-ink-muted transition-colors hover:border-red-400 hover:text-red-400 disabled:pointer-events-none disabled:opacity-50"
+          disabled={signingOut}
           onclick={signOut}
         >
-          {m.settings_sign_out()}
+          {signingOut ? m.settings_signing_out() : m.settings_sign_out()}
         </button>
       </div>
     </section>

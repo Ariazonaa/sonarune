@@ -179,10 +179,14 @@ function raster(size, withField = true) {
         b = layer.c[2] * cov + b * (1 - cov);
         a = cov + a * (1 - cov);
       }
+      // The layers above composite premultiplied: the colour already carries
+      // its coverage. PNG and ICO store straight alpha, so it is divided back
+      // out -- left in, every antialiased edge would be darkened twice.
+      const k = a > 0 ? 1 / a : 0;
       const i = (y * size + x) << 2;
-      png.data[i] = Math.round(r);
-      png.data[i + 1] = Math.round(g);
-      png.data[i + 2] = Math.round(b);
+      png.data[i] = Math.round(r * k);
+      png.data[i + 1] = Math.round(g * k);
+      png.data[i + 2] = Math.round(b * k);
       png.data[i + 3] = Math.round(a * 255);
     }
   }

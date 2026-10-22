@@ -18,7 +18,9 @@ describe("updateErrorMessage", () => {
     ["update:unavailable", () => m.settings_update_error_unavailable()],
   ])("%s reads as its own sentence", (code, expected) => {
     expect(updateErrorMessage(code)).toBe(expected());
-    // Commands reject with a string, but an Error must map the same way.
+    // As the command rejects since the codes (`ErrorReport`, `appErrors.ts`).
+    expect(updateErrorMessage({ code, detail: code })).toBe(expected());
+    // A bare string (before the codes) or an Error must map the same way.
     expect(updateErrorMessage(new Error(code))).toBe(expected());
   });
 

@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import { api } from "#lib/api.js";
   import { apiLibrary } from "#lib/api/library.js";
+  import { errorMessage } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import BrandMark from "#lib/components/BrandMark.svelte";
   import SyncStatus from "#lib/components/SyncStatus.svelte";
@@ -11,6 +12,7 @@
   import { player } from "#lib/state/player.svelte.js";
   import { toast } from "#lib/state/toast.svelte.js";
   import { isOurDrag, readDrag } from "#lib/dragToPlaylist.js";
+  import { playlistAddedToast } from "#lib/playlistAdd.js";
   import type { PlaylistDto } from "#lib/types.js";
 
   const links = [
@@ -87,6 +89,12 @@
       icon: "M5 9.2h3V19H5V9.2zM10.6 5h2.8v14h-2.8V5zm5.6 8H19v6h-2.8v-6z",
     },
     {
+      href: "/history",
+      label: m.nav_history(),
+      // clock with a turning arrow
+      icon: "M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z",
+    },
+    {
       href: "/search",
       label: m.nav_search(),
       // magnifier
@@ -117,11 +125,12 @@
       const trackIds =
         payload.trackIds ?? (await api.getAlbum(payload.albumId!)).tracks.map((track) => track.id);
       if (trackIds.length === 0) return;
-      await apiLibrary.playlistAdd(playlist.id, trackIds);
+      const added = await apiLibrary.playlistAdd(playlist.id, trackIds);
       playlists.refresh();
-      toast.show(m.add_to_playlist_done({ name: playlist.name }));
+      const { message, kind } = playlistAddedToast(playlist.name, trackIds, added);
+      toast.show(message, { kind });
     } catch (e) {
-      player.error = String(e);
+      player.error = errorMessage(e);
     }
   }
 </script>
@@ -169,6 +178,11 @@
             ? 'text-ink'
             : 'text-ink-muted hover:text-ink'}
             {dropTarget === playlist.id ? 'bg-accent text-(--color-on-accent)' : ''}"
+          ondragenter={(event) => {
+            // Taken like `dragover`, or a drop while the list scrolls under
+            // the pointer is lost (see PlaylistTrackList.svelte).
+            if (isOurDrag(event)) event.preventDefault();
+          }}
           ondragover={(event) => {
             // Only ours: a file or a link dragged in must not look droppable.
             if (!isOurDrag(event)) return;

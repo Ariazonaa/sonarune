@@ -35,9 +35,15 @@ fn cache_path(app: &tauri::AppHandle, item_id: &str, tag: &str, size: u32) -> Op
 
 /// A cached cover, or `None` on a miss. A zero-length file is a leftover from
 /// a crashed/partial write — ignore it and re-fetch rather than serving a
-/// broken image.
+/// broken image. A file that is no image at all (a portal's page, cached
+/// before the fetch checked for that) is removed: served as immutable and
+/// touched on every hit, it would otherwise never leave the cache.
 fn read_cached(path: &Path) -> Option<Vec<u8>> {
     let bytes = std::fs::read(path).ok().filter(|bytes| !bytes.is_empty())?;
+    if !crate::api::looks_like_image(&bytes) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
     touch(path);
     Some(bytes)
 }
@@ -143,4 +149,36 @@ pub fn handle(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_cached;
+
+    #[test]
+    fn only_image_data_is_served_from_the_cover_cache() {
+        let dir =
+            std::env::temp_dir().join(format!("sonarune-proto-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+
+        let cover = dir.join("cover.img");
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        std::fs::write(&cover, jpeg).unwrap();
+        assert_eq!(read_cached(&cover).as_deref(), Some(&jpeg[..]));
+
+        // What a captive portal answered with before fetches were checked.
+        let portal = dir.join("portal.img");
+        std::fs::write(&portal, b"<!DOCTYPE html><title>Sign in</title>").unwrap();
+        assert_eq!(read_cached(&portal), None);
+        assert!(
+            !portal.exists(),
+            "the bad entry is dropped, not kept forever"
+        );
+
+        let empty = dir.join("empty.img");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(read_cached(&empty), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

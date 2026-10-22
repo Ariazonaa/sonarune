@@ -12,36 +12,32 @@
   }: {
     tracks: PlaylistTrackDto[];
     busy?: boolean;
+    /** Why the clean-up did not happen, ready to show. */
     error?: string | null;
     onclose: () => void;
-    onconfirm: (entryIds: string[]) => void;
+    onconfirm: () => void;
   } = $props();
 
   const groups = $derived.by(() => {
-    const byTrack = new Map<
-      string,
-      { track: PlaylistTrackDto["track"]; positions: number[]; entryIds: string[] }
-    >();
+    const byTrack = new Map<string, { track: PlaylistTrackDto["track"]; positions: number[] }>();
     for (const [index, entry] of tracks.entries()) {
       const group = byTrack.get(entry.track.id);
       if (group) {
         group.positions.push(index + 1);
-        group.entryIds.push(entry.entryId);
       } else {
-        byTrack.set(entry.track.id, {
-          track: entry.track,
-          positions: [index + 1],
-          entryIds: [entry.entryId],
-        });
+        byTrack.set(entry.track.id, { track: entry.track, positions: [index + 1] });
       }
     }
-    return [...byTrack.values()].filter((group) => group.entryIds.length > 1);
+    return [...byTrack.values()].filter((group) => group.positions.length > 1);
   });
 
-  // Keep the first occurrence of every item and remove later playlist entries
-  // by their unique entry ids. Never use the (possibly duplicated) item id for
-  // a mutation.
-  const removeEntryIds = $derived(groups.flatMap((group) => group.entryIds.slice(1)));
+  // The first occurrence of every track stays, the later ones go. Not by entry
+  // id: on Jellyfin 10.11 that is the track's id, the same for every copy, and
+  // removing by it would take the one to keep as well — the backend rewrites
+  // the playlist with each track once instead.
+  const removeCount = $derived(
+    groups.reduce((count, group) => count + group.positions.length - 1, 0),
+  );
 
   function onKeydown(event: KeyboardEvent) {
     // defaultPrevented: an overlay on top (a confirmation) already handled it.
@@ -74,9 +70,9 @@
       <div class="min-w-0">
         <h2 class="text-md font-bold tracking-tight">{m.playlist_duplicates_title()}</h2>
         <p class="mt-1 text-sm text-ink-muted">
-          {(removeEntryIds.length === 1
+          {(removeCount === 1
             ? m.playlist_duplicates_preview_one
-            : m.playlist_duplicates_preview_many)({ count: removeEntryIds.length })}
+            : m.playlist_duplicates_preview_many)({ count: removeCount })}
         </p>
       </div>
       <button
@@ -124,7 +120,7 @@
 
     {#if error}
       <p class="mx-5 mb-3 rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
-        {m.error_generic({ message: error })}
+        {error}
       </p>
     {/if}
 
@@ -138,10 +134,10 @@
       </button>
       <button
         class="rounded-full bg-accent px-4 py-1.5 text-sm font-bold text-(--color-on-accent) transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
-        onclick={() => onconfirm(removeEntryIds)}
-        disabled={busy || removeEntryIds.length === 0}
+        onclick={() => onconfirm()}
+        disabled={busy || removeCount === 0}
       >
-        {m.playlist_duplicates_confirm({ count: removeEntryIds.length })}
+        {m.playlist_duplicates_confirm({ count: removeCount })}
       </button>
     </div>
   </div>

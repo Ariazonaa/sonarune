@@ -11,6 +11,17 @@ pub enum CloseBehavior {
     Tray,
 }
 
+/// Which releases an update check considers (see updater.rs). Beta takes the
+/// newest of both: a beta tester gets the stable release that follows a beta
+/// too, instead of staying behind on the beta.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DesktopSettings {
@@ -21,6 +32,9 @@ pub struct DesktopSettings {
     /// (see updater.rs). Off means the app never talks to GitHub on its own;
     /// the button in Settings still checks on demand.
     pub auto_check_updates: bool,
+    /// Stable unless asked for. Leaving beta installs nothing older: the beta
+    /// stays until a stable release is newer than it.
+    pub update_channel: UpdateChannel,
 }
 
 impl Default for DesktopSettings {
@@ -30,6 +44,7 @@ impl Default for DesktopSettings {
             start_minimized: false,
             cover_cache_limit_mb: DEFAULT_LIMIT_MB,
             auto_check_updates: true,
+            update_channel: UpdateChannel::Stable,
         }
     }
 }
@@ -59,7 +74,17 @@ pub fn save(store: &Store, settings: DesktopSettings) -> AppResult<DesktopSettin
 
 #[cfg(test)]
 mod tests {
-    use super::DesktopSettings;
+    use super::{DesktopSettings, UpdateChannel};
+
+    #[test]
+    fn settings_from_before_the_channel_stay_on_stable() {
+        let old: DesktopSettings = serde_json::from_str(
+            r#"{"closeBehavior":"tray","startMinimized":false,"coverCacheLimitMb":256,"autoCheckUpdates":true}"#,
+        )
+        .unwrap();
+        assert_eq!(old.update_channel, UpdateChannel::Stable);
+        assert_eq!(serde_json::to_value(UpdateChannel::Beta).unwrap(), "beta");
+    }
 
     #[test]
     fn cache_limit_is_bounded() {
