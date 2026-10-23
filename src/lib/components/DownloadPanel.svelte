@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { errorCause } from "#lib/appErrors.js";
   import { m } from "#lib/paraglide/messages.js";
   import { downloads } from "#lib/state/downloads.svelte.js";
   import type { DownloadTask } from "#lib/types.js";
@@ -45,8 +46,8 @@
     <div class="flex items-start gap-3">
       <div class="min-w-0 flex-1">
         <p class="truncate text-sm font-semibold" title={task.name}>{task.name}</p>
-        <p class="truncate text-xs text-ink-muted" title={task.error ?? undefined}>
-          {task.error ?? status(task)}
+        <p class="truncate text-xs text-ink-muted" title={task.error?.detail}>
+          {task.error ? errorCause(task.error) : status(task)}
         </p>
       </div>
       {#if task.status === "queued" || task.status === "downloading"}

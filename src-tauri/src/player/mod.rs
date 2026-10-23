@@ -1087,9 +1087,9 @@ fn open_renewing<T>(
     }
 }
 
-/// A fetch of the player's own on the async runtime (the Auto-DJ mix) on
-/// `client`: a 401 gets one renewal (`renew`) and one more try, and `client`
-/// is the renewed session from then on.
+/// A fetch of the player's own on the async runtime (the Auto-DJ mix, the
+/// playback reports) on `client`: a 401 gets one renewal (`renew`) and one
+/// more try, and `client` is the renewed session from then on.
 async fn fetch_renewing<T, Fetched, Renewed>(
     client: &mut Arc<JellyfinClient>,
     fetch: impl Fn(Arc<JellyfinClient>) -> Fetched,
@@ -1529,12 +1529,21 @@ const BROKE_OFF_SHORT_MS: u64 = 5_000;
 /// position fetches from there to the end first and fills in the part before
 /// it only then, so a track reopened near its end plays out while that fill
 /// still runs. A short stop alone proves nothing either: a damaged frame also
-/// ends a decoder, with the whole file on disk. A live transcode has no
-/// length to tell by and never counts as broken off.
-fn stream_broke_off(stopped_at_ms: u64, duration_ms: u64, download: Option<(f64, f64)>) -> bool {
+/// ends a decoder, with the whole file on disk.
+///
+/// A live transcode (`live`) has no download to tell by, but the server
+/// transcodes to the end of the track: one that ends clearly short of the
+/// track's length was cut off (ffmpeg killed or crashed, the server
+/// restarted), and its end comes as cleanly as a natural one.
+fn stream_broke_off(
+    stopped_at_ms: u64,
+    duration_ms: u64,
+    download: Option<(f64, f64)>,
+    live: bool,
+) -> bool {
     duration_ms > 0
         && stopped_at_ms.saturating_add(BROKE_OFF_SHORT_MS) < duration_ms
-        && download.is_some_and(|(_, end)| end < 1.0)
+        && (live || download.is_some_and(|(_, end)| end < 1.0))
 }
 
 /// `player:stream-broke-off` — the track stopped early because its stream
@@ -3356,8 +3365,14 @@ impl Worker {
                 // saved first, as shutdown does.
                 self.save_volume();
                 self.persist_position();
+                let position_ms = self.position_ms();
                 let report = self.take_final_report(true);
                 self.stop_internal();
+                // The installer can fail to start, and the process carries
+                // on: Play continues where it stopped, as after a restart. A
+                // sign-out resets the queue next, which takes this along.
+                self.position_offset_ms = position_ms;
+                self.emit();
                 if let Some(report) = report {
                     self.send_final_report(report);
                 }
@@ -4423,9 +4438,10 @@ impl Worker {
             .current_download
             .as_ref()
             .is_some_and(|download| download.decoder_failed());
+        let live = self.transcoding();
         if let Some(prev) = self.queue.get(self.index).cloned() {
             self.report_stopped(&prev, stopped_at);
-            if !crashed && stream_broke_off(stopped_at, prev.duration_ms, download) {
+            if !crashed && stream_broke_off(stopped_at, prev.duration_ms, download, live) {
                 // Not on to the next track as if nothing happened: stop on
                 // this one, where it broke off, so Play continues it there.
                 tracing::warn!("the stream broke off at {stopped_at} ms");
@@ -5465,11 +5481,15 @@ impl Worker {
                 tracing::error!("cannot open audio output: {e}");
                 self.output_alive = false;
                 self.report_error(PlayerErrorEvent::no_fallback_output(failed, &e));
+                let position_ms = self.position_ms();
                 // Close the Jellyfin play session like any other stop.
                 if self.status != PlaybackStatus::Idle {
                     self.report_stopped_playing();
                 }
                 self.stop_internal();
+                // Play continues where the output died, once one opens.
+                self.position_offset_ms = position_ms;
+                self.emit();
             }
         }
     }
@@ -5818,9 +5838,16 @@ impl Worker {
         self.play_session_id = Some(session_id.clone());
         if let Some(client) = self.session_client() {
             let item_id = track.item_id.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = client.report_start(&item_id, &session_id).await {
-                    tracing::debug!("report start failed: {e}");
+            // Not always 0: a resume after a restart or a failed update, or
+            // a seek made while the track was starting.
+            let position_ms = self.position_ms();
+            let transcoding = self.transcoding();
+            self.spawn_report(client, "start", move |client| {
+                let (item_id, session_id) = (item_id.clone(), session_id.clone());
+                async move {
+                    client
+                        .report_start(&item_id, &session_id, position_ms, transcoding)
+                        .await
                 }
             });
         }
@@ -5838,15 +5865,50 @@ impl Worker {
         if let Some(client) = self.session_client() {
             let item_id = track.item_id.clone();
             let position_ms = self.position_ms();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = client
-                    .report_progress(&item_id, &session_id, position_ms, is_paused)
-                    .await
-                {
-                    tracing::debug!("report progress failed: {e}");
+            let transcoding = self.transcoding();
+            self.spawn_report(client, "progress", move |client| {
+                let (item_id, session_id) = (item_id.clone(), session_id.clone());
+                async move {
+                    client
+                        .report_progress(&item_id, &session_id, position_ms, is_paused, transcoding)
+                        .await
                 }
             });
         }
+    }
+
+    /// Whether the current track comes as a live transcode (see
+    /// [`DownloadProgress::is_live`]).
+    fn transcoding(&self) -> bool {
+        self.current_download
+            .as_ref()
+            .is_some_and(|download| download.is_live())
+    }
+
+    /// Send a playback report on the async runtime. A 401 (the device removed
+    /// while the window sits in the tray) gets one renewal and one more try,
+    /// as every other caller does: a "stopped" lost to it is a play the
+    /// server never counts. The final reports go without (see
+    /// [`Self::send_final_report`]): the session or the process ends with
+    /// them, and a sign-out holds the renewal gate meanwhile.
+    fn spawn_report<Sent>(
+        &self,
+        client: Arc<JellyfinClient>,
+        what: &'static str,
+        send: impl Fn(Arc<JellyfinClient>) -> Sent + Send + 'static,
+    ) where
+        Sent: std::future::Future<Output = AppResult<()>> + Send + 'static,
+    {
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            let renew = move |stale: Arc<JellyfinClient>, unauthorized| async move {
+                crate::commands::renew_session(&app, &stale, Instant::now(), unauthorized).await
+            };
+            let mut client = client;
+            if let Err(e) = fetch_renewing(&mut client, send, renew).await {
+                tracing::debug!("report {what} failed: {e}");
+            }
+        });
     }
 
     /// Report a specific track as stopped at a specific position. `track` is
@@ -5882,12 +5944,12 @@ impl Worker {
         };
         if let Some(client) = self.session_client() {
             let item_id = track.item_id.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = client
-                    .report_stopped(&item_id, &session_id, position_ms)
-                    .await
-                {
-                    tracing::debug!("report stopped failed: {e}");
+            self.spawn_report(client, "stopped", move |client| {
+                let (item_id, session_id) = (item_id.clone(), session_id.clone());
+                async move {
+                    client
+                        .report_stopped(&item_id, &session_id, position_ms)
+                        .await
                 }
             });
         }
@@ -8783,30 +8845,75 @@ mod tests {
     }
 
     #[test]
-    fn only_a_short_stop_with_the_download_unfinished_is_a_broken_stream() {
+    fn a_short_stop_with_the_download_unfinished_or_a_cut_transcode_is_a_broken_stream() {
         let four_minutes = 240_000;
         // Played through, all downloaded.
-        assert!(!stream_broke_off(240_000, four_minutes, Some((0.0, 1.0))));
+        assert!(!stream_broke_off(
+            240_000,
+            four_minutes,
+            Some((0.0, 1.0)),
+            false
+        ));
         // The connection died at 40 %: the download stopped there, and so
         // did the music.
-        assert!(stream_broke_off(96_000, four_minutes, Some((0.0, 0.45))));
+        assert!(stream_broke_off(
+            96_000,
+            four_minutes,
+            Some((0.0, 0.45)),
+            false
+        ));
         // Same after a reopen at 2:00, which downloads from there on.
-        assert!(stream_broke_off(150_000, four_minutes, Some((0.5, 0.65))));
+        assert!(stream_broke_off(
+            150_000,
+            four_minutes,
+            Some((0.5, 0.65)),
+            false
+        ));
         // Reopened at 3:55 (a seek, a device switch, Play after an error):
         // the rest of the file came first and played out, while the part
         // before 3:55 is still being filled in. That is a natural end.
-        assert!(!stream_broke_off(240_000, four_minutes, Some((0.0, 0.3))));
+        assert!(!stream_broke_off(
+            240_000,
+            four_minutes,
+            Some((0.0, 0.3)),
+            false
+        ));
         // A stated length a little off makes no difference either.
-        assert!(!stream_broke_off(237_000, four_minutes, Some((0.0, 0.3))));
-        assert!(!stream_broke_off(235_000, four_minutes, Some((0.0, 0.3))));
-        assert!(stream_broke_off(234_999, four_minutes, Some((0.0, 0.3))));
+        assert!(!stream_broke_off(
+            237_000,
+            four_minutes,
+            Some((0.0, 0.3)),
+            false
+        ));
+        assert!(!stream_broke_off(
+            235_000,
+            four_minutes,
+            Some((0.0, 0.3)),
+            false
+        ));
+        assert!(stream_broke_off(
+            234_999,
+            four_minutes,
+            Some((0.0, 0.3)),
+            false
+        ));
         // Stopped short with the whole file on disk: a damaged frame, not
         // the stream.
-        assert!(!stream_broke_off(96_000, four_minutes, Some((0.0, 1.0))));
-        // A live transcode has no length to tell by; nor has a track
-        // without a duration.
-        assert!(!stream_broke_off(96_000, four_minutes, None));
-        assert!(!stream_broke_off(96_000, 0, Some((0.0, 0.45))));
+        assert!(!stream_broke_off(
+            96_000,
+            four_minutes,
+            Some((0.0, 1.0)),
+            false
+        ));
+        // Nothing to tell by: no download range and no transcode, or a
+        // track without a duration.
+        assert!(!stream_broke_off(96_000, four_minutes, None, false));
+        assert!(!stream_broke_off(96_000, 0, Some((0.0, 0.45)), false));
+        // A live transcode the server cut off at 1:36 ends as cleanly as
+        // one that ran to the end; only where it ended tells them apart.
+        assert!(stream_broke_off(96_000, four_minutes, None, true));
+        assert!(!stream_broke_off(236_000, four_minutes, None, true));
+        assert!(!stream_broke_off(96_000, 0, None, true));
     }
 
     #[test]

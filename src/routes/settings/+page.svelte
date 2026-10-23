@@ -1144,7 +1144,7 @@
           {/if}
         </p>
         {#if status.lastError}
-          <p class="mt-1 text-xs text-red-300">{m.error_generic({ message: status.lastError })}</p>
+          <p class="mt-1 text-xs text-red-300">{m.error_generic({ message: errorCause(status.lastError) })}</p>
         {/if}
       {/if}
       <p class="mt-3 max-w-md text-xs text-ink-muted">{m.settings_sonic_usage()}</p>

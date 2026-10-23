@@ -111,6 +111,9 @@ const CAUSES: Record<string, (report: AppErrorReport) => string> = {
   fileMissing: () => m.error_file_missing(),
   fileBrowser: () => m.error_file_browser(),
   downloadMissing: () => m.error_download_missing(),
+  downloadWrite: () => m.error_download_write(),
+  downloadTooLarge: () => m.error_download_too_large(),
+  downloadNameTaken: () => m.error_download_name_taken(),
   diagnosticsFailed: () => m.error_diagnostics_failed(),
   coverCache: () => m.error_cover_cache(),
   taskFailed: () => m.error_task_failed(),
@@ -122,7 +125,8 @@ export const WORDED_CODES: readonly string[] = [...Object.keys(CAUSES), "server"
 
 /**
  * What went wrong, as a clause in the user's language — the part after
- * "Something went wrong:" (`error_generic`), and the cause of a player error.
+ * "Something went wrong:" (`error_generic`), the cause of a player error, and
+ * the error line of a download or of the sonic scan.
  * A code there are no words for (`other`, `audio`, an area's own code, a new
  * code from a newer backend) shows its detail.
  */
@@ -149,6 +153,7 @@ const WITH_REASON: ReadonlySet<string> = new Set([
   "settingsUnsaved",
   "settingsExport",
   "downloadsFolder",
+  "downloadWrite",
   "diagnosticsFailed",
   "coverCache",
   "fileBrowser",

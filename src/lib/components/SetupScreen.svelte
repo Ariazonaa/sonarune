@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
   import { api } from "#lib/api.js";
-  import { errorMessage } from "#lib/appErrors.js";
+  import { errorMessage, isNotFound } from "#lib/appErrors.js";
   import BrandMark from "#lib/components/BrandMark.svelte";
   import { normalizeServerUrl } from "#lib/serverUrl.js";
   import { session } from "#lib/state/session.svelte.js";
@@ -114,6 +114,12 @@
             session.info = info;
           }
         } catch (e) {
+          // The server forgets a code nobody approved after a few minutes.
+          if (isNotFound(e)) {
+            stopQuickConnect();
+            error = m.setup_quick_connect_expired();
+            return;
+          }
           failures += 1;
           if (failures >= MAX_CONSECUTIVE_POLL_FAILURES) {
             stopQuickConnect();

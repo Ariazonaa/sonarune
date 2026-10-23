@@ -219,7 +219,7 @@ describe("the panel's share of a long list", () => {
   it("keeps the failed and cancelled apart, so many completed ones cannot hide them", () => {
     // 2000 tracks: about 100 fail early, the rest completes after them.
     const failed = Array.from({ length: 100 }, (_, n) =>
-      task(`x${n}`, n % 4 ? "failed" : "cancelled", { error: n % 4 ? "server returned 500" : null }),
+      task(`x${n}`, n % 4 ? "failed" : "cancelled", { error: n % 4 ? { code: "server", status: 500, detail: "server returned 500" } : null }),
     );
     const done = Array.from({ length: 1900 }, (_, n) => task(`c${n}`, "completed"));
     const view = panelView([...failed, ...done]);

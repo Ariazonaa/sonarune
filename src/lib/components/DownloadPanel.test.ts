@@ -102,7 +102,11 @@ describe("the download panel", () => {
 
     changed(task("t0", "downloading"));
     changed(task("t0", "completed", { path: "C:/t0.flac" }), task("t1", "downloading"));
-    changed(task("t1", "failed", { error: "server returned 500" }));
+    changed(
+      task("t1", "failed", {
+        error: { code: "server", status: 500, reason: "Internal Server Error", detail: "server returned 500" },
+      }),
+    );
     // The collapsed button counts what is still to do.
     expect(host.textContent).toContain(String(3000 - 2));
 
@@ -114,7 +118,9 @@ describe("the download panel", () => {
     const completed = texts.findIndex((text) => text.includes("t0.flac"));
     expect(failed).toBeGreaterThan(PANEL_ROWS);
     expect(completed).toBe(failed + 1);
-    expect(texts[failed]).toContain("server returned 500");
+    // Worded, not the English it was raised with.
+    expect(texts[failed]).toContain(m.player_error_cause_server({ status: "500" }));
+    expect(texts[failed]).not.toContain("server returned 500");
     expect(texts[completed]).toContain(m.download_status_completed());
   });
 
@@ -123,7 +129,7 @@ describe("the download panel", () => {
     backend = {
       revision: ++revision,
       tasks: [
-        ...Array.from({ length: 100 }, (_, n) => task(`x${n}`, "failed", { error: `error ${n}` })),
+        ...Array.from({ length: 100 }, (_, n) => task(`x${n}`, "failed", { error: { code: "network", detail: `error ${n}` } })),
         ...Array.from({ length: 2900 }, (_, n) => task(`c${n}`, "completed")),
       ],
     };

@@ -2936,7 +2936,9 @@ mod tests {
             let (b, b_handle) = started(second());
             assert!(a_handle.couple(&b_handle, rate(48_000)), "converted anew");
             eventually("B converted anew", || offered(&b_handle).0 >= 20_000);
-            drop(b);
+            // Moved while its source is still there, as the player does
+            // (`restart_at`, `refit`): a thread whose source is gone with no
+            // new ring waiting may have ended already.
             let parked = park.then(|| {
                 b_handle
                     .reposition(Duration::from_secs(1), rate(44_100))
@@ -2945,6 +2947,7 @@ mod tests {
             let mut moved = b_handle
                 .reposition(Duration::from_secs(1), rate(48_000))
                 .expect("moved");
+            drop(b);
             drop(parked);
             assert!(b_handle.shared.offer.load(Ordering::SeqCst).is_null());
             assert_eq!(moved.sample_rate().get(), 48_000);

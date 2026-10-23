@@ -175,6 +175,15 @@ fn hidden_entries(stored: &[String], listed: &[String]) -> usize {
         .count()
 }
 
+/// The `PlayMethod` of a playback report.
+fn play_method(transcoding: bool) -> &'static str {
+    if transcoding {
+        "Transcode"
+    } else {
+        "DirectPlay"
+    }
+}
+
 /// Most of a non-2xx body read for the error message — a proxy's error page
 /// can be arbitrarily large and is never worth buffering whole.
 const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
@@ -1744,16 +1753,24 @@ impl JellyfinClient {
     // --- Playback reporting (drives play counts, "recently played", and
     // server-side scrobble plugins). Ticks are .NET ticks: 100 ns. ---
 
-    pub async fn report_start(&self, item_id: &str, play_session_id: &str) -> AppResult<()> {
+    /// `transcoding`: the server transcodes the stream (it did not take the
+    /// container), so its dashboard says so instead of "direct play".
+    pub async fn report_start(
+        &self,
+        item_id: &str,
+        play_session_id: &str,
+        position_ms: u64,
+        transcoding: bool,
+    ) -> AppResult<()> {
         self.post_no_content(
             "/Sessions/Playing",
             serde_json::json!({
                 "ItemId": item_id,
                 "PlaySessionId": play_session_id,
-                "PositionTicks": 0,
+                "PositionTicks": position_ms * 10_000,
                 "CanSeek": true,
                 "IsPaused": false,
-                "PlayMethod": "DirectPlay",
+                "PlayMethod": play_method(transcoding),
                 "RepeatMode": "RepeatNone",
             }),
         )
@@ -1766,6 +1783,7 @@ impl JellyfinClient {
         play_session_id: &str,
         position_ms: u64,
         is_paused: bool,
+        transcoding: bool,
     ) -> AppResult<()> {
         self.post_no_content(
             "/Sessions/Playing/Progress",
@@ -1775,7 +1793,7 @@ impl JellyfinClient {
                 "PositionTicks": position_ms * 10_000,
                 "CanSeek": true,
                 "IsPaused": is_paused,
-                "PlayMethod": "DirectPlay",
+                "PlayMethod": play_method(transcoding),
                 "RepeatMode": "RepeatNone",
             }),
         )
