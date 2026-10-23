@@ -2,7 +2,7 @@ use crate::api::JellyfinClient;
 use crate::commands::{
     collision_filename, filename_len, sanitize_filename, truncate_to_filename_len, MAX_FILENAME_LEN,
 };
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorReport};
 use crate::player::SharedSession;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -55,7 +55,8 @@ pub struct DownloadTask {
     pub received_bytes: u64,
     pub total_bytes: Option<u64>,
     pub path: Option<String>,
-    pub error: Option<String>,
+    /// Why it failed, worded by the UI (`src/lib/appErrors.ts`).
+    pub error: Option<ErrorReport>,
     /// The list's revision at this task's last change. The UI keeps the newer
     /// of two copies of a task by it, whichever way they reached it.
     pub revision: u64,
@@ -206,7 +207,12 @@ pub struct DownloadManager {
 
 enum RunError {
     Cancelled,
-    Failed(String),
+    Failed(AppError),
+}
+
+/// A failure of the download's own, in words `error.rs` gives a code.
+fn failed(message: impl Into<String>) -> RunError {
+    RunError::Failed(AppError::Other(message.into()))
 }
 
 struct PartGuard {
@@ -442,11 +448,7 @@ impl DownloadManager {
             }
         };
         let Ok(_permit) = permit else {
-            self.finish(
-                &id,
-                attempt,
-                Err(RunError::Failed("download queue closed".into())),
-            );
+            self.finish(&id, attempt, Err(failed("download queue closed")));
             return;
         };
         if cancel.load(Ordering::Acquire) {
@@ -470,21 +472,19 @@ impl DownloadManager {
         let item_id = self
             .task(id, attempt)
             .map(|task| task.item_id)
-            .ok_or_else(|| RunError::Failed("download not found".into()))?;
+            .ok_or_else(|| failed("download not found"))?;
         let client = self
             .inner
             .session
             .read()
             .await
             .clone()
-            .ok_or_else(|| RunError::Failed(AppError::NotConnected.to_string()))?;
+            .ok_or(RunError::Failed(AppError::NotConnected))?;
         // Race the request stage against cancellation too: the download
         // client's timeout is hours long, and a stalled server would otherwise
         // keep a cancelled task holding one of the concurrency slots.
         let (mut response, filename) = tokio::select! {
-            result = self.request(client, &item_id) => {
-                result.map_err(|error| RunError::Failed(error.to_string()))?
-            }
+            result = self.request(client, &item_id) => result.map_err(RunError::Failed)?,
             _ = cancel_wake.notified() => return Err(RunError::Cancelled),
         };
         if cancel.load(Ordering::Acquire) {
@@ -499,7 +499,7 @@ impl DownloadManager {
         });
         let destination = self
             .reserve_destination(&filename)
-            .map_err(|error| RunError::Failed(error.to_string()))?;
+            .map_err(|error| failed(error.to_string()))?;
         let result = async {
             let part = part_path(&destination, id, attempt);
             let mut file = tokio::fs::OpenOptions::new()
@@ -507,9 +507,7 @@ impl DownloadManager {
                 .create_new(true)
                 .open(&part)
                 .await
-                .map_err(|error| {
-                    RunError::Failed(format!("cannot create partial download: {error}"))
-                })?;
+                .map_err(|error| failed(format!("cannot create partial download: {error}")))?;
             let guard = PartGuard::new(part.clone());
 
             let mut received = 0u64;
@@ -519,9 +517,8 @@ impl DownloadManager {
                     return Err(RunError::Cancelled);
                 }
                 let chunk = tokio::select! {
-                    chunk = response.chunk() => {
-                        chunk.map_err(|error| RunError::Failed(error.to_string()))?
-                    }
+                    // Through `AppError`, which strips the URL off a body error.
+                    chunk = response.chunk() => chunk.map_err(|error| RunError::Failed(error.into()))?,
                     _ = cancel_wake.notified() => return Err(RunError::Cancelled),
                 };
                 let Some(chunk) = chunk else { break };
@@ -532,13 +529,11 @@ impl DownloadManager {
                     declared.saturating_add(DOWNLOAD_OVERRUN_SLACK)
                 });
                 if received > ceiling {
-                    return Err(RunError::Failed(
-                        "download exceeded the expected size".into(),
-                    ));
+                    return Err(failed("download exceeded the expected size"));
                 }
                 file.write_all(&chunk)
                     .await
-                    .map_err(|error| RunError::Failed(format!("download write failed: {error}")))?;
+                    .map_err(|error| failed(format!("download write failed: {error}")))?;
                 if last_emit.elapsed() >= PROGRESS_INTERVAL {
                     self.update_progress(id, attempt, received);
                     last_emit = Instant::now();
@@ -546,10 +541,10 @@ impl DownloadManager {
             }
             file.flush()
                 .await
-                .map_err(|error| RunError::Failed(format!("download flush failed: {error}")))?;
+                .map_err(|error| failed(format!("download flush failed: {error}")))?;
             file.sync_all()
                 .await
-                .map_err(|error| RunError::Failed(format!("download sync failed: {error}")))?;
+                .map_err(|error| failed(format!("download sync failed: {error}")))?;
             drop(file);
             if cancel.load(Ordering::Acquire) {
                 return Err(RunError::Cancelled);
@@ -560,7 +555,7 @@ impl DownloadManager {
             }
             let destination = finalize(&part, &destination)
                 .await
-                .map_err(|error| RunError::Failed(format!("download finalize failed: {error}")))?;
+                .map_err(|error| failed(format!("download finalize failed: {error}")))?;
             guard.disarm();
             self.update_progress(id, attempt, received);
             Ok(destination)
@@ -629,9 +624,11 @@ impl DownloadManager {
                 task.error = None;
             }
             Err(RunError::Failed(error)) => {
+                let report = error.report();
+                tracing::debug!(code = %report.code, "download failed: {}", report.detail);
                 task.status = DownloadStatus::Failed;
                 task.path = None;
-                task.error = Some(error);
+                task.error = Some(report);
             }
         });
     }
@@ -929,7 +926,7 @@ fn open_folder(path: &Path) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_name, finalize, part_path, progress_wait, DownloadEvent, DownloadManager,
+        display_name, failed, finalize, part_path, progress_wait, DownloadEvent, DownloadManager,
         DownloadRequest, DownloadStatus, DownloadTask, RunError, PROGRESS_EMIT_INTERVAL,
     };
     use crate::commands::{collision_filename, filename_len, sanitize_filename, MAX_FILENAME_LEN};
@@ -1110,6 +1107,30 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_reaches_the_ui_as_a_code() {
+        let (manager, events, dir) = recording("code");
+        let added = manager.add(requests(1));
+        let id = added[0].id.clone();
+        start(&manager, &id);
+        take(&events);
+        manager.finish(
+            &id,
+            0,
+            Err(failed(
+                "download write failed: There is not enough space on the disk. (os error 112)",
+            )),
+        );
+        let sent = take(&events);
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = changed(&sent[0])[0].error.clone().expect("an error");
+        assert_eq!(error.code, "downloadWrite");
+        assert_eq!(
+            error.reason.as_deref(),
+            Some("There is not enough space on the disk. (os error 112)")
+        );
+    }
+
+    #[test]
     fn a_change_of_status_carries_the_progress_held_back() {
         let (manager, events, dir) = recording("carry");
         let added = manager.add(requests(2));
@@ -1120,13 +1141,19 @@ mod tests {
 
         manager.update_progress(&a, 0, 4096);
         assert!(take(&events).is_empty());
-        manager.finish(&b, 0, Err(RunError::Failed("server returned 500".into())));
+        manager.finish(&b, 0, Err(failed("server returned 500")));
         let sent = take(&events);
         assert_eq!(sent.len(), 1);
         let tasks = changed(&sent[0]);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].received_bytes, 4096);
         assert_eq!(tasks[1].status, DownloadStatus::Failed);
+        // A message of no known kind keeps its English for the UI to show.
+        let error = tasks[1].error.as_ref().expect("an error");
+        assert_eq!(
+            (error.code.as_ref(), error.detail.as_str()),
+            ("other", "server returned 500")
+        );
 
         // Nothing is left for the scheduled send.
         std::thread::sleep(PROGRESS_EMIT_INTERVAL + Duration::from_millis(300));
@@ -1178,13 +1205,9 @@ mod tests {
         let added = manager.add(requests(5));
         let ids: Vec<String> = added.iter().map(|task| task.id.clone()).collect();
         manager.finish(&ids[0], 0, Ok(dir.join("Track 0.flac")));
-        manager.finish(
-            &ids[1],
-            0,
-            Err(RunError::Failed("server returned 500".into())),
-        );
+        manager.finish(&ids[1], 0, Err(failed("server returned 500")));
         manager.cancel(&ids[2]).unwrap();
-        manager.finish(&ids[3], 0, Err(RunError::Failed("timed out".into())));
+        manager.finish(&ids[3], 0, Err(failed("timed out")));
         take(&events);
 
         assert_eq!(manager.retry_failed(), 3);
@@ -1258,7 +1281,7 @@ mod tests {
         manager.update(&ids[0], 0, |task| task.total_bytes = Some(10_000));
         manager.finish(&ids[0], 0, Ok(dir.join("Track 0.flac")));
         manager.cancel(&ids[2]).unwrap();
-        manager.finish(&ids[1], 0, Err(RunError::Failed("timed out".into())));
+        manager.finish(&ids[1], 0, Err(failed("timed out")));
         let sent = take(&events);
         let truth = manager.snapshot();
         let _ = std::fs::remove_dir_all(&dir);

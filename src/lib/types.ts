@@ -452,7 +452,8 @@ export interface DownloadTask extends DownloadRequest {
   receivedBytes: number;
   totalBytes: number | null;
   path: string | null;
-  error: string | null;
+  /** Why it failed (`errorCause` words it). */
+  error: AppErrorReport | null;
   /** The list's revision at this task's last change: of two copies of a
    *  task, the one with the higher revision is the newer. */
   revision: number;
@@ -584,7 +585,8 @@ export interface SonicScanStatus {
    *  null until a listing of this library is known. */
   total: number | null;
   current: string | null;
-  lastError: string | null;
+  /** The last failure (`errorCause` words it). */
+  lastError: AppErrorReport | null;
 }
 
 /** What the play history remembers of a track. */

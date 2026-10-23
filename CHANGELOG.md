@@ -7,6 +7,31 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-23
+
+### Changed
+
+- The error line of a failed download and the sonic scan's last error in
+  Settings are now in your language, like every other error message. A
+  download whose connection broke no longer shows the request's address.
+
+### Fixed
+
+- When an update's installer could not be started, Play began the paused
+  track from the start instead of where it was.
+- A Quick Connect code that expired before it was approved now says so,
+  instead of reporting a server error 404.
+- A track resumed partway through was reported to Jellyfin as starting at
+  0:00 until the next progress report.
+- Playback reports to Jellyfin now renew a revoked session like everything
+  else does. Before, a track that ended right after the device was removed
+  in the dashboard was never counted as played on the server.
+- When the audio device went away and no other one could be opened, Play
+  began the track from the start instead of where it was.
+- A server transcode that ended early (the server restarted, its ffmpeg
+  died) no longer counts as the end of the track: playback stops there with
+  the "stream broke off" message, and Play continues from that point.
+
 ## [0.7.0] — 2026-10-23
 
 0.6.1 was never released; everything it would have brought is part of 0.7.0.
@@ -359,7 +384,8 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/Ariazonaa/sonarune/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Ariazonaa/sonarune/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Ariazonaa/sonarune/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Ariazonaa/sonarune/compare/v0.5.0...v0.5.1

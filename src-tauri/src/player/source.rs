@@ -675,6 +675,11 @@ impl DownloadState {
         (end > start).then(|| (start as f64 / total as f64, end as f64 / total as f64))
     }
 
+    /// A live transcode: bytes arrived, but the stream has no length.
+    fn is_live(&self) -> bool {
+        self.total.load(Ordering::Relaxed) == 0 && self.end.load(Ordering::Relaxed) > 0
+    }
+
     /// The whole stream is on disk, gap-free from the first byte — so a native
     /// seek never waits on the network. Always false for a live transcode.
     pub fn is_complete(&self) -> bool {
@@ -745,6 +750,11 @@ impl DownloadProgress {
     /// See [`DownloadState::is_complete`].
     pub fn is_complete(&self) -> bool {
         self.state.is_complete()
+    }
+
+    /// See [`DownloadState::is_live`].
+    pub fn is_live(&self) -> bool {
+        self.state.is_live()
     }
 
     /// The download ended without the rest of the stream. A source that runs

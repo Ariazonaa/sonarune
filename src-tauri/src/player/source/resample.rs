@@ -1816,6 +1816,40 @@ pub(super) mod tests {
         );
     }
 
+    /// The same the other way round: 48 kHz tracks (Opus is always 48 kHz)
+    /// on a 44.1 kHz output, converted down.
+    #[test]
+    fn coupled_tracks_converted_down_come_out_as_one_piece() {
+        let piece: Vec<f32> = (0..3 * 48_000)
+            .flat_map(|n| {
+                let t = n as f64 / 48_000.0;
+                let s = 0.5 * (2.0 * PI * 80.0 * t).sin() + 0.2 * (2.0 * PI * 1_234.0 * t).sin();
+                [s as f32, -s as f32]
+            })
+            .collect();
+        // On the grid of both rates (147 · 160 · 2 frames) and off it.
+        let splits = [0, 47_040, 47_040 + 20_122, 3 * 48_000];
+        let parts: Vec<SamplesBuffer> = splits
+            .windows(2)
+            .map(|w| buffer(2, 48_000, piece[w[0] * 2..w[1] * 2].to_vec()))
+            .collect();
+        let whole = convert_all(buffer(2, 48_000, piece.clone()), 44_100);
+        let outs = convert_coupled(parts, 44_100);
+        for (out, w) in outs.iter().zip(splits.windows(2)) {
+            let share = converted_len(w[1] as u64, 48_000, 44_100)
+                - converted_len(w[0] as u64, 48_000, 44_100);
+            assert_eq!(out.len(), share as usize * 2, "split {w:?}");
+        }
+        let joined = outs.concat();
+        assert_eq!(joined.len(), whole.len(), "no frame more or less");
+        let worst = joined
+            .iter()
+            .zip(&whole)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(worst < 1e-5, "{worst} off the piece");
+    }
+
     #[test]
     fn coupled_tracks_ring_no_more_at_their_boundaries() {
         // The measurement that found it: one tone over four parts — 44.1 kHz

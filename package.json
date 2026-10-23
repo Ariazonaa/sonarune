@@ -1,6 +1,6 @@
 {
   "name": "sonarune",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": true,
   "description": "A fast Jellyfin desktop music client",
   "license": "GPL-3.0-or-later",

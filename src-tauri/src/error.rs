@@ -271,6 +271,22 @@ const KNOWN: &[(&str, Shape)] = &[
     ("fileBrowser", Shape::Starts("cannot open file browser: ")),
     ("downloadMissing", Shape::Is("download not found")),
     (
+        "downloadWrite",
+        Shape::Starts("cannot create partial download: "),
+    ),
+    ("downloadWrite", Shape::Starts("download write failed: ")),
+    ("downloadWrite", Shape::Starts("download flush failed: ")),
+    ("downloadWrite", Shape::Starts("download sync failed: ")),
+    ("downloadWrite", Shape::Starts("download finalize failed: ")),
+    (
+        "downloadTooLarge",
+        Shape::Is("download exceeded the expected size"),
+    ),
+    (
+        "downloadNameTaken",
+        Shape::Is("too many files with the same download name"),
+    ),
+    (
         "diagnosticsFailed",
         Shape::Starts("diagnostic export failed: "),
     ),

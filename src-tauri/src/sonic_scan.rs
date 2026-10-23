@@ -77,7 +77,8 @@ pub struct ScanStatus {
     pub total: Option<u64>,
     /// Name of a track being analysed right now.
     pub current: Option<String>,
-    pub last_error: Option<String>,
+    /// The last failure, worded by the UI (`src/lib/appErrors.ts`).
+    pub last_error: Option<crate::error::ErrorReport>,
 }
 
 #[derive(Clone)]
@@ -531,7 +532,7 @@ impl Scan {
             let page = match client.songs(start, PAGE).await {
                 Ok(page) => page,
                 Err(e) => {
-                    self.publish(|s| s.last_error = Some(e.to_string()));
+                    self.publish(|s| s.last_error = Some(e.report()));
                     if matches!(e, AppError::Server { status: 401, .. }) {
                         self.renew(client, e).await;
                     }
@@ -651,7 +652,7 @@ impl Scan {
                         } else {
                             server_trouble = true;
                         }
-                        failed = Some(e.to_string());
+                        failed = Some(e.report());
                         if matches!(e, AppError::Server { status: 401, .. }) {
                             unauthorized = Some(e);
                         }
