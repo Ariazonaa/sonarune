@@ -25,6 +25,7 @@ const session: SessionInfo = {
   userId: "user-1",
   canDelete: false,
   canEdit: false,
+  credentialsSaved: true,
 };
 
 beforeEach(() => localStorage.clear());

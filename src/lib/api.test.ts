@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { api, formatDuration } from "#lib/api.js";
+import { api, coverUrl, formatDuration, resetCoverUrlBase } from "#lib/api.js";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -140,5 +140,37 @@ describe("formatDuration", () => {
     expect(formatDuration(-4_000)).toBe("0:00");
     expect(formatDuration(Number.NaN)).toBe("0:00");
     expect(formatDuration(Number.POSITIVE_INFINITY)).toBe("0:00");
+  });
+});
+
+// The jfimg protocol has another URL form per webview: WebView2 (Windows)
+// http://jfimg.localhost/, WebKitGTK (Linux) and WKWebView (macOS)
+// jfimg://localhost/. Covers stayed blank on Linux while the Windows form was
+// hard-coded.
+describe("coverUrl", () => {
+  type Internals = { convertFileSrc: (path: string, protocol: string) => string };
+  const win = globalThis as { __TAURI_INTERNALS__?: Internals };
+
+  beforeEach(() => {
+    resetCoverUrlBase();
+    delete win.__TAURI_INTERNALS__;
+  });
+
+  it("takes the scheme's base from Tauri", () => {
+    win.__TAURI_INTERNALS__ = {
+      convertFileSrc: (path, protocol) => `${protocol}://localhost/${encodeURIComponent(path)}`,
+    };
+    expect(coverUrl("item", "tag", 96)).toBe("jfimg://localhost/item/tag/96");
+    resetCoverUrlBase();
+    win.__TAURI_INTERNALS__ = {
+      convertFileSrc: (path, protocol) => `http://${protocol}.localhost/${encodeURIComponent(path)}`,
+    };
+    expect(coverUrl("item", "tag")).toBe("http://jfimg.localhost/item/tag/300");
+  });
+
+  it("falls back to the WebView2 form outside Tauri, and needs an id and a tag", () => {
+    expect(coverUrl("item", "tag", 64)).toBe("http://jfimg.localhost/item/tag/64");
+    expect(coverUrl(null, "tag")).toBeNull();
+    expect(coverUrl("item", null)).toBeNull();
   });
 });

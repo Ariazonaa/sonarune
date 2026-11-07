@@ -24,6 +24,9 @@ pub struct SessionInfo {
     /// Whether this user (an admin) may edit item metadata on the server.
     /// Persisted alongside `can_delete` so the UI can gate the edit action.
     pub can_edit: bool,
+    /// Whether the sign-in is in the credential store and comes back at the
+    /// next start; false where there is none (`credentials`).
+    pub credentials_saved: bool,
 }
 
 /// Outcome of a `connect` attempt. `CertUntrusted` is returned (not an error)
@@ -292,8 +295,8 @@ pub(crate) fn password_entry_name(server_url: &str, username: &str) -> String {
 
 pub(crate) const LISTENBRAINZ_ENTRY_NAME: &str = "listenbrainz";
 
-fn keyring_entry(server_url: &str, username: &str) -> AppResult<keyring::Entry> {
-    Ok(keyring::Entry::new(
+fn keyring_entry(server_url: &str, username: &str) -> AppResult<crate::credentials::Secret> {
+    Ok(crate::credentials::Secret::new(
         keyring_service(),
         &token_entry_name(server_url, username),
     )?)
@@ -319,8 +322,8 @@ pub(crate) fn migrate_legacy_credentials(store: &crate::store::Store) {
 
 /// The password is kept (Windows Credential Manager) so an expired token can
 /// be renewed without bothering the user.
-fn password_entry(server_url: &str, username: &str) -> AppResult<keyring::Entry> {
-    Ok(keyring::Entry::new(
+fn password_entry(server_url: &str, username: &str) -> AppResult<crate::credentials::Secret> {
+    Ok(crate::credentials::Secret::new(
         keyring_service(),
         &password_entry_name(server_url, username),
     )?)
@@ -1223,6 +1226,7 @@ fn stored_session_info(
         user_id,
         can_delete: state.store.get(keys::CAN_DELETE).as_deref() == Some("true"),
         can_edit: state.store.get(keys::CAN_EDIT).as_deref() == Some("true"),
+        credentials_saved: crate::credentials::persistent(),
     }
 }
 
@@ -1326,6 +1330,7 @@ pub async fn connect(
         user_id: user.id,
         can_delete,
         can_edit,
+        credentials_saved: crate::credentials::persistent(),
     };
     Ok(ConnectResult::Connected { session: info })
 }
@@ -1465,6 +1470,7 @@ pub async fn quick_connect_poll(
         user_id: user.id,
         can_delete,
         can_edit,
+        credentials_saved: crate::credentials::persistent(),
     };
     Ok(Some(info))
 }
@@ -2628,8 +2634,8 @@ pub fn player_set_stop_after(
         .send(PlayerCommand::SetStopAfter { mode, entry })
 }
 
-fn listenbrainz_entry() -> AppResult<keyring::Entry> {
-    Ok(keyring::Entry::new(
+fn listenbrainz_entry() -> AppResult<crate::credentials::Secret> {
+    Ok(crate::credentials::Secret::new(
         keyring_service(),
         LISTENBRAINZ_ENTRY_NAME,
     )?)
@@ -2738,6 +2744,42 @@ pub fn set_extras_settings(
 #[tauri::command]
 pub fn export_settings(state: State<'_, AppState>) -> AppResult<String> {
     state.store.export_settings()
+}
+
+/// The settings as a file in the downloads folder, under a name that does not
+/// overwrite an earlier export; returns its path. The WebView's own download
+/// (`<a download>` on a blob) does nothing in WebKitGTK under Tauri -- on Linux
+/// the button exported nothing (test VM, 07.11.2026) -- so the file is written
+/// here, the way the diagnostic bundle is.
+#[tauri::command]
+pub async fn save_settings_export(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let json = state.store.export_settings()?;
+    let dir = downloads_folder(&app)?;
+    let destination = tokio::task::spawn_blocking(move || {
+        write_unique(&dir, "sonarune-settings.json", json.as_bytes())
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("settings writer task failed: {e}")))?
+    .map_err(|e| AppError::Other(format!("settings write failed: {e}")))?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+/// Where downloads and exports go: the system's downloads folder, or a
+/// `downloads` folder in the app's data where the system names none -- a Linux
+/// desktop without `~/.config/user-dirs.dirs`, where the diagnostic export
+/// failed with "no downloads folder" and "show in folder" with it. One place,
+/// so the files land where `reveal_path` lets the file manager look.
+pub(crate) fn downloads_folder(app: &tauri::AppHandle) -> AppResult<std::path::PathBuf> {
+    if let Ok(dir) = app.path().download_dir() {
+        return Ok(dir);
+    }
+    app.path()
+        .app_data_dir()
+        .map(|data| data.join("downloads"))
+        .map_err(|e| AppError::Other(format!("no downloads folder: {e}")))
 }
 
 /// Returns the list of imported keys; the player takes them over live.
@@ -2968,10 +3010,7 @@ pub async fn export_diagnostics(
     });
     let bytes = serde_json::to_vec_pretty(&diagnostics)
         .map_err(|e| AppError::Other(format!("diagnostic export failed: {e}")))?;
-    let dir = app
-        .path()
-        .download_dir()
-        .map_err(|e| AppError::Other(format!("no downloads folder: {e}")))?;
+    let dir = downloads_folder(&app)?;
     let destination = tokio::task::spawn_blocking(move || {
         write_unique(&dir, "sonarune-diagnostics.json", &bytes)
     })
@@ -2989,10 +3028,7 @@ pub async fn reveal_path(app: tauri::AppHandle, path: String) -> AppResult<()> {
     // is handed to the file manager, so an arbitrary path — a UNC share in
     // particular — would let anything that can reach this command trigger an
     // outbound SMB connection or open a location the user never chose.
-    let downloads = app
-        .path()
-        .download_dir()
-        .map_err(|e| AppError::Other(format!("no downloads folder: {e}")))?;
+    let downloads = downloads_folder(&app)?;
     // Judge the string before touching the file system: `canonicalize` opens
     // the path, so on `\\attacker\share\x` it would already make that SMB
     // connection (and leak an NTLM handshake) before any check rejected it.

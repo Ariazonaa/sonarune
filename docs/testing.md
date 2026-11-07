@@ -25,13 +25,21 @@ all of that installed and the actions cache reachable. The workflow sets
 `CARGO_TARGET_DIR`, which overrides any local target-dir redirect in
 `src-tauri/.cargo/config.toml` (see `config.toml.example`).
 
+A second job, `quality-linux`, builds the Linux side of the crate on
+`ubuntu-22.04` (WebKitGTK, MPRIS, ALSA, the Secret Service) and runs clippy and
+`cargo test --lib` there; it installs the libraries a Linux build links against
+with apt. The frontend gates and rustfmt are the same on both and run once.
+`npm run verify` runs on Linux as well.
+
 The release workflow, `.github/workflows/release.yml`, does not run the tests.
 It builds from the tag with a read-only token and no secrets, runs
 `svelte-check` first (a failed message compile only shows there), signs the
 installer in a separate job whose key step runs nothing but the Tauri CLI's
 signer, checks that signature against the public key in `tauri.conf.json`
 (`scripts/verify-update-signature.mjs`), and drafts the release from a third
-job. A tag pushed without the signing key fails instead of drafting a release
+job. A fourth, `build-linux`, builds the AppImage and the .deb on
+ubuntu-22.04; `sign` signs and checks them alongside the installer and lists
+them in `latest.json`. A tag pushed without the signing key fails instead of drafting a release
 without `latest.json`. A manual run (`workflow_dispatch`) goes through build,
 signing and the check and drafts nothing; only the unsigned installer and zip
 stay on the run, for a day. The signature never shows in a log, and on a tag

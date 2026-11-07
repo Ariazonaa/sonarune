@@ -3,7 +3,7 @@
   import { Virtualizer } from "virtua/svelte";
   import { formatDuration } from "#lib/api.js";
   import { m } from "#lib/paraglide/messages.js";
-  import { dropSlot, moveTarget } from "#lib/dragReorder.js";
+  import { dropSlot, moveTarget, startReorderDrag } from "#lib/dragReorder.js";
   import { isLongList, offsetIn, scrollParent, type ListPosition } from "#lib/longList.js";
   import { contextMenuKey } from "#lib/menu.js";
   import { listFlip } from "#lib/motion.js";
@@ -140,7 +140,7 @@
   function onDragStart(event: DragEvent, row: PlaylistRow) {
     if (!reorderable) return;
     drag = { key: row.key };
-    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+    startReorderDrag(event);
   }
 
   /** A row a drag of this list comes over takes it, as `dragover` does. Left

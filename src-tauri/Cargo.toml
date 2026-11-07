@@ -71,7 +71,7 @@ tauri-plugin-window-state = "2.4.1"
 tauri-plugin-single-instance = "2"
 # In-app updates (updater.rs). Desktop only, which is every target this crate
 # has -- the iOS port is its own project.
-tauri-plugin-updater = "2.12.0"
+tauri-plugin-updater = "2.14.1"
 # Comparing the stable and the beta channel's versions (updater.rs). Already
 # in the graph: the updater plugin's own.
 semver = "1.0.28"
@@ -90,8 +90,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 windows-registry = "0.6"
 # Suspending the WebView in the background (see webview_power.rs). Versions
 # follow wry's, or the controller type would not match across crate copies.
-webview2-com = "0.38"
-windows = { version = "0.61", features = ["Win32_Foundation"] }
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 proptest = "1"

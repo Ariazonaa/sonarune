@@ -9,6 +9,7 @@ mod commands_metadata;
 mod commands_sonic;
 mod commands_visualizer;
 mod credential_purge;
+mod credentials;
 mod db_recovery;
 mod desktop;
 mod diagnostics;
@@ -228,14 +229,18 @@ pub fn run() {
             app.manage(recovery);
             // Same rule as for the data directories: only the real app's
             // release build takes over what the old name left behind.
-            if !cfg!(debug_assertions) && app.config().identifier == legacy::IDENTIFIER {
+            // Jellysic only ever shipped for Windows; elsewhere this would be a
+            // keyring call on the main thread for nothing, and a keyring that
+            // never answers would keep the window blank.
+            if cfg!(windows)
+                && !cfg!(debug_assertions)
+                && app.config().identifier == legacy::IDENTIFIER
+            {
                 commands::migrate_legacy_credentials(&store);
             }
             let session: SharedSession = Arc::new(tokio::sync::RwLock::new(None));
             let desktop_settings = desktop::load(&store);
-            let downloads_dir = app
-                .path()
-                .download_dir()
+            let downloads_dir = commands::downloads_folder(app.handle())
                 .unwrap_or_else(|_| data_dir.join("downloads"));
             let downloads = download::DownloadManager::new(
                 app.handle().clone(),
@@ -244,12 +249,15 @@ pub fn run() {
             )?;
             app.manage(downloads);
 
-            // SMTC needs the main window handle; covers for the media overlay
-            // come from the jfimg disk cache.
+            // SMTC needs the main window handle (MPRIS on Linux needs none);
+            // covers for the media overlay come from the jfimg disk cache.
+            #[cfg(target_os = "windows")]
             let hwnd = app
                 .get_webview_window("main")
                 .and_then(|w| w.hwnd().ok())
                 .map(|h| h.0 as isize);
+            #[cfg(not(target_os = "windows"))]
+            let hwnd: Option<isize> = None;
             let cover_dir = app.path().app_cache_dir()?.join("covers");
             let cover_cache =
                 cache::CoverCache::new(cover_dir.clone(), desktop_settings.cover_cache_limit_mb)?;
@@ -384,6 +392,7 @@ pub fn run() {
             commands::get_extras_settings,
             commands::set_extras_settings,
             commands::export_settings,
+            commands::save_settings_export,
             commands::import_settings,
             commands::visualizer_subscribe,
             commands::visualizer_unsubscribe,
@@ -435,6 +444,9 @@ pub fn run() {
             commands_library::history_year,
             commands_library::history_delete,
             commands_library::history_clear,
+            commands_library::history_stranded,
+            commands_library::history_claim_stranded,
+            commands_library::history_forget_stranded,
             commands_sonic::sonic_status,
             commands_sonic::sonic_set_scan,
             commands_sonic::sonic_radio,

@@ -24,6 +24,7 @@ const newer = (version: string): UpdateInfo => ({
   notes: null,
   date: null,
   installable: true,
+  copy: "installer",
 });
 
 describe("update announcement", () => {

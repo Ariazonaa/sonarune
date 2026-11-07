@@ -33,6 +33,7 @@ const home: SessionInfo = {
   userId: "u1",
   canDelete: false,
   canEdit: false,
+  credentialsSaved: true,
 };
 
 function track(id: string) {

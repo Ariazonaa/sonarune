@@ -31,9 +31,9 @@ interface and nothing else.
 
 > **Status:** actively developed, feature-rich, and daily-usable. Not yet 1.0.
 > Planned work and known gaps are tracked in
-> [issues](https://github.com/Ariazonaa/sonarune/issues). Windows-first, but
-> the architecture keeps Linux/macOS open (no Windows-only shortcuts baked into
-> the core).
+> [issues](https://github.com/Ariazonaa/sonarune/issues). Windows-first,
+> Linux built and checked; the architecture keeps macOS open (no Windows-only
+> shortcuts baked into the core).
 
 > **AI disclosure:** Sonarune was developed substantially with assistance from
 > large language models. The maintainers review and test the resulting code and
@@ -50,6 +50,15 @@ WebView2 already ships with Windows.
 
 There is also a portable zip if you would rather not install anything: the exe
 is self-contained, the interface is embedded in it.
+
+**Linux** (x86_64, Ubuntu 22.04 / Debian 12 or newer): an AppImage and a
+`.deb`, both built and checked on Debian 13; they join the releases page with
+the next release. The `.deb` installs with
+`sudo apt install ./Sonarune_<version>_amd64.deb` and updates itself, asking for
+an administrator password to install the next one. The AppImage runs without
+installing (`chmod +x`) and replaces itself on update. The sign-in is kept in
+the desktop's keyring (GNOME Keyring, KWallet); without one it lasts until the
+app quits.
 
 It is not code-signed, so SmartScreen calls the publisher unknown. **More info →
 Run anyway.** That is a reputation problem rather than a technical one, and it
@@ -359,6 +368,12 @@ Prerequisites: **Rust** (MSVC toolchain + the C++ build tools), **Node.js 22+**,
 `signalsmith-stretch` generates its bindings with it), and a **Jellyfin
 server 10.11+**.
 
+On Linux, instead of the MSVC tools, the libraries Tauri, cpal and MPRIS link
+against (Debian/Ubuntu): `libwebkit2gtk-4.1-dev libgtk-3-dev
+libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libasound2-dev
+libdbus-1-dev libclang-dev cmake`. `npm run tauri build` makes the AppImage and
+the `.deb` there.
+
 ```powershell
 npm install
 npm run tauri dev      # run the app in dev (Vite on :1420 + cargo run, hot reload)
@@ -438,7 +453,8 @@ By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
 
-Tokens live in the Windows Credential Manager and never reach the DOM,
+Tokens live in the Windows Credential Manager (the Secret Service on Linux)
+and never reach the DOM,
 certificates are pinned per server, and the online visualizer packs are
 verified against a pinned manifest before anything is evaluated.
 [`SECURITY.md`](SECURITY.md) writes that out and says how to report

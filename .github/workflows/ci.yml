@@ -1,9 +1,10 @@
 name: CI
 
-# The public quality gate. Runs on Windows because that is the primary target:
-# the `opus` crate compiles bundled libopus via cmake, and the crate pulls in
-# Windows-only dependencies (SMTC via souvlaki, WebView2), so the Rust gates
-# only compile there. Mirrors `npm run verify` step for step.
+# The public quality gate. `quality` runs on Windows, the primary target, and
+# mirrors `npm run verify` step for step. `quality-linux` builds the Linux side
+# of the crate -- WebKitGTK instead of WebView2, MPRIS instead of SMTC, ALSA
+# instead of WASAPI -- and runs clippy and the unit tests there; the frontend
+# and rustfmt are the same on both and run once, on Windows.
 #
 # GitHub's hosted `windows-latest` image already ships Node, rustup, MSVC and
 # cmake, so this only pins versions and adds caching.
@@ -91,6 +92,47 @@ jobs:
       - name: rustfmt
         working-directory: src-tauri
         run: cargo fmt --check
+
+      - name: clippy (warnings are errors)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib
+
+  quality-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # What a Tauri build links against on Linux, plus ALSA (cpal), D-Bus
+      # (MPRIS, the Secret Service) and libclang (bindgen in
+      # signalsmith-stretch). The same list as release.yml's build-linux.
+      - name: Install the system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libasound2-dev libdbus-1-dev \
+            libclang-dev cmake file
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          rustc --version --verbose
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      # tauri::generate_context! embeds the frontend; clippy and the tests
+      # only need the folder to exist.
+      - name: Placeholder frontend
+        run: mkdir -p build
 
       - name: clippy (warnings are errors)
         working-directory: src-tauri

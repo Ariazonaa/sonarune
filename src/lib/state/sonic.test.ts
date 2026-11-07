@@ -27,6 +27,7 @@ beforeEach(() => {
     userId: "u1",
     canDelete: false,
     canEdit: false,
+    credentialsSaved: true,
   };
   invokeMock.mockReset();
   show.mockClear();

@@ -24,7 +24,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "~2.11.1",
+    "@tauri-apps/api": "~2.12.4",
     "blurhash": "^2.0.5",
     "butterchurn": "^2.6.7",
     "butterchurn-presets": "^2.4.7",

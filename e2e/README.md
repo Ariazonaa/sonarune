@@ -57,6 +57,24 @@ named after the identifier), and never touches the installed app's.
    `https://msedgedriver.microsoft.com/LATEST_RELEASE_<major>_WINDOWS` gives the
    newest build of a major line if the exact runtime version isn't published.
 
+## Prerequisites (Linux)
+
+Green on Debian 13 (07.11.2026, all four tests) under Xvfb. `tauri-driver`
+drives WebKitGTK through `WebKitWebDriver`; there is no driver version to
+match.
+
+1. The build packages of a Linux build (`libwebkit2gtk-4.1-dev`,
+   `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`,
+   `libxdo-dev`, `libasound2-dev`, `libdbus-1-dev`, `libclang-dev`, `cmake`).
+2. `webkit2gtk-driver` (provides `WebKitWebDriver`) and
+   `cargo install tauri-driver --locked`.
+3. A display and a session bus: `Xvfb :99` with `DISPLAY=:99`, and the run
+   inside `dbus-run-session`. The sign-in stores its token in the Secret
+   Service, so start one in that session
+   (`printf pw | gnome-keyring-daemon --unlock --components=secrets`).
+   Without an audio server the player logs that it cannot open an output;
+   the specs do not need sound.
+
 ## Run
 
 ```sh

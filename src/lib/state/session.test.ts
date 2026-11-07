@@ -22,6 +22,7 @@ import { net } from "#lib/state/net.svelte.js";
 import { player } from "#lib/state/player.svelte.js";
 import { playlists } from "#lib/state/playlists.svelte.js";
 import { session } from "#lib/state/session.svelte.js";
+import { toast } from "#lib/state/toast.svelte.js";
 import { swrGet, swrSet } from "#lib/swr.js";
 import type { PlaylistDto, SessionEnded, SessionInfo } from "#lib/types.js";
 
@@ -33,6 +34,7 @@ const info: SessionInfo = {
   userId: "user-1",
   canDelete: false,
   canEdit: false,
+  credentialsSaved: true,
 };
 
 const rejected: SessionEnded = {
@@ -148,5 +150,34 @@ describe("session", () => {
     await session.disconnect();
     expect(session.ended).toBeNull();
     expect(session.info).toBeNull();
+  });
+});
+
+// A Linux desktop without a Secret Service: the sign-in goes through but is
+// kept for this run only. Said at once, not at the next start's sign-in.
+describe("a sign-in the credential store could not keep", () => {
+  const input = { serverUrl: "https://music.home", username: "alice", password: "pw", acceptInvalidCerts: false };
+
+  it("tells the user it lasts this session only", async () => {
+    const shown = vi.spyOn(toast, "show");
+    invokeMock.mockImplementation(async (command: string) =>
+      command === "connect"
+        ? ({ status: "connected", session: { ...info, credentialsSaved: false } } as never)
+        : (undefined as never),
+    );
+    await session.connect(input);
+    expect(session.info?.credentialsSaved).toBe(false);
+    expect(shown).toHaveBeenCalledWith(
+      expect.stringContaining("this session only"),
+      expect.objectContaining({ kind: "info" }),
+    );
+    shown.mockRestore();
+  });
+
+  it("says nothing when the sign-in is saved", async () => {
+    const shown = vi.spyOn(toast, "show");
+    await session.connect(input);
+    expect(shown).not.toHaveBeenCalled();
+    shown.mockRestore();
   });
 });

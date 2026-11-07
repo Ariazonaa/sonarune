@@ -7,6 +7,39 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- Settings → Play history lists your plays that were recorded under another
+  server's id — after moving the server to a fresh install restored from a
+  backup at a new address, say. Until now they stayed hidden, out of the
+  history and the year in review, and "Clear history" did not reach them.
+  Take them over for this server or delete them.
+
+### Added
+
+- **Linux:** an AppImage and a `.deb` for x86_64 (Ubuntu 22.04 / Debian 12 or
+  newer). Both update themselves from the release; the `.deb` asks for an
+  administrator password to install the next version. Playback goes through
+  ALSA (PipeWire and PulseAudio through their ALSA plugin), media keys and the
+  desktop's player widget through MPRIS, the sign-in into the desktop's
+  keyring. Without a keyring the sign-in lasts until the app quits, and the
+  app says so.
+
+### Changed
+
+- Drop-down lists, number and date fields are drawn in the app's dark theme
+  everywhere.
+- **Export settings** saves the file into the Downloads folder and shows where,
+  with a button to open the folder, as the diagnostic export does.
+
+### Security
+
+- The updater's ZIP handling no longer uses `zip` 4.6.1, which has known
+  parser flaws (updater plugin 2.14.1 with `zip` 9, Tauri 2.12). Sonarune's
+  updates are signed installers, not ZIP archives, so no release was
+  affected. Signatures are now checked with `minisign-verify` 0.3, and once
+  more right before the installer starts.
+
 ## [0.7.1] — 2026-10-23
 
 ### Changed

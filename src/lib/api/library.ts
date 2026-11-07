@@ -16,6 +16,7 @@ import type {
   PlaylistDto,
   PlaylistTransfer,
   StatsData,
+  StrandedPlays,
   TrackDto,
   YearReview,
 } from "#lib/types.js";
@@ -84,6 +85,13 @@ export const apiLibrary = {
   historyDelete: (id: number) => invoke<boolean>("history_delete", { id }),
   /** Forget the history of the signed-in account; resolves with the rows gone. */
   historyClear: () => invoke<number>("history_clear"),
+  /** The signed-in account's plays under other server ids, one entry per id. */
+  historyStranded: () => invoke<StrandedPlays[]>("history_stranded"),
+  /** Give the account's plays under `serverId` to the signed-in server;
+   *  resolves with how many moved. */
+  historyClaimStranded: (serverId: string) => invoke<number>("history_claim_stranded", { serverId }),
+  /** Forget the account's plays under `serverId`; resolves with how many. */
+  historyForgetStranded: (serverId: string) => invoke<number>("history_forget_stranded", { serverId }),
   /** First page of every favorites section, each with its total. */
   getFavorites: () => invoke<FavoritesData>("get_favorites"),
   /** Later pages of one favorites section (by name; limit 1–200). */

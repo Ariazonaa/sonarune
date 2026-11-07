@@ -249,6 +249,7 @@ const KNOWN: &[(&str, Shape)] = &[
         Shape::Starts("cannot serialize audio profiles: "),
     ),
     ("settingsExport", Shape::Starts("export failed: ")),
+    ("settingsExport", Shape::Starts("settings write failed: ")),
     (
         "notSettingsExport",
         Shape::Starts("not a settings export: "),
@@ -308,6 +309,7 @@ const KNOWN: &[(&str, Shape)] = &[
         "taskFailed",
         Shape::Starts("diagnostic writer task failed: "),
     ),
+    ("taskFailed", Shape::Starts("settings writer task failed: ")),
     ("taskFailed", Shape::Starts("reveal task failed: ")),
     ("taskFailed", Shape::Starts("update install task failed: ")),
     // A replayed error (`AppError::replay`) keeps its variant's code.

@@ -84,7 +84,13 @@
           {#if busy}
             <p class="mt-2 text-xs text-ink-muted">{m.settings_update_playing()}</p>
           {:else}
-            <p class="mt-2 max-w-lg text-xs text-ink-muted">{m.settings_update_install_hint()}</p>
+            <p class="mt-2 max-w-lg text-xs text-ink-muted">
+              {updates.info.copy === "appImage"
+                ? m.settings_update_install_hint_appimage()
+                : updates.info.copy === "deb"
+                  ? m.settings_update_install_hint_deb()
+                  : m.settings_update_install_hint()}
+            </p>
           {/if}
           {#if updates.installing}
             <div class="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-panel-2">
@@ -95,7 +101,9 @@
             </div>
           {/if}
         {:else}
-          <p class="mt-3 max-w-lg text-xs text-ink-muted">{m.settings_update_portable()}</p>
+          <p class="mt-3 max-w-lg text-xs text-ink-muted">
+            {updates.info.copy === "portable" ? m.settings_update_portable() : m.settings_update_manual()}
+          </p>
         {/if}
       {:else}
         <p class="text-sm">{m.settings_update_none()}</p>

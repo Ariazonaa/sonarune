@@ -250,6 +250,32 @@ pub struct UpdateInfo {
     /// run, which may well see a newer version but must not install it (see
     /// the module docs).
     pub installable: bool,
+    /// What kind of copy this is, for the UI to say how it updates.
+    pub copy: CopyKind,
+}
+
+/// How this copy came onto the machine, and so how it updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CopyKind {
+    /// Installed by the NSIS installer (Windows): the next installer replaces it.
+    Installer,
+    /// An AppImage (Linux): the updater swaps the file in place.
+    AppImage,
+    /// Installed from the .deb (Linux): the updater installs the next package
+    /// through pkexec, which asks for an administrator's password.
+    Deb,
+    /// The portable zip (Windows): never turned into an installed copy.
+    Portable,
+    /// Anything else — a bare binary, a package the updater does not handle:
+    /// updated by hand.
+    Unbundled,
+}
+
+impl CopyKind {
+    fn self_updates(self) -> bool {
+        matches!(self, Self::Installer | Self::AppImage | Self::Deb)
+    }
 }
 
 /// Bytes of the running download, as `updater:progress`. `total` is missing
@@ -309,9 +335,18 @@ fn stable_offer(current: &semver::Version, remote: &semver::Version) -> bool {
 /// installer (see [`hand_over`]).
 fn updater(app: &AppHandle, source: Source) -> Result<Updater, UpdateError> {
     let handle = app.clone();
-    let builder = app
+    let mut builder = app
         .updater_builder()
         .on_before_exit(move || hand_over(&handle));
+    // A Linux binary outside an AppImage or a .deb carries no bundle mark,
+    // and the plugin would look for a bare `linux-x86_64` entry that
+    // `latest.json` does not have: the check failed instead of saying that a
+    // newer version exists and must be fetched by hand. Asking for the
+    // AppImage's entry only reads its version; this copy installs nothing
+    // (`copy_kind`).
+    if cfg!(target_os = "linux") && copy_kind() == CopyKind::Unbundled {
+        builder = builder.target("linux-x86_64-appimage");
+    }
     let builder = match source {
         Source::Stable => {
             builder.version_comparator(|current, remote| stable_offer(&current, &remote.version))
@@ -503,16 +538,41 @@ fn newer_of<T>(
 /// language, and it errs on the safe side: an unknown layout counts as
 /// portable and merely refuses to install.
 fn installed_copy() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("uninstall.exe")))
-        .map(|uninstaller| uninstaller.is_file())
-        .unwrap_or(false)
+    copy_kind().self_updates()
+}
+
+/// On Windows the NSIS `uninstall.exe` beside the exe tells an installed copy
+/// from the portable zip. On Linux the bundler marks the binary with the
+/// bundle it went into (`tauri::utils::platform::bundle_type`); the updater
+/// reads the same mark to pick the `linux-x86_64-appimage` or `-deb` entry of
+/// `latest.json`.
+fn copy_kind() -> CopyKind {
+    if cfg!(target_os = "windows") {
+        let installed = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("uninstall.exe")))
+            .is_some_and(|uninstaller| uninstaller.is_file());
+        return if installed {
+            CopyKind::Installer
+        } else {
+            CopyKind::Portable
+        };
+    }
+    if cfg!(target_os = "linux") {
+        use tauri::utils::config::BundleType;
+        return match tauri::utils::platform::bundle_type() {
+            Some(BundleType::AppImage) => CopyKind::AppImage,
+            Some(BundleType::Deb) => CopyKind::Deb,
+            _ => CopyKind::Unbundled,
+        };
+    }
+    CopyKind::Unbundled
 }
 
 fn info(app: &AppHandle, update: Option<&Update>) -> UpdateInfo {
     let current_version = app.package_info().version.to_string();
-    let installable = installed_copy();
+    let copy = copy_kind();
+    let installable = copy.self_updates();
     let Some(update) = update else {
         return UpdateInfo {
             current_version,
@@ -520,6 +580,7 @@ fn info(app: &AppHandle, update: Option<&Update>) -> UpdateInfo {
             notes: None,
             date: None,
             installable,
+            copy,
         };
     };
     UpdateInfo {
@@ -535,6 +596,7 @@ fn info(app: &AppHandle, update: Option<&Update>) -> UpdateInfo {
             .and_then(|value| value.as_str())
             .map(str::to_string),
         installable,
+        copy,
     }
 }
 
@@ -613,7 +675,9 @@ pub async fn check_for_update(app: AppHandle) -> AppResult<UpdateInfo> {
 /// On Windows this does not return: the installer is launched and the process
 /// exits right after the hook in [`updater`]. The frontend therefore sees the
 /// window close, which is what the confirmation before it says will happen.
-/// It returns only when the installer could not be started.
+/// It returns only when the installer could not be started. On Linux the
+/// plugin installs in place (AppImage) or through pkexec (deb) and returns;
+/// the app then restarts itself into the new version.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> AppResult<()> {
     if !installed_copy() {
@@ -645,12 +709,24 @@ pub async fn install_update(app: AppHandle) -> AppResult<()> {
     // Blocking from here on: the hook waits for the player's final reports,
     // and the plugin writes the installer out before starting it.
     let installed = tauri::async_runtime::spawn_blocking(move || update.install(bytes)).await;
-    // Still running, so the installer did not start — also when the task
-    // itself fell over, which must not leave playback held either.
-    recover_from_failed_launch(&app);
+    if cfg!(target_os = "windows") {
+        // Still running, so the installer did not start — also when the task
+        // itself fell over, which must not leave playback held either.
+        recover_from_failed_launch(&app);
+    }
     installed
         .map_err(|e| AppError::Other(format!("update install task failed: {e}")))?
-        .map_err(|e| classify(Phase::Install, e).into())
+        .map_err(|e| AppError::from(classify(Phase::Install, e)))?;
+    if cfg!(target_os = "windows") {
+        return Ok(());
+    }
+    // Linux: the plugin swapped the AppImage or installed the package and came
+    // back — it runs no hook there and starts nothing. Exiting through the
+    // event loop sends the final reports (`flush_before_exit`), saves the
+    // window and lets go of the single-instance name before the new version
+    // starts.
+    tracing::info!("update installed, restarting");
+    app.restart()
 }
 
 /// Check once, quietly, a while after startup, and tell the UI only when there
@@ -761,6 +837,7 @@ mod tests {
             notes: None,
             date: None,
             installable: true,
+            copy: super::CopyKind::Installer,
         };
         super::remember(UpdateChannel::Stable, &answer);
         let known = super::known(UpdateChannel::Stable).expect("remembered");
@@ -768,6 +845,27 @@ mod tests {
         assert_eq!(known.current_version, "0.6.1");
         // Switched to beta since: that answer was given for stable.
         assert!(super::known(UpdateChannel::Beta).is_none());
+    }
+
+    /// The UI words its install hint by the kind of copy; only the three
+    /// kinds the updater can replace offer the install button.
+    #[test]
+    fn only_installer_appimage_and_deb_update_themselves() {
+        use super::CopyKind;
+        for kind in [CopyKind::Installer, CopyKind::AppImage, CopyKind::Deb] {
+            assert!(kind.self_updates(), "{kind:?}");
+        }
+        for kind in [CopyKind::Portable, CopyKind::Unbundled] {
+            assert!(!kind.self_updates(), "{kind:?}");
+        }
+        assert_eq!(
+            serde_json::to_value(CopyKind::AppImage).unwrap(),
+            serde_json::json!("appImage")
+        );
+        // A test binary is not a bundle.
+        if cfg!(target_os = "linux") {
+            assert_eq!(super::copy_kind(), CopyKind::Unbundled);
+        }
     }
 
     fn v(text: &str) -> semver::Version {

@@ -750,6 +750,35 @@ pub async fn history_clear(state: State<'_, AppState>) -> AppResult<usize> {
     off_the_main_thread(&state, crate::history::clear).await
 }
 
+#[tauri::command]
+pub async fn history_stranded(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::history::StrandedPlays>> {
+    off_the_main_thread(&state, crate::history::stranded).await
+}
+
+#[tauri::command]
+pub async fn history_claim_stranded(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> AppResult<usize> {
+    off_the_main_thread(&state, move |store| {
+        crate::history::claim_stranded(store, &server_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn history_forget_stranded(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> AppResult<usize> {
+    off_the_main_thread(&state, move |store| {
+        crate::history::forget_stranded(store, &server_id)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{top_artists, ArtistPlays};

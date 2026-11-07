@@ -1063,6 +1063,56 @@ fn media_playback(
     }
 }
 
+/// How long MPRIS goes without a playback update while playing on, and how
+/// far the position may drift from where the last one put it.
+const MEDIA_REFRESH: Duration = Duration::from_secs(10);
+const MEDIA_JUMP: Duration = Duration::from_millis(1500);
+
+/// Whether `next` is news to the system's media controls after `last`, sent
+/// `since` ago. Windows' SMTC takes every update on the spot, and gets one
+/// every tick. MPRIS does not: souvlaki's D-Bus thread handles one update,
+/// then waits up to a second for the bus, so an update every 400 ms tick
+/// piled up and the status and the title lagged further behind every minute
+/// (seen on Linux, 06.11.2026). It gets a change of state, a position that
+/// jumped (a seek, a new track), and a refresh every [`MEDIA_REFRESH`];
+/// the clients advance the position themselves meanwhile.
+fn media_playback_is_news(
+    last: Option<&souvlaki::MediaPlayback>,
+    since: Duration,
+    next: &souvlaki::MediaPlayback,
+) -> bool {
+    use souvlaki::{MediaPlayback as P, MediaPosition};
+    fn position(playback: &P) -> Option<Duration> {
+        match playback {
+            P::Playing {
+                progress: Some(MediaPosition(at)),
+            }
+            | P::Paused {
+                progress: Some(MediaPosition(at)),
+            } => Some(*at),
+            _ => None,
+        }
+    }
+    let Some(last) = last else {
+        return true;
+    };
+    match (last, next) {
+        (P::Playing { .. }, P::Playing { .. }) => {
+            if since >= MEDIA_REFRESH {
+                return true;
+            }
+            match (position(last), position(next)) {
+                (Some(was), Some(now)) => (was + since).abs_diff(now) > MEDIA_JUMP,
+                (was, now) => was != now,
+            }
+        }
+        // Nothing ticks while paused: every move is a seek, however small.
+        (P::Paused { .. }, P::Paused { .. }) => position(last) != position(next),
+        (P::Stopped, P::Stopped) => false,
+        _ => true,
+    }
+}
+
 /// Map a downloaded byte fraction onto the track's timeline.
 /// A fresh play session id. See `spawn_open` for what the server does with it.
 fn new_play_session() -> String {
@@ -2585,6 +2635,9 @@ struct Worker {
     tempo: tempo::TempoHandle,
     speed: tempo::SpeedSetting,
     media: Option<souvlaki::MediaControls>,
+    /// What the media controls were last told, and when
+    /// ([`media_playback_is_news`]).
+    media_sent: Option<(souvlaki::MediaPlayback, Instant)>,
     dsp: Arc<AudioDsp>,
     tap: Arc<tap::VisualizerTap>,
     /// Handed to every open, so a fully downloaded track gets its seek-bar
@@ -2856,6 +2909,7 @@ impl Worker {
             tempo,
             speed,
             media,
+            media_sent: None,
             dsp,
             tap,
             waveform,
@@ -6196,12 +6250,23 @@ impl Worker {
     }
 
     fn update_media_playback(&mut self) {
+        if self.media.is_none() {
+            return;
+        }
         let position = Duration::from_millis(self.position_ms());
         let playback = media_playback(self.status, self.pending_pause, position);
-        let Some(controls) = self.media.as_mut() else {
-            return;
-        };
-        let _ = controls.set_playback(playback);
+        let now = Instant::now();
+        if !cfg!(target_os = "windows") {
+            let last = self.media_sent.as_ref();
+            let since = last.map_or(Duration::ZERO, |(_, at)| now.duration_since(*at));
+            if !media_playback_is_news(last.map(|(sent, _)| sent), since, &playback) {
+                return;
+            }
+        }
+        self.media_sent = Some((playback.clone(), now));
+        if let Some(controls) = self.media.as_mut() {
+            let _ = controls.set_playback(playback);
+        }
     }
 
     /// Queue is on its last track and Auto-DJ is on: append a server mix
@@ -6968,6 +7033,10 @@ fn open_output_named(
     let flag = dead.clone();
     let mut sink = builder
         .with_error_callback(move |err| {
+            if !stream_error_is_fatal(&err) {
+                tracing::debug!("audio stream glitch: {err}");
+                return;
+            }
             tracing::warn!("audio stream error: {err}");
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = tx.send(PlayerCommand::OutputFailed);
@@ -6995,6 +7064,15 @@ fn open_output_named(
         dead,
         opened,
     ))
+}
+
+/// Whether an error the device stream reports means the stream is gone. An
+/// underrun or overrun is not: ALSA reports every one (cpal recovers from it
+/// and plays on), and treating it as a failure made the Linux build fall back
+/// to the default device again and again on a busy machine (seen on the test
+/// VM, 07.11.2026). WASAPI does not report them.
+fn stream_error_is_fatal(err: &rodio::cpal::StreamError) -> bool {
+    !matches!(err, rodio::cpal::StreamError::BufferUnderrun)
 }
 
 /// An output: the device stream, and the mixer the players connect to.
@@ -7891,11 +7969,19 @@ fn init_media_controls(
     hwnd: Option<isize>,
     tx: Sender<PlayerCommand>,
 ) -> Option<souvlaki::MediaControls> {
-    let hwnd = hwnd?;
+    // SMTC hangs off the main window; MPRIS (Linux) and the macOS Now
+    // Playing center need no window.
+    #[cfg(target_os = "windows")]
+    let hwnd = Some(hwnd? as *mut std::ffi::c_void);
+    #[cfg(not(target_os = "windows"))]
+    let hwnd = {
+        let _ = hwnd;
+        None
+    };
     let config = souvlaki::PlatformConfig {
         dbus_name: "sonarune",
         display_name: "Sonarune",
-        hwnd: Some(hwnd as *mut std::ffi::c_void),
+        hwnd,
     };
     let mut controls = match souvlaki::MediaControls::new(config) {
         Ok(c) => c,
@@ -8054,6 +8140,109 @@ mod tests {
         assert!(!arrives_paused(PlaybackStatus::Loading, false));
         assert!(!arrives_paused(PlaybackStatus::Idle, true));
         assert!(!arrives_paused(PlaybackStatus::Paused, true));
+    }
+
+    #[test]
+    fn an_underrun_is_a_glitch_not_a_lost_device() {
+        use super::stream_error_is_fatal;
+        use rodio::cpal::{BackendSpecificError, StreamError};
+        assert!(!stream_error_is_fatal(&StreamError::BufferUnderrun));
+        assert!(stream_error_is_fatal(&StreamError::DeviceNotAvailable));
+        assert!(stream_error_is_fatal(&StreamError::StreamInvalidated));
+        assert!(stream_error_is_fatal(&StreamError::BackendSpecific {
+            err: BackendSpecificError {
+                description: "the driver went away".into(),
+            },
+        }));
+    }
+
+    #[test]
+    fn mpris_hears_of_changes_not_of_every_tick() {
+        use super::{media_playback_is_news, MEDIA_REFRESH};
+        use souvlaki::{MediaPlayback, MediaPosition};
+        use std::time::Duration;
+
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        let playing = |at: Duration| MediaPlayback::Playing {
+            progress: Some(MediaPosition(at)),
+        };
+        let paused = |at: Duration| MediaPlayback::Paused {
+            progress: Some(MediaPosition(at)),
+        };
+        // The first update always goes out.
+        assert!(media_playback_is_news(None, ms(0), &playing(s(0))));
+        // A tick 400 ms on, where the clients put it themselves: nothing.
+        assert!(!media_playback_is_news(
+            Some(&playing(s(10))),
+            ms(400),
+            &playing(ms(10_400))
+        ));
+        // Some slack for a tick that comes late or a download that stalled.
+        assert!(!media_playback_is_news(
+            Some(&playing(s(10))),
+            s(2),
+            &playing(ms(10_900))
+        ));
+        // A seek, back or ahead, and a new track starting at 0.
+        assert!(media_playback_is_news(
+            Some(&playing(s(10))),
+            ms(400),
+            &playing(s(60))
+        ));
+        assert!(media_playback_is_news(
+            Some(&playing(s(60))),
+            ms(400),
+            &playing(s(5))
+        ));
+        assert!(media_playback_is_news(
+            Some(&playing(s(170))),
+            ms(400),
+            &playing(s(0))
+        ));
+        // A refresh now and then all the same.
+        assert!(media_playback_is_news(
+            Some(&playing(s(10))),
+            MEDIA_REFRESH,
+            &playing(s(20))
+        ));
+        // Every change of state.
+        assert!(media_playback_is_news(
+            Some(&playing(s(10))),
+            ms(400),
+            &paused(s(10))
+        ));
+        assert!(media_playback_is_news(
+            Some(&paused(s(10))),
+            s(30),
+            &playing(s(10))
+        ));
+        assert!(media_playback_is_news(
+            Some(&playing(s(10))),
+            ms(400),
+            &MediaPlayback::Stopped
+        ));
+        // Paused stays quiet, unless a seek moves it, however little.
+        assert!(media_playback_is_news(
+            Some(&paused(s(10))),
+            ms(400),
+            &paused(ms(10_300))
+        ));
+        assert!(!media_playback_is_news(
+            Some(&paused(s(10))),
+            s(60),
+            &paused(s(10))
+        ));
+        assert!(media_playback_is_news(
+            Some(&paused(s(10))),
+            ms(400),
+            &paused(s(90))
+        ));
+        assert!(!media_playback_is_news(
+            Some(&MediaPlayback::Stopped),
+            s(60),
+            &MediaPlayback::Stopped
+        ));
     }
 
     // Property tests: the pure queue-index helpers must hold their invariants
