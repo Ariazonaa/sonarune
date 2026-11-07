@@ -7,13 +7,7 @@ caveat that a minor bump may still change behaviour.
 
 ## [Unreleased]
 
-### Added
-
-- Settings → Play history lists your plays that were recorded under another
-  server's id — after moving the server to a fresh install restored from a
-  backup at a new address, say. Until now they stayed hidden, out of the
-  history and the year in review, and "Clear history" did not reach them.
-  Take them over for this server or delete them.
+## [0.8.0] — 2026-11-07
 
 ### Added
 
@@ -24,6 +18,11 @@ caveat that a minor bump may still change behaviour.
   desktop's player widget through MPRIS, the sign-in into the desktop's
   keyring. Without a keyring the sign-in lasts until the app quits, and the
   app says so.
+- Settings → Play history lists your plays that were recorded under another
+  server's id — after moving the server to a fresh install restored from a
+  backup at a new address, say. Until now they stayed hidden, out of the
+  history and the year in review, and "Clear history" did not reach them.
+  Take them over for this server or delete them.
 
 ### Changed
 
@@ -417,7 +416,8 @@ First public release. Windows, Jellyfin 10.11 or newer.
 - No offline downloads, casting, podcasts, multiple servers at once, or
   Subsonic/Navidrome backends. These are deliberate non-goals for 1.0.
 
-[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/Ariazonaa/sonarune/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/Ariazonaa/sonarune/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/Ariazonaa/sonarune/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Ariazonaa/sonarune/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Ariazonaa/sonarune/compare/v0.5.1...v0.6.0

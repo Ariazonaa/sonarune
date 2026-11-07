@@ -1,6 +1,6 @@
 {
   "name": "sonarune",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "private": true,
   "description": "A fast Jellyfin desktop music client",
   "license": "GPL-3.0-or-later",
@@ -51,7 +51,7 @@
     "tailwindcss": "^4.3.2",
     "typescript": "^6.0.0",
     "vite": "^8.0.12",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "imports": {
     "#lib/*": "./src/lib/*"

@@ -4561,7 +4561,7 @@ dependencies = [
 
 [[package]]
 name = "sonarune"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "dirs 6.0.0",
