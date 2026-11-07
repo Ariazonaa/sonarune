@@ -280,11 +280,17 @@ pub fn os_version() -> Option<String> {
 
     #[cfg(target_os = "linux")]
     {
-        let release = std::fs::read_to_string("/etc/os-release").ok()?;
-        return release.lines().find_map(|line| {
-            line.strip_prefix("PRETTY_NAME=")
-                .map(|value| value.trim_matches('"').to_string())
-        });
+        let name = std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|release| {
+                release.lines().find_map(|line| {
+                    line.strip_prefix("PRETTY_NAME=")
+                        .map(|value| value.trim_matches('"').to_string())
+                })
+            });
+        if name.is_some() {
+            return name;
+        }
     }
 
     None

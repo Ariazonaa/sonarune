@@ -16,6 +16,16 @@ use std::{
 use types::*;
 
 pub const CLIENT_NAME: &str = "Sonarune";
+/// The device the Jellyfin dashboard lists the sessions under. It was
+/// "Windows" everywhere, also on Linux; Jellyfin tells devices apart by the
+/// `DeviceId`, so Windows keeps its name and its existing entries.
+const DEVICE_NAME: &str = if cfg!(target_os = "windows") {
+    "Windows"
+} else if cfg!(target_os = "macos") {
+    "macOS"
+} else {
+    "Linux"
+};
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Sent with every request. reqwest sends none of its own, and a proxy in
@@ -1257,7 +1267,7 @@ impl JellyfinClient {
     /// legacy-auth removal planned for Jellyfin 12/13.
     pub fn auth_header(&self) -> String {
         let mut header = format!(
-            "MediaBrowser Client=\"{CLIENT_NAME}\", Device=\"Windows\", DeviceId=\"{}\", Version=\"{CLIENT_VERSION}\"",
+            "MediaBrowser Client=\"{CLIENT_NAME}\", Device=\"{DEVICE_NAME}\", DeviceId=\"{}\", Version=\"{CLIENT_VERSION}\"",
             self.device_id
         );
         if let Some(token) = &self.token {

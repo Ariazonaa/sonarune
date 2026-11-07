@@ -7,6 +7,8 @@ import { net } from "#lib/state/net.svelte.js";
 import { player } from "#lib/state/player.svelte.js";
 import { playlists } from "#lib/state/playlists.svelte.js";
 import { sonic } from "#lib/state/sonic.svelte.js";
+import { toast } from "#lib/state/toast.svelte.js";
+import { m } from "#lib/paraglide/messages.js";
 import { swrClear } from "#lib/swr.js";
 import type { ConnectResult, SessionEnded, SessionInfo } from "#lib/types.js";
 
@@ -85,11 +87,17 @@ class SessionStore {
     trustFingerprint?: string;
   }): Promise<ConnectResult> {
     const result = await api.connect(input);
-    if (result.status === "connected") {
-      this.ended = null;
-      this.info = result.session;
-    }
+    if (result.status === "connected") this.signedIn(result.session);
     return result;
+  }
+
+  /** A sign-in went through (password or Quick Connect). Without a
+   *  credential store it lasts this run only — say so now, not at the next
+   *  start's sign-in screen. */
+  signedIn(info: SessionInfo) {
+    this.ended = null;
+    this.info = info;
+    if (!info.credentialsSaved) toast.show(m.session_not_saved(), { kind: "info", ms: 12000 });
   }
 
   async disconnect() {

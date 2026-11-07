@@ -50,12 +50,12 @@ const STREAM_FILE_PREFIX: &str = "sonarune-";
 /// crash, the installer replacing it. So the first open of a run empties the
 /// folder; only one instance runs at a time (the single-instance plugin), so
 /// whatever is in there belongs to a run that is over. `None` when the folder
-/// cannot be made or written to (a shared `/tmp` where another user made it
-/// first): the copies then go to the temp directory itself.
+/// cannot be made or written to: the copies then go to the temp directory
+/// itself.
 fn stream_dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join("sonarune-streams");
+        let dir = stream_parent().join("sonarune-streams");
         let swept = std::fs::create_dir_all(&dir).map(|()| sweep_stream_dir(&dir));
         let usable = swept.and_then(|swept| {
             stream_download::storage::temp::tempfile::Builder::new()
@@ -77,6 +77,21 @@ fn stream_dir() -> Option<&'static Path> {
         }
     })
     .as_deref()
+}
+
+/// Where the folder of stream copies goes. The temp directory is the user's
+/// own on Windows and macOS; on Linux it is the shared `/tmp`, where a folder
+/// of that name may be another user's — on the test VM, one a run as root had
+/// left, and every copy then fell back to `/tmp` itself, where no later run
+/// sweeps what a crash left behind. There the user's cache directory, which is
+/// on disk (`$XDG_RUNTIME_DIR` is RAM, too small for a hi-res track).
+fn stream_parent() -> PathBuf {
+    if cfg!(target_os = "linux") {
+        if let Some(cache) = dirs::cache_dir() {
+            return cache;
+        }
+    }
+    std::env::temp_dir()
 }
 
 /// Delete the stream copies in `dir`; returns how many went.

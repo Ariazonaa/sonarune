@@ -2,8 +2,9 @@ name: Release
 
 # Cuts a release from a tag, so the installer people download is one CI built
 # from a commit anyone can check out -- not one somebody produced on their own
-# machine. Push a `v*` tag and a DRAFT release appears with the installer, a
-# portable zip and the updater manifest; review it, then publish by hand.
+# machine. Push a `v*` tag and a DRAFT release appears with the Windows
+# installer, a portable zip, the Linux AppImage and .deb and the updater
+# manifest; review it, then publish by hand.
 # GitHub shows a SHA-256 next to every file of a release, so there is no
 # separate checksum file.
 #
@@ -50,8 +51,9 @@ name: Release
 # can write to this repository. So the work is split, and each job runs on a
 # fresh machine that only gets the files the job before it uploaded:
 #
-#   * `build` has a read-only token and no secrets. It builds the installer and
-#     the portable zip and hands them on.
+#   * `build` and `build-linux` have a read-only token and no secrets. They
+#     build the Windows installer and portable zip, and the AppImage and .deb,
+#     and hand them on.
 #   * `sign` gets the key, in a single step that runs nothing of the project's
 #     but the Tauri CLI's signer, installed from the lockfile without install
 #     scripts. The steps after it, without the key, check the signature
@@ -204,8 +206,66 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  sign:
+  # The oldest Ubuntu GitHub still runs, so the AppImage and the .deb ask for
+  # no newer glibc than 2.35: Ubuntu 22.04, Debian 12 and everything after.
+  build-linux:
     needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # The same list as ci.yml's quality-linux.
+      - name: Install the system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libasound2-dev libdbus-1-dev \
+            libclang-dev cmake file
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version --verbose
+
+      # Uncached, as on Windows. The bundles come from
+      # src-tauri/tauri.linux.conf.json; for the AppImage the bundler fetches
+      # linuxdeploy from github.com.
+      - name: Build the app, the AppImage and the .deb
+        run: npm run tauri build
+
+      - name: Collect the artefacts
+        run: |
+          set -eu
+          mkdir -p dist
+          cp "src-tauri/target/release/bundle/appimage/Sonarune_${VERSION}_amd64.AppImage" dist/
+          cp "src-tauri/target/release/bundle/deb/Sonarune_${VERSION}_amd64.deb" dist/
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-linux
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: [build, build-linux]
     runs-on: windows-latest
     permissions:
       contents: read
@@ -237,6 +297,11 @@ jobs:
           name: unsigned
           path: dist
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-linux
+          path: dist
+
       # The key is in this step's environment and nowhere else in the workflow.
       #
       # A tag build without it would draft a release without latest.json, and
@@ -253,7 +318,7 @@ jobs:
       #
       # The signer prints the signature it made; that output goes nowhere (see
       # the top). Its errors are on stderr and still show.
-      - name: Sign the installer
+      - name: Sign the installer, the AppImage and the .deb
         id: sign
         shell: pwsh
         env:
@@ -269,13 +334,17 @@ jobs:
             "signed=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
-          $setup = "dist/Sonarune_$($env:VERSION)_x64-setup.exe"
-          if (-not (Test-Path $setup)) { "::error::installer not found at $setup"; exit 1 }
           $password = "$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
-          node node_modules/@tauri-apps/cli/tauri.js signer sign --app-version $env:VERSION --password=$password $setup > $null
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          if (-not (Test-Path "$setup.sig")) { "::error::signature not found at $setup.sig"; exit 1 }
-          "signed $setup"
+          foreach ($file in @(
+              "dist/Sonarune_$($env:VERSION)_x64-setup.exe",
+              "dist/Sonarune_$($env:VERSION)_amd64.AppImage",
+              "dist/Sonarune_$($env:VERSION)_amd64.deb")) {
+            if (-not (Test-Path $file)) { "::error::not found: $file"; exit 1 }
+            node node_modules/@tauri-apps/cli/tauri.js signer sign --app-version $env:VERSION --password=$password $file > $null
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if (-not (Test-Path "$file.sig")) { "::error::signature not found at $file.sig"; exit 1 }
+            "signed $file"
+          }
           "signed=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # The key only signs; this proves it is the one installed apps trust. A
@@ -287,8 +356,13 @@ jobs:
         if: steps.sign.outputs.signed == '1'
         shell: pwsh
         run: |
-          node scripts/verify-update-signature.mjs "dist/Sonarune_$($env:VERSION)_x64-setup.exe" --version $env:VERSION
-          if ($LASTEXITCODE) { "::error::the signature does not check out against the public key in src-tauri/tauri.conf.json"; exit 1 }
+          foreach ($name in @(
+              "Sonarune_$($env:VERSION)_x64-setup.exe",
+              "Sonarune_$($env:VERSION)_amd64.AppImage",
+              "Sonarune_$($env:VERSION)_amd64.deb")) {
+            node scripts/verify-update-signature.mjs "dist/$name" --version $env:VERSION
+            if ($LASTEXITCODE) { "::error::the signature of $name does not check out against the public key in src-tauri/tauri.conf.json"; exit 1 }
+          }
 
       # The signature travels inside latest.json; the .sig file rides along for
       # checking a release by hand. Both hold what Tauri writes -- the minisign
@@ -305,8 +379,6 @@ jobs:
         shell: pwsh
         run: |
           $out = "dist"
-          $name = "Sonarune_$($env:VERSION)_x64-setup.exe"
-          $sig = "$out/$name.sig"
 
           # On a manual run there is no tag; the URL still has to name one,
           # and the tag a release of this version would carry is known.
@@ -323,15 +395,25 @@ jobs:
             $notes = "See the release notes and CHANGELOG.md for what changed in $($env:VERSION)."
           }
 
+          # One entry per kind of copy. The updater looks for
+          # `{os}-{arch}-{bundle}` first, then `{os}-{arch}`: an AppImage
+          # finds its own entry, an installed .deb its own, and every Windows
+          # install the one it always used.
+          $entry = {
+            param($name)
+            [ordered]@{
+              signature = (Get-Content "$out/$name.sig" -Raw).Trim()
+              url       = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$tag/$name"
+            }
+          }
           $manifest = [ordered]@{
             version   = $env:VERSION
             notes     = $notes
             pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
             platforms = [ordered]@{
-              "windows-x86_64" = [ordered]@{
-                signature = (Get-Content $sig -Raw).Trim()
-                url       = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$tag/$name"
-              }
+              "windows-x86_64"        = & $entry "Sonarune_$($env:VERSION)_x64-setup.exe"
+              "linux-x86_64-appimage" = & $entry "Sonarune_$($env:VERSION)_amd64.AppImage"
+              "linux-x86_64-deb"      = & $entry "Sonarune_$($env:VERSION)_amd64.deb"
             }
           }
           [System.IO.File]::WriteAllText(
@@ -340,15 +422,18 @@ jobs:
             (New-Object System.Text.UTF8Encoding $false))
 
           # Shown for review, but without the signature: the log is public.
-          $manifest.platforms["windows-x86_64"].signature = "(in latest.json, not shown here)"
+          foreach ($key in @($manifest.platforms.Keys)) {
+            $manifest.platforms[$key].signature = "(in latest.json, not shown here)"
+          }
           $manifest | ConvertTo-Json -Depth 5
 
       - name: List what the release carries
         shell: pwsh
         run: Get-ChildItem dist | Select-Object Name, Length
 
-      # A tag run only: a manual run hands nothing signed on. The installer
-      # and the zip go to `release` through `unsigned`.
+      # A tag run only: a manual run hands nothing signed on. The installer,
+      # the zip and the Linux bundles go to `release` through `unsigned` and
+      # `unsigned-linux`.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: handover
         if: steps.sign.outputs.signed == '1' && startsWith(github.ref, 'refs/tags/')
@@ -361,7 +446,7 @@ jobs:
           retention-days: 1
 
   release:
-    needs: [build, sign]
+    needs: [build, build-linux, sign]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     permissions:
@@ -374,6 +459,11 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: unsigned
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-linux
           path: dist
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -391,13 +481,15 @@ jobs:
           # are full of them.
           $bt = [string][char]96
           $setup = "Sonarune_$($env:VERSION)_x64-setup.exe"
+          $appimage = "Sonarune_$($env:VERSION)_amd64.AppImage"
+          $deb = "Sonarune_$($env:VERSION)_amd64.deb"
 
           # `sign` already refuses a tag without the key; this is the same rule
           # once more, where it matters: promising self-updates on a release
           # that carries no latest.json would be a lie told to everyone who
           # reads the page, and publishing it would cut every installed app off
           # from updates.
-          foreach ($file in @($setup, "$setup.sig", "latest.json")) {
+          foreach ($file in @($setup, "$setup.sig", $appimage, "$appimage.sig", $deb, "$deb.sig", "latest.json")) {
             if (-not (Test-Path "dist/$file")) { "::error::dist/$file is missing; not drafting a release without it"; exit 1 }
           }
 
@@ -430,6 +522,14 @@ jobs:
             ""
             "There is also a portable zip. The exe is self-contained; the"
             "interface is embedded in it."
+            ""
+            "**Linux** (x86_64; Ubuntu 22.04, Debian 12 or newer): the"
+            "${bt}.deb${bt} installs with ${bt}sudo apt install ./$deb${bt} and"
+            "updates itself, asking for an administrator password when it"
+            "installs the next one. The AppImage runs as it is"
+            "(${bt}chmod +x${bt}) and replaces itself. Signing in is remembered in"
+            "the desktop's keyring (GNOME Keyring, KWallet); without one it lasts"
+            "the session."
             ""
             "The build is not code-signed, so SmartScreen reports an unknown"
             "publisher: **More info -> Run anyway**."

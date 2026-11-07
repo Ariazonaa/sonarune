@@ -25,6 +25,7 @@
   import ContextMenu, { type ContextMenuItem } from "./ContextMenu.svelte";
   import AddToPlaylistMenu from "./AddToPlaylistMenu.svelte";
   import SongInfo from "./SongInfo.svelte";
+  import { startReorderDrag } from "#lib/dragReorder.js";
   import type { QueueTrack } from "#lib/types.js";
 
   const queue = $derived(player.queue);
@@ -467,7 +468,7 @@
       draggable="true"
       ondragstart={(e) => {
         dragFrom = i;
-        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+        startReorderDrag(e);
       }}
       ondragenter={(e) => {
         // Taken like `dragover`, or a drop while the list scrolls under the

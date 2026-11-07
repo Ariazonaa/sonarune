@@ -1432,11 +1432,15 @@ mod tests {
 
     #[test]
     fn partial_file_stays_next_to_destination() {
-        let path = part_path(Path::new(r"C:\Downloads\song.flac"), "task-id", 0);
+        // Built with join, not a `C:\…` literal: on Linux that is one file
+        // name with backslashes in it.
+        let dest = Path::new("Downloads").join("song.flac");
+        let path = part_path(&dest, "task-id", 0);
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some("song.flac.sonarune-task-id-0.part")
         );
+        assert_eq!(path.parent(), dest.parent());
     }
 
     #[test]

@@ -10,6 +10,9 @@ export interface SessionInfo {
   canDelete: boolean;
   /** Whether this user (an admin) may edit item metadata on the server. */
   canEdit: boolean;
+  /** Whether the sign-in is in the credential store and comes back at the
+   *  next start; false on a Linux desktop without a Secret Service. */
+  credentialsSaved: boolean;
 }
 
 /** Current server values for the metadata editor form + diff preview. */
@@ -420,6 +423,9 @@ export interface UpdateInfo {
   notes: string | null;
   date: string | null;
   installable: boolean;
+  /** How this copy came onto the machine (`updater::CopyKind`), so the UI
+   *  can say how it updates. */
+  copy: "installer" | "appImage" | "deb" | "portable" | "unbundled";
 }
 
 export interface CacheInfo {
@@ -614,6 +620,20 @@ export interface HistoryEntry {
   playedAt: number;
   listenedMs: number;
   track: HistoryTrack;
+}
+
+/** Plays of the signed-in account kept under another server's id
+ *  (`history::StrandedPlays`): hidden while no server with that id answers. */
+export interface StrandedPlays {
+  serverId: string;
+  plays: number;
+  /** First and last listen, epoch ms. */
+  firstPlayedAt: number;
+  lastPlayedAt: number;
+  /** The address the last of them was played under. */
+  address: string;
+  /** When a server with that id last answered, epoch ms; null if never recorded. */
+  lastSeen: number | null;
 }
 
 export interface HistoryYears {

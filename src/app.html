@@ -8,6 +8,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Sonarune</title>
     <script>
+      // WebKitGTK (Linux) and WKWebView (macOS) load the app at
+      // tauri://localhost, a URL whose path is empty, not "/" as in WebView2's
+      // http://tauri.localhost/. SvelteKit's page.url, a `new URL(location.href)`,
+      // then has pathname "" (location.pathname itself says "/"), and code that
+      // keeps a path to come back to -- the visualizer's toggle -- went to "",
+      // which is the page it was on. Before the app reads it.
+      try {
+        if (new URL(location.href).pathname === "")
+          history.replaceState(history.state, "", "/");
+      } catch (e) {
+        /* left as it is: the rest of this script must still run */
+      }
+
       // Re-apply the persisted accent before first paint (kept in sync with
       // src/lib/theme.ts, which handles changes from the settings UI). The app
       // is AMOLED dark only, so there is no mode to restore here.

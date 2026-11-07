@@ -43,6 +43,7 @@ describe("sign-out", () => {
       userId: "a",
       canDelete: false,
       canEdit: false,
+      credentialsSaved: true,
     };
     playlists.items = [playlist];
     downloads.tasks = [task];

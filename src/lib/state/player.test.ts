@@ -297,6 +297,7 @@ describe("favorites", () => {
       userId,
       canDelete: false,
       canEdit: false,
+      credentialsSaved: true,
     });
     session.info = signedIn("A");
     emitState(state({ current: track("f3", { isFavorite: false }) }));

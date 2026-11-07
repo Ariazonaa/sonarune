@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dropSlot, moveItem, moveTarget } from "./dragReorder";
+import { dropSlot, moveItem, moveTarget, REORDER_MIME, startReorderDrag } from "./dragReorder";
 import { isLongList, LONG_LIST_ROWS } from "./longList";
 
 describe("dropSlot", () => {
@@ -63,5 +63,25 @@ describe("isLongList", () => {
     expect(isLongList(LONG_LIST_ROWS)).toBe(false);
     expect(isLongList(LONG_LIST_ROWS + 1)).toBe(true);
     expect(isLongList(8000)).toBe(true);
+  });
+});
+
+// WebKitGTK ends a drag that carries no data right after dragstart: the queue
+// and the playlist could not be reordered on Linux.
+describe("startReorderDrag", () => {
+  it("puts data of its own type on the drag and allows a move", () => {
+    const store = new Map<string, string>();
+    const dataTransfer = {
+      effectAllowed: "uninitialized",
+      setData: (type: string, value: string) => store.set(type, value),
+    };
+    startReorderDrag({ dataTransfer } as unknown as DragEvent);
+    expect(dataTransfer.effectAllowed).toBe("move");
+    expect(store.get(REORDER_MIME)).toBeTruthy();
+    expect(store.has("text/plain")).toBe(false);
+  });
+
+  it("does nothing without a DataTransfer", () => {
+    expect(() => startReorderDrag({ dataTransfer: null } as unknown as DragEvent)).not.toThrow();
   });
 });

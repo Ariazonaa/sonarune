@@ -23,3 +23,20 @@ export function moveItem<T>(items: readonly T[], from: number, to: number): T[] 
   moved.splice(to, 0, ...moved.splice(from, 1));
   return moved;
 }
+
+/** The type a reorder drag carries. Its value is never read: the list keeps
+ *  which row is moving itself. */
+export const REORDER_MIME = "application/x-sonarune-reorder";
+
+/** Start a reorder drag. It has to carry data: WebKitGTK (Linux) hands GTK
+ *  the types in the DataTransfer as the drag's targets, and a drag with none
+ *  ends right after `dragstart` -- no `dragover`, no `drop` (seen with the
+ *  queue and the playlist on the test VM, 07.11.2026). WebView2 starts one
+ *  either way. A type of our own, not text, so dropping a row into another
+ *  program does not paste anything. */
+export function startReorderDrag(event: DragEvent) {
+  const data = event.dataTransfer;
+  if (!data) return;
+  data.effectAllowed = "move";
+  data.setData(REORDER_MIME, "row");
+}

@@ -110,8 +110,7 @@
           failures = 0;
           if (info) {
             stopQuickConnect();
-            session.ended = null;
-            session.info = info;
+            session.signedIn(info);
           }
         } catch (e) {
           // The server forgets a code nobody approved after a few minutes.

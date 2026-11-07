@@ -33,7 +33,9 @@ the server is what the design defends against.
 **All server traffic runs in Rust, never in the WebView.** Sign-in, browsing,
 cover art and audio streams go through `reqwest`. Access tokens never reach the
 DOM and never land in SQLite; they live in the Windows Credential Manager, keyed
-per server and user.
+per server and user, and on Linux in the Secret Service (GNOME Keyring,
+KWallet). A Linux desktop without one gets a sign-in for the running session
+only: the token stays in memory and is never written to a file instead.
 
 **Certificates are pinned per server.** A custom rustls verifier checks the OS
 trust store first and accepts an untrusted leaf only when its SHA-256

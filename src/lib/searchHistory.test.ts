@@ -14,6 +14,7 @@ const account = (serverUrl: string, userId: string): SessionInfo => ({
   userId,
   canDelete: false,
   canEdit: false,
+  credentialsSaved: true,
 });
 
 const alice = account("https://music.home", "alice");

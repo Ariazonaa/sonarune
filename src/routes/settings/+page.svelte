@@ -23,6 +23,7 @@
   } from "#lib/eqPresets.js";
   import ShortcutSettings from "#lib/components/ShortcutSettings.svelte";
   import LayoutSettings from "#lib/components/LayoutSettings.svelte";
+  import StrandedHistorySettings from "#lib/components/StrandedHistorySettings.svelte";
   import TrustedCertSettings from "#lib/components/TrustedCertSettings.svelte";
   import UpdateSettings from "#lib/components/UpdateSettings.svelte";
   import {
@@ -124,6 +125,7 @@
   let maintenanceError = $state<string | null>(null);
   // Full path of the last diagnostics export, so the user can see/open it.
   let diagnosticsPath = $state<string | null>(null);
+  let settingsExportPath = $state<string | null>(null);
 
   // The listed device the output setting means, also under a new id.
   const selectedOutput = $derived(configuredOutput(playback, audioDevices.devices));
@@ -369,6 +371,12 @@
     }
   }
 
+  function revealSettingsExport() {
+    if (settingsExportPath) {
+      void api.revealPath(settingsExportPath).catch((e) => (backupError = errorCause(e)));
+    }
+  }
+
   function revealDiagnostics() {
     if (diagnosticsPath) {
       void api.revealPath(diagnosticsPath).catch((e) => (maintenanceError = errorCause(e)));
@@ -584,13 +592,9 @@
     importedCount = null;
     backupError = null;
     try {
-      const json = await api.exportSettings();
-      const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "sonarune-settings.json";
-      a.click();
-      URL.revokeObjectURL(url);
+      // Written by Rust: the WebView's own download of a blob does nothing in
+      // WebKitGTK (Linux).
+      settingsExportPath = await api.saveSettingsExport();
     } catch (e) {
       backupError = errorCause(e);
     }
@@ -1169,6 +1173,7 @@
       <a href="/history" class="mt-3 inline-block text-xs font-semibold text-ink-muted underline hover:text-ink">
         {m.settings_history_open()}
       </a>
+      <StrandedHistorySettings />
     </section>
 
     <section class="mb-8 rounded-lg bg-card p-5">
@@ -1240,6 +1245,9 @@
         <p class="min-w-0 text-sm">
           <span class="block font-medium">{session.info.username}</span>
           <span class="block break-all text-xs text-ink-muted">{session.info.serverUrl}</span>
+          {#if !session.info.credentialsSaved}
+            <span class="mt-1 block max-w-md text-xs text-ink-muted">{m.session_not_saved()}</span>
+          {/if}
         </p>
         <button
           class="shrink-0 rounded-full border border-edge px-4 py-1.5 text-sm font-bold text-ink-muted transition-colors hover:border-red-400 hover:text-red-400 disabled:pointer-events-none disabled:opacity-50"
@@ -1347,6 +1355,18 @@
         {m.settings_import()}
       </button>
     </div>
+    {#if settingsExportPath}
+      <div class="mt-3 rounded-md bg-base px-3 py-2">
+        <p class="text-[11px] text-ink-muted">{m.settings_diagnostics_saved_at()}</p>
+        <p class="mt-0.5 break-all font-mono text-[11px] text-ink">{settingsExportPath}</p>
+        <button
+          class="mt-2 rounded-full border border-edge px-3 py-1 text-xs font-semibold text-ink-muted transition-colors hover:border-ink-muted hover:text-ink"
+          onclick={revealSettingsExport}
+        >
+          {m.download_open_folder()}
+        </button>
+      </div>
+    {/if}
     {#if importedCount !== null}
       <p class="mt-3 text-xs font-medium text-accent">
         {(importedCount === 1 ? m.settings_imported_one : m.settings_imported_many)({

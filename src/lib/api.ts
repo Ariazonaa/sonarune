@@ -188,6 +188,8 @@ export const api = {
   setExtrasSettings: (settings: ExtrasSettings) =>
     invoke<void>("set_extras_settings", { settings }),
   exportSettings: () => invoke<string>("export_settings"),
+  /** Write the settings into the downloads folder; resolves with the file's path. */
+  saveSettingsExport: () => invoke<string>("save_settings_export"),
   importSettings: (json: string) => invoke<string[]>("import_settings", { json }),
 
   /** Ask the release endpoint what the current version is (updater.rs). */
@@ -211,10 +213,32 @@ export const api = {
     invoke<ArtistDto[]>("get_similar_artists", { artistId, limit }),
 };
 
+type TauriInternals = { convertFileSrc?: (path: string, protocol: string) => string };
+
+let coverBase: string | null = null;
+
+/** Where the jfimg protocol is reached in this webview. Windows' WebView2
+ *  exposes custom schemes as `http://jfimg.localhost/`, WebKitGTK (Linux) and
+ *  WKWebView (macOS) as `jfimg://localhost/`; Tauri knows which, so ask it
+ *  rather than guess from the user agent. Outside Tauri (unit tests) the
+ *  Windows form. */
+export function coverUrlBase(): string {
+  if (coverBase === null) {
+    const internals = (globalThis as { __TAURI_INTERNALS__?: TauriInternals }).__TAURI_INTERNALS__;
+    coverBase = internals?.convertFileSrc?.("", "jfimg") ?? "http://jfimg.localhost/";
+    if (!coverBase.endsWith("/")) coverBase += "/";
+  }
+  return coverBase;
+}
+
+/** Forget the cached base (tests). */
+export function resetCoverUrlBase() {
+  coverBase = null;
+}
+
 /**
- * URL for the authenticated cover-art protocol (see src-tauri/src/proto.rs).
- * Windows WebView2 exposes custom schemes as http://{scheme}.localhost/.
- * TODO(cross-platform): macOS/Linux use `jfimg://` directly.
+ * URL for the authenticated cover-art protocol (see src-tauri/src/proto.rs):
+ * `{base}{itemId}/{tag}/{size}`, with the base from [`coverUrlBase`].
  */
 export function coverUrl(
   itemId: string | null,
@@ -222,7 +246,7 @@ export function coverUrl(
   size = 300,
 ): string | null {
   if (!itemId || !tag) return null;
-  return `http://jfimg.localhost/${itemId}/${tag}/${size}`;
+  return `${coverUrlBase()}${itemId}/${tag}/${size}`;
 }
 
 /** `m:ss`, or `h:mm:ss` from one hour on (queue/album totals, long mixes).

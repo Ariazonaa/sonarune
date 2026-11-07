@@ -123,6 +123,11 @@ pub(crate) const ADDRESSES_OF: &str = "
       AND NOT EXISTS (SELECT 1 FROM server_address b
                       WHERE b.address = a.address AND b.last_seen > a.last_seen)";
 
+/// Retag the analyses of the server id `:old` for the server (`:address`,
+/// `:id`) that took its place.
+const TAKE_OVER_ANALYSES: &str = "UPDATE track_analysis SET server_url = :address, server_id = :id
+     WHERE server_id = :old AND server_url <> ''";
+
 /// The analyses of the server (`:address`, `:id`): tagged with its id — or,
 /// stored before its id was known or for a server whose id is not known,
 /// with its address. Released rows and rows from before analyses recorded
@@ -487,8 +492,7 @@ impl Store {
     pub fn take_over_analyses(&self, old: &str, server: &Server) -> AppResult<usize> {
         let moved = self.with_conn(|conn| {
             conn.execute(
-                "UPDATE track_analysis SET server_url = :address, server_id = :id
-                 WHERE server_id = :old AND server_url <> ''",
+                TAKE_OVER_ANALYSES,
                 named_params! { ":address": server.address, ":id": server.id, ":old": old },
             )
         })?;
@@ -497,6 +501,40 @@ impl Store {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(moved)
+    }
+
+    /// Give `server` the plays of `user` under the server id `old` and, if
+    /// there were any, the analyses tagged with `old` — in one transaction,
+    /// so a failure leaves both where they were and a retry finds the plays
+    /// again. Returns how many plays and how many analyses moved.
+    pub fn take_over_plays_and_analyses(
+        &self,
+        user: &str,
+        old: &str,
+        server: &Server,
+    ) -> AppResult<(usize, usize)> {
+        let (plays, analyses) = self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let plays = tx.execute(
+                "UPDATE play_history SET server_id = :id WHERE server_id = :old AND user_id = :user",
+                named_params! { ":id": server.id, ":old": old, ":user": user },
+            )?;
+            let analyses = if plays > 0 {
+                tx.execute(
+                    TAKE_OVER_ANALYSES,
+                    named_params! { ":address": server.address, ":id": server.id, ":old": old },
+                )?
+            } else {
+                0
+            };
+            tx.commit()?;
+            Ok((plays, analyses))
+        })?;
+        if analyses > 0 {
+            self.analysis_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok((plays, analyses))
     }
 
     /// Run `sql`, which names `:address`, `:id` and `:item`, for `server`

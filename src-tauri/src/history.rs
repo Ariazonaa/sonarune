@@ -827,6 +827,111 @@ pub fn take_over(store: &Store, user: &str, old: &str, new: &str) -> AppResult<u
     })
 }
 
+/// Plays of the signed-in account kept under the id of another server: one
+/// entry per id. The history hides them as long as no server with that id
+/// answers (`MINE`), "Clear history" does not reach them, and `identity::settle`
+/// hands them over only on evidence — a server that took the old one's place
+/// at its address. Restored into a fresh install at a new address, a server
+/// answers with a new id at an address the old one never stood at, and the
+/// account's whole history seems gone. A Jellyfin user id is minted by one
+/// server, so the same user id under another server id is a copy of this
+/// account; Settings lists them for the account to claim or forget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrandedPlays {
+    pub server_id: String,
+    pub plays: u64,
+    /// The first and the last listen, Unix milliseconds.
+    pub first_played_at: i64,
+    pub last_played_at: i64,
+    /// The address the last of them was played under.
+    pub address: String,
+    /// When a server with that id last answered, at any address; `None` when
+    /// that was never recorded.
+    pub last_seen: Option<i64>,
+}
+
+/// The signed-in account's plays under other server ids, the most recently
+/// played first. Empty while signed out or while the server's id is not
+/// known: the history then shows every play of the user id anyway.
+pub fn stranded(store: &Store) -> AppResult<Vec<StrandedPlays>> {
+    let Some(owner) = account(store) else {
+        return Ok(Vec::new());
+    };
+    let Some(id) = owner.server.id else {
+        return Ok(Vec::new());
+    };
+    store.with_conn(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT p.server_id, COUNT(*), MIN(p.played_at), MAX(p.played_at),
+                    (SELECT q.server_url FROM play_history q
+                     WHERE q.user_id = :user AND q.server_id = p.server_id
+                     ORDER BY q.id DESC LIMIT 1),
+                    (SELECT MAX(a.last_seen) FROM server_address a
+                     WHERE a.server_id = p.server_id)
+             FROM play_history p
+             WHERE p.user_id = :user AND p.server_id IS NOT NULL AND p.server_id <> :id
+             GROUP BY p.server_id
+             ORDER BY MAX(p.played_at) DESC",
+        )?;
+        let rows = statement
+            .query_map(named_params! { ":user": owner.user, ":id": id }, |row| {
+                Ok(StrandedPlays {
+                    server_id: row.get(0)?,
+                    plays: row.get::<_, i64>(1)?.max(0) as u64,
+                    first_played_at: row.get(2)?,
+                    last_played_at: row.get(3)?,
+                    address: row.get(4)?,
+                    last_seen: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+}
+
+/// The signed-in account says its plays under the server id `old` are its
+/// plays on this server: they go over, and so do the analyses of `old`, as
+/// when `identity::settle` finds a server replaced at its address — in one
+/// transaction (`Store::take_over_plays_and_analyses`). An analysis given to
+/// the wrong server costs a new analysis of that track, nothing more: a
+/// listing releases what is not in the library. Returns how many plays
+/// moved; nothing without a server id, or for the server's own.
+pub fn claim_stranded(store: &Store, old: &str) -> AppResult<usize> {
+    let Some(owner) = account(store) else {
+        return Ok(0);
+    };
+    let Some(id) = owner.server.id.as_deref() else {
+        return Ok(0);
+    };
+    if old == id || owner.user.is_empty() {
+        return Ok(0);
+    }
+    let (plays, _) = store.take_over_plays_and_analyses(&owner.user, old, &owner.server)?;
+    Ok(plays)
+}
+
+/// Forget the signed-in account's plays under the server id `old`. Returns
+/// how many; nothing without a server id, or for the server's own — those
+/// go with "Clear history".
+pub fn forget_stranded(store: &Store, old: &str) -> AppResult<usize> {
+    let Some(owner) = account(store) else {
+        return Ok(0);
+    };
+    let Some(id) = owner.server.id.as_deref() else {
+        return Ok(0);
+    };
+    if old == id || owner.user.is_empty() {
+        return Ok(0);
+    }
+    store.with_conn(|conn| {
+        conn.execute(
+            "DELETE FROM play_history WHERE user_id = ?1 AND server_id = ?2",
+            params![owner.user, old],
+        )
+    })
+}
+
 /// Whether `user` has plays on the server `id`.
 pub fn has_plays_on(store: &Store, user: &str, id: &str) -> AppResult<bool> {
     store.with_conn(|conn| {
@@ -1582,5 +1687,151 @@ mod tests {
         let rows = page(&store, None, 50).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].track.item_id, "a");
+    }
+
+    /// The server was restored into a fresh install at another address: the
+    /// same user ids, a new server id, and nothing at its new address says
+    /// it replaced the old one. `u1` played on the old one (plus one play
+    /// from before ids, shown everywhere), and so did `kid`; an unrelated
+    /// server `other` has a play of `u1`'s user id too. Signed in as `u1` on
+    /// the new one.
+    fn restored_elsewhere() -> TempStore {
+        let store = signed_in();
+        let (old_address, new_address) = ("http://10.0.0.5:8096", "https://music.home");
+        store.record_server(old_address, "old").unwrap();
+        store.record_server("https://other.home", "other").unwrap();
+        let old = owner("u1", old_address, Some("old"));
+        record_at(&store, &old, &track("o1", "A", Some("x")), 1_000, day(2, 1)).unwrap();
+        record_at(&store, &old, &track("o2", "A", Some("x")), 1_000, day(2, 3)).unwrap();
+        let kid = owner("kid", old_address, Some("old"));
+        record_at(&store, &kid, &track("k1", "A", None), 1_000, day(2, 2)).unwrap();
+        let other = owner("u1", "https://other.home", Some("other"));
+        record_at(&store, &other, &track("x1", "A", None), 1_000, day(1, 1)).unwrap();
+        let before_ids = owner("u1", old_address, None);
+        record_at(
+            &store,
+            &before_ids,
+            &track("b1", "A", None),
+            1_000,
+            day(1, 5),
+        )
+        .unwrap();
+        store
+            .put_analysis_from(Some(&old.server), "o1", "{}")
+            .unwrap();
+        store
+            .put_analysis_from(Some(&other.server), "x1", "{}")
+            .unwrap();
+        store.record_server(new_address, "new").unwrap();
+        let new = owner("u1", new_address, Some("new"));
+        record_at(&store, &new, &track("n1", "A", None), 1_000, day(3, 1)).unwrap();
+        assert_eq!(Owner::current(&store), Some(new));
+        store
+    }
+
+    fn shown(store: &Store) -> Vec<String> {
+        let mut items: Vec<String> = page(store, None, 50)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.track.item_id)
+            .collect();
+        items.sort();
+        items
+    }
+
+    #[test]
+    fn plays_under_another_server_id_are_listed_for_the_account() {
+        let store = restored_elsewhere();
+        assert_eq!(shown(&store), ["b1", "n1"]);
+        let stranded = stranded(&store).unwrap();
+        let ids: Vec<&str> = stranded.iter().map(|s| s.server_id.as_str()).collect();
+        // The most recently played first; never the server's own, the plays
+        // from before ids or another account's.
+        assert_eq!(ids, ["old", "other"]);
+        assert_eq!(
+            stranded[0],
+            StrandedPlays {
+                server_id: "old".into(),
+                plays: 2,
+                first_played_at: day(2, 1),
+                last_played_at: day(2, 3),
+                address: "http://10.0.0.5:8096".into(),
+                last_seen: stranded[0].last_seen,
+            }
+        );
+        assert!(stranded[0].last_seen.is_some());
+    }
+
+    #[test]
+    fn claimed_plays_show_on_this_server_with_their_analyses() {
+        let store = restored_elsewhere();
+        assert_eq!(claim_stranded(&store, "old").unwrap(), 2);
+        assert_eq!(shown(&store), ["b1", "n1", "o1", "o2"]);
+        let analysis = store.analysis_row("o1").expect("stored");
+        assert_eq!(analysis.server_id.as_deref(), Some("new"));
+        assert_eq!(analysis.server_url.as_deref(), Some("https://music.home"));
+        // Another server's analyses stay its own.
+        let other = store.analysis_row("x1").expect("stored");
+        assert_eq!(other.server_id.as_deref(), Some("other"));
+        // The kid's stay until the kid claims them.
+        let kid: i64 = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM play_history WHERE user_id = 'kid' AND server_id = 'old'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(kid, 1);
+        let ids: Vec<String> = stranded(&store)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.server_id)
+            .collect();
+        assert_eq!(ids, ["other"]);
+        assert_eq!(claim_stranded(&store, "old").unwrap(), 0, "once");
+        // The server's own id is not another's.
+        assert_eq!(claim_stranded(&store, "new").unwrap(), 0);
+    }
+
+    #[test]
+    fn forgotten_plays_under_another_server_id_are_gone_for_this_account_only() {
+        let store = restored_elsewhere();
+        assert_eq!(forget_stranded(&store, "new").unwrap(), 0, "its own");
+        assert_eq!(forget_stranded(&store, "old").unwrap(), 2);
+        assert_eq!(shown(&store), ["b1", "n1"]);
+        let left: Vec<(String, String)> = store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT user_id, item_id FROM play_history
+                     WHERE server_id = 'old' ORDER BY item_id",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(left, [("kid".to_string(), "k1".to_string())]);
+        // The analysis is the server's, not the account's.
+        assert!(store.analysis_row("o1").is_some());
+    }
+
+    #[test]
+    fn without_the_servers_id_nothing_is_stranded() {
+        let store = signed_in();
+        let old = owner("u1", "http://10.0.0.5:8096", Some("old"));
+        record_at(&store, &old, &track("o1", "A", None), 1_000, day(2, 1)).unwrap();
+        // No id was ever seen at the signed-in address: the history shows
+        // every play of the user id.
+        assert_eq!(Owner::current(&store).unwrap().server.id, None);
+        assert_eq!(shown(&store), ["o1"]);
+        assert!(stranded(&store).unwrap().is_empty());
+        assert_eq!(claim_stranded(&store, "old").unwrap(), 0);
+        assert_eq!(forget_stranded(&store, "old").unwrap(), 0);
+        // Nor while signed out.
+        store.delete(keys::USER_ID).unwrap();
+        assert!(stranded(&store).unwrap().is_empty());
     }
 }
